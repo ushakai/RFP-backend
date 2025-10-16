@@ -1,5 +1,5 @@
 """
-Score QA quality against Purple.ai scraped reference using Gemini,
+Score QA quality against Purple.ai scraped reference using AI,
 and write numeric 0-100 scores to wifi_answers.quality_score in Supabase.
 """
 
@@ -11,9 +11,11 @@ from typing import List, Dict, Any
 
 from openai import OpenAI
 from supabase import create_client, Client
+from dotenv import load_dotenv
 
 
 # --- CONFIGURATION ---
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -56,7 +58,7 @@ def fetch_all_mappings() -> List[Dict[str, Any]]:
 
 def build_scoring_prompt(question: str, answer: str, reference: str) -> str:
     """
-    Build a robust scoring prompt that asks Gemini to evaluate answer quality from 0-100.
+    Build a robust scoring prompt that asks AI to evaluate answer quality from 0-100.
     The prompt instructs strict JSON output with numeric score and short rationale.
     """
     prompt = f"""
@@ -157,7 +159,7 @@ def update_quality_score(answer_id: str, score: int) -> bool:
 
 def score_all_answers(reference_text: str, min_delay_seconds: float = 0.5, limit: int = None):
     """
-    Fetch mappings, ask Gemini to evaluate each answer, and update Supabase quality_score.
+    Fetch mappings, ask AI to evaluate each answer, and update Supabase quality_score.
     If limit is provided, only process that many mappings.
     """
     mappings = fetch_all_mappings()
@@ -202,7 +204,7 @@ def score_all_answers(reference_text: str, min_delay_seconds: float = 0.5, limit
 
             prompt = build_scoring_prompt(question_text, answer_text, reference_text)
 
-            # call Gemini with safety settings; retry on rate limit
+            # call AI with safety settings; retry on rate limit
             retry = 0
             while True:
                 try:
@@ -224,7 +226,7 @@ def score_all_answers(reference_text: str, min_delay_seconds: float = 0.5, limit
                         time.sleep(wait)
                         retry += 1
                         continue
-                    print(f"[ERROR] Gemini call failed for answer {answer_id}: {e}")
+                    print(f"[ERROR] AI call failed for answer {answer_id}: {e}")
                     resp_text = ""
                     break
 

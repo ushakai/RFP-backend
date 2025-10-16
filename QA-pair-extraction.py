@@ -7,6 +7,7 @@ import json
 import time
 from supabase import create_client, Client
 from openai import OpenAI
+from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
 
@@ -18,6 +19,7 @@ ENV required:
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -51,7 +53,7 @@ def generate_embedding_gpt(text: str) -> list:
         return []
     try:
         response = openai_client.embeddings.create(
-            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
+            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
             input=text,
         )
         return response.data[0].embedding
@@ -75,7 +77,7 @@ def categorize_question(question_text: str) -> str:
 
 def extract_qa_pairs(sheet_content_csv: str) -> list:
     """
-    Uses Gemini to extract question-answer pairs from the sheet.
+    Uses AI to extract question-answer pairs from the sheet.
     Returns a JSON array with question, answer, row, and category.
     """
     prompt = f"""

@@ -15,8 +15,10 @@ from openpyxl.utils import get_column_letter
 from openai import OpenAI
 import zipfile
 import tempfile
+from dotenv import load_dotenv
 
 # CONFIGURATION 
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -115,7 +117,7 @@ def get_embedding(text: str) -> list:
         return []
     try:
         emb = openai_client.embeddings.create(
-            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
+            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
             input=text,
         )
         return emb.data[0].embedding
@@ -526,11 +528,14 @@ def _build_scoring_prompt(question: str, answer: str, reference: str) -> str:
 You are an expert RFP evaluator. Given QUESTION, ANSWER, and REFERENCE, return a strict JSON object:
 {{ "score": <integer 0-100>, "notes": "<one sentence>" }}
 
-QUESTION:\n"""{question}"""
+QUESTION:
+\"\"\"{question}\"\"\"
 
-ANSWER:\n"""{answer}"""
+ANSWER:
+\"\"\"{answer}\"\"\"
 
-REFERENCE:\n"""{reference}"""
+REFERENCE:
+\"\"\"{reference}\"\"\"
 """
 
 

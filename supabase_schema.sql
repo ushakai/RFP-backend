@@ -15,7 +15,7 @@ create table if not exists public.wifi_questions (
   client_id uuid references public.clients(id) on delete cascade,
   original_text text not null,
   normalized_text text,
-  embedding vector(3072),
+  embedding vector(1536),
   category text default 'Other',
   created_at timestamptz default now()
 );
@@ -46,7 +46,7 @@ create table if not exists public.question_answer_mappings (
 -- RPC for embedding match (pgvector required)
 -- Ensure extension: create extension if not exists vector;
 create or replace function public.match_wifi_questions(
-  query_embedding vector(3072),
+  query_embedding vector(1536),
   match_threshold float,
   match_count int,
   p_client_id uuid
