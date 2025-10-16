@@ -19,12 +19,24 @@ from dotenv import load_dotenv
 
 # CONFIGURATION 
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+def _clean_env(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.strip().strip('"').strip("'")
+
+OPENAI_API_KEY = _clean_env(os.getenv("OPENAI_API_KEY"))
+SUPABASE_URL = _clean_env(os.getenv("SUPABASE_URL"))
+SUPABASE_KEY = _clean_env(os.getenv("SUPABASE_KEY"))
 
 # Initialize clients
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Validate and initialize Supabase client with clearer errors
+if not SUPABASE_URL or not SUPABASE_URL.startswith("https://") or ".supabase.co" not in SUPABASE_URL:
+    raise ValueError(f"Invalid SUPABASE_URL format: '{SUPABASE_URL}'. Expected like https://xxxxx.supabase.co")
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY is missing")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FastAPI app
