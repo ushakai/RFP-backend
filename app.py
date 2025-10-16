@@ -6,22 +6,23 @@ import re
 import pandas as pd
 import openpyxl
 from fastapi import FastAPI, UploadFile, Header, HTTPException
+from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from supabase import create_client, Client
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
+from openai import OpenAI
+import zipfile
+import tempfile
 
 # CONFIGURATION 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Initialize clients
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FastAPI app
@@ -39,7 +40,7 @@ app.add_middleware(
 
 # HELPER FUNCTIONS
 
-def extract_questions_with_gemini(sheet_text: str) -> list:
+def extract_questions_with_llm(sheet_text: str) -> list:
     prompt = f"""
 You are analyzing an RFP Excel sheet. Identify ALL rows that represent questions or
 requirements directed at the vendor. Treat both explicit questions (with '?') and
@@ -60,22 +61,21 @@ Sheet:
 {sheet_text}
 """
     try:
-        response = gemini_model.generate_content(
-            prompt,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            },
+        response = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that outputs only valid JSON when asked."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
         )
-        text = response.text.strip()
+        text = (response.choices[0].message.content or "").strip()
         start, end = text.find("["), text.rfind("]")
         if start == -1 or end == -1:
             return []
         return json.loads(text[start:end+1])
     except Exception as e:
-        print(f"Gemini error: {e}")
+        print(f"LLM extract error: {e}")
         return []
 
 
@@ -114,8 +114,11 @@ def get_embedding(text: str) -> list:
     if not text:
         return []
     try:
-        res = genai.embed_content(model="models/embedding-001", content=text, task_type="retrieval_query")
-        return res["embedding"]
+        emb = openai_client.embeddings.create(
+            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"),
+            input=text,
+        )
+        return emb.data[0].embedding
     except Exception as e:
         print(f"Embedding error: {e}")
         return []
@@ -131,7 +134,7 @@ def search_supabase(question_embedding: list, client_id: str) -> list:
                 "query_embedding": question_embedding,
                 "match_threshold": 0.0,
                 "match_count": 5,
-                "client_id": client_id,
+                "p_client_id": client_id,
             }
         ).execute()
         return res.data if res.data else []
@@ -164,10 +167,17 @@ Write a concise, tailored answer that best addresses the new question using the 
 If unclear, combine and adapt from references.
 """
     try:
-        resp = gemini_model.generate_content(prompt)
-        return resp.text.strip()
+        resp = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "You are a precise RFP assistant. Keep answers concise and professional."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        print(f"Gemini tailored answer error: {e}")
+        print(f"LLM tailored answer error: {e}")
         return "AI could not generate tailored answer."
 
 
@@ -224,7 +234,7 @@ def process_excel_file_obj(file_obj: UploadFile, client_id: str):
             continue
         sheet_text = df.to_string(index=False, header=False)
 
-        extracted = extract_questions_with_gemini(sheet_text)
+        extracted = extract_questions_with_llm(sheet_text)
         if not extracted:
             continue
 
@@ -301,3 +311,303 @@ async def process_excel(file: UploadFile, x_client_key: str | None = Header(defa
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
     )
+
+
+# --- Organization-focused routes ---
+
+@app.get("/org")
+def get_org(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    client_id = get_client_id_from_key(x_client_key)
+    res = supabase.table("clients").select("id, name, sector, contact_email").eq("id", client_id).single().execute()
+    return res.data
+
+
+@app.put("/org")
+def update_org(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    client_id = get_client_id_from_key(x_client_key)
+    updates = {k: v for k, v in payload.items() if k in ("name", "sector", "contact_email")}
+    supabase.table("clients").update(updates).eq("id", client_id).execute()
+    return {"ok": True}
+
+
+@app.get("/org/qa")
+def list_org_qa(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    client_id = get_client_id_from_key(x_client_key)
+    qs = supabase.table("wifi_questions").select("id, original_text, category, created_at").eq("client_id", client_id).order("created_at", desc=True).execute().data or []
+    ans = supabase.table("wifi_answers").select("id, answer_text, category, quality_score, last_updated").eq("client_id", client_id).order("last_updated", desc=True).execute().data or []
+    mappings = supabase.table("question_answer_mappings").select("question_id, answer_id").in_("question_id", [q["id"] for q in qs] if qs else [""]).execute().data or []
+    return {"questions": qs, "answers": ans, "mappings": mappings}
+
+
+@app.post("/org/qa")
+def ingest_org_qa(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Ingest a list of question/answer pairs for the organization.
+    payload: { pairs: [{question, answer, category?}] }
+    """
+    client_id = get_client_id_from_key(x_client_key)
+    pairs = payload.get("pairs", []) or []
+    created = 0
+    for p in pairs:
+        qtext = (p.get("question") or "").strip()
+        atext = (p.get("answer") or "").strip()
+        category = (p.get("category") or "Other").strip() or "Other"
+        if not qtext or not atext:
+            continue
+        try:
+            q_emb = get_embedding(qtext)
+            q_row = {
+                "original_text": qtext,
+                "normalized_text": qtext.lower(),
+                "embedding": q_emb,
+                "category": category,
+                "client_id": client_id,
+            }
+            q_ins = supabase.table("wifi_questions").insert(q_row).execute()
+            q_id = (q_ins.data or [{}])[0].get("id")
+
+            a_row = {
+                "answer_text": atext,
+                "answer_type": "General",
+                "character_count": len(atext),
+                "technical_level": 1,
+                "client_id": client_id,
+            }
+            a_ins = supabase.table("wifi_answers").insert(a_row).execute()
+            a_id = (a_ins.data or [{}])[0].get("id")
+
+            if q_id and a_id:
+                supabase.table("question_answer_mappings").insert({
+                    "question_id": q_id,
+                    "answer_id": a_id,
+                    "confidence_score": 1.0,
+                    "context_requirements": None,
+                    "stakeholder_approved": False,
+                }).execute()
+                created += 1
+        except Exception as e:
+            print(f"ingest_org_qa error: {e}")
+            continue
+    return {"created": created}
+
+
+# --- Q/A extraction from uploaded RFPs (ZIP or XLSX) ---
+
+def _extract_qa_pairs(sheet_content_csv: str) -> list:
+    prompt = f"""
+Analyze the following Excel sheet data and identify question-answer pairs.
+
+- Detect rows where a question and its corresponding answer are present.
+- Return them as a JSON array of objects in this exact format:
+  [
+    {{
+      "question": "string",
+      "answer": "string",
+      "row": 0,
+      "category": "Wifi | Map | Other"
+    }}
+  ]
+
+Rules:
+1. Do not include any explanation or extra text outside the JSON array.
+2. If you are unsure about a category, default to "Other".
+3. If no valid pairs are found, return an empty array [].
+
+Sheet Data:
+{sheet_content_csv}
+"""
+    try:
+        response = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": "Respond with JSON arrays only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        s, e = text.find("["), text.rfind("]")
+        if s == -1 or e == -1:
+            return []
+        return json.loads(text[s:e+1])
+    except Exception as e:
+        print(f"extract_qa_pairs error: {e}")
+        return []
+
+
+def _insert_qa_pair(client_id: str, question_text: str, answer_text: str, category: str = "Other") -> bool:
+    try:
+        q_emb = get_embedding(question_text)
+        q_ins = supabase.table("wifi_questions").insert({
+            "original_text": question_text,
+            "normalized_text": (question_text or "").lower(),
+            "embedding": q_emb,
+            "category": category or "Other",
+            "client_id": client_id,
+        }).execute()
+        q_id = (q_ins.data or [{}])[0].get("id")
+
+        a_ins = supabase.table("wifi_answers").insert({
+            "answer_text": answer_text,
+            "answer_type": "General",
+            "character_count": len(answer_text or ""),
+            "technical_level": 1,
+            "client_id": client_id,
+        }).execute()
+        a_id = (a_ins.data or [{}])[0].get("id")
+
+        if q_id and a_id:
+            supabase.table("question_answer_mappings").insert({
+                "question_id": q_id,
+                "answer_id": a_id,
+                "confidence_score": 1.0,
+                "context_requirements": None,
+                "stakeholder_approved": False,
+            }).execute()
+            return True
+    except Exception as e:
+        print(f"_insert_qa_pair error: {e}")
+    return False
+
+
+@app.post("/org/qa/extract")
+async def extract_qa_from_upload(file: UploadFile, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    client_id = get_client_id_from_key(x_client_key)
+    created = 0
+    # Save uploaded file to temp
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = os.path.join(td, file.filename)
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        def _process_excel(path: str):
+            nonlocal created
+            try:
+                xls = pd.ExcelFile(path)
+                for sheet in xls.sheet_names:
+                    df = pd.read_excel(path, sheet_name=sheet, header=None)
+                    if df.empty:
+                        continue
+                    sheet_csv = df.to_csv(index=False, header=False)
+                    pairs = _extract_qa_pairs(sheet_csv) or []
+                    for p in pairs:
+                        q = (p.get("question") or "").strip()
+                        a = (p.get("answer") or "").strip()
+                        c = (p.get("category") or "Other").strip() or "Other"
+                        if q and a and _insert_qa_pair(client_id, q, a, c):
+                            created += 1
+            except Exception as e:
+                print(f"extract_qa_from_upload excel error: {e}")
+
+        if file.filename.lower().endswith(".zip"):
+            try:
+                extract_dir = os.path.join(td, "unzipped")
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                for root, _, files in os.walk(extract_dir):
+                    for fn in files:
+                        if fn.lower().endswith(".xlsx"):
+                            _process_excel(os.path.join(root, fn))
+            except Exception as e:
+                print(f"extract_qa_from_upload zip error: {e}")
+        elif file.filename.lower().endswith(".xlsx"):
+            _process_excel(tmp_path)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Upload .zip or .xlsx")
+
+    return {"created": created}
+
+
+# --- Quality scoring trigger ---
+
+def _build_scoring_prompt(question: str, answer: str, reference: str) -> str:
+    return f"""
+You are an expert RFP evaluator. Given QUESTION, ANSWER, and REFERENCE, return a strict JSON object:
+{{ "score": <integer 0-100>, "notes": "<one sentence>" }}
+
+QUESTION:\n"""{question}"""
+
+ANSWER:\n"""{answer}"""
+
+REFERENCE:\n"""{reference}"""
+"""
+
+
+def _extract_score(resp_text: str) -> int:
+    if not resp_text:
+        return -1
+    try:
+        s, e = resp_text.find("{"), resp_text.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            data = json.loads(resp_text[s:e+1])
+            if "score" in data:
+                val = int(round(float(data["score"])) )
+                return max(0, min(100, val))
+    except Exception:
+        pass
+    # fallback: first integer
+    m = re.search(r"(\d{1,3})(?:\.\d+)?", resp_text)
+    if m:
+        try:
+            return max(0, min(100, int(round(float(m.group(1))))))
+        except Exception:
+            return -1
+    return -1
+
+
+@app.post("/org/qa/score")
+def score_org_answers(payload: dict = Body(default={}), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    client_id = get_client_id_from_key(x_client_key)
+    limit = payload.get("limit")
+    reference_text = payload.get("reference_text") or ""
+
+    # fetch mappings and join QA
+    try:
+        rows = supabase.table("question_answer_mappings").select(
+            "question_id, answer_id, wifi_questions(original_text, client_id), wifi_answers(answer_text, quality_score, client_id)"
+        ).execute().data or []
+    except Exception as e:
+        print(f"score_org_answers fetch error: {e}")
+        rows = []
+
+    # filter to this org
+    scoped = [r for r in rows if (r.get("wifi_questions") or {}).get("client_id") == client_id and (r.get("wifi_answers") or {}).get("client_id") == client_id]
+
+    if limit:
+        scoped = scoped[: int(limit)]
+
+    updated = 0
+    for r in scoped:
+        question_text = (r.get("wifi_questions") or {}).get("original_text") or ""
+        answer_id = r.get("answer_id")
+        answer_text = (r.get("wifi_answers") or {}).get("answer_text") or ""
+        if not answer_id or not question_text or not answer_text:
+            continue
+
+        prompt = _build_scoring_prompt(question_text, answer_text, reference_text)
+        try:
+            resp = openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": "Return only a single JSON object with an integer score and concise notes."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
+            resp_text = resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"score_org_answers LLM error: {e}")
+            resp_text = ""
+
+        score = _extract_score(resp_text)
+        if score == -1:
+            continue
+
+        try:
+            supabase.table("wifi_answers").update({"quality_score": int(score)}).eq("id", answer_id).execute()
+            updated += 1
+        except Exception as e:
+            print(f"score_org_answers update error: {e}")
+
+    return {"updated": updated}
