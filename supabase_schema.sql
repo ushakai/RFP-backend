@@ -9,21 +9,31 @@ create table if not exists public.clients (
   created_at timestamptz default now()
 );
 
--- Questions per org
-create table if not exists public.wifi_questions (
+-- RFPs per client
+create table if not exists public.client_rfps (
   id uuid primary key default gen_random_uuid(),
   client_id uuid references public.clients(id) on delete cascade,
+  name text not null,
+  description text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.client_questions (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  rfp_id uuid references public.client_rfps(id) on delete cascade,
   original_text text not null,
   normalized_text text,
-  embedding vector(1536),
+  embedding vector(768),
   category text default 'Other',
   created_at timestamptz default now()
 );
 
--- Answers per org
-create table if not exists public.wifi_answers (
+create table if not exists public.client_answers (
   id uuid primary key default gen_random_uuid(),
   client_id uuid references public.clients(id) on delete cascade,
+  rfp_id uuid references public.client_rfps(id) on delete cascade,
   answer_text text not null,
   answer_type text,
   character_count int,
@@ -32,32 +42,52 @@ create table if not exists public.wifi_answers (
   last_updated timestamptz default now()
 );
 
--- Mappings
-create table if not exists public.question_answer_mappings (
+-- Mappings (renamed to client_question_answer_mappings)
+create table if not exists public.client_question_answer_mappings (
   id uuid primary key default gen_random_uuid(),
-  question_id uuid references public.wifi_questions(id) on delete cascade,
-  answer_id uuid references public.wifi_answers(id) on delete cascade,
+  question_id uuid references public.client_questions(id) on delete cascade,
+  answer_id uuid references public.client_answers(id) on delete cascade,
   confidence_score float,
   context_requirements text,
   stakeholder_approved boolean default false,
   created_at timestamptz default now()
 );
 
--- RPC for embedding match (pgvector required)
+-- Job processing table
+create table if not exists public.client_jobs (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  rfp_id uuid references public.client_rfps(id) on delete cascade,
+  job_type text not null, -- 'process_rfp' or 'extract_qa'
+  status text default 'pending', -- 'pending', 'processing', 'completed', 'failed'
+  file_name text,
+  file_size bigint,
+  progress_percent int default 0,
+  current_step text,
+  estimated_completion timestamptz,
+  started_at timestamptz,
+  completed_at timestamptz,
+  error_message text,
+  result_data jsonb, -- stores extracted questions/answers or processing results
+  created_at timestamptz default now()
+);
+
 -- Ensure extension: create extension if not exists vector;
-create or replace function public.match_wifi_questions(
-  query_embedding vector(1536),
+create or replace function public.client_match_questions(
+  query_embedding vector(768),
   match_threshold float,
   match_count int,
-  p_client_id uuid
+  p_client_id uuid,
+  p_rfp_id uuid default null
 )
 returns table(id uuid, question text, answer text, similarity float) language sql stable as $$
   select q.id, q.original_text as question, a.answer_text as answer,
          1 - (q.embedding <=> query_embedding) as similarity
-  from public.wifi_questions q
-  join public.question_answer_mappings m on m.question_id = q.id
-  join public.wifi_answers a on a.id = m.answer_id
+  from public.client_questions q
+  join public.client_question_answer_mappings m on m.question_id = q.id
+  join public.client_answers a on a.id = m.answer_id
   where q.client_id = p_client_id
+    and (p_rfp_id is null or q.rfp_id = p_rfp_id)
     and q.embedding is not null
     and (1 - (q.embedding <=> query_embedding)) >= match_threshold
   order by q.embedding <=> query_embedding
