@@ -887,16 +887,46 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
         print(f"QA extraction error: {e}")
         update_job_progress(job_id, -1, f"Extraction failed: {str(e)}")
 
-@app.post("/jobs/submit")
-async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
-    """Submit a job for background processing"""
-    client_id = get_client_id_from_key(x_client_key)
+def create_rfp_from_filename(client_id: str, filename: str) -> str:
+    """Auto-create RFP record from filename"""
+    # Extract RFP name from filename (remove extension and clean up)
+    rfp_name = filename.rsplit('.', 1)[0]  # Remove file extension
+    rfp_name = rfp_name.replace('_', ' ').replace('-', ' ')  # Replace underscores and dashes with spaces
+    rfp_name = ' '.join(word.capitalize() for word in rfp_name.split())  # Title case
     
+    # Check if RFP with similar name already exists
+    existing_rfps = supabase.table("client_rfps").select("id, name").eq("client_id", client_id).execute()
+    
+    # Find exact match or similar name
+    rfp_id = None
+    for rfp in existing_rfps.data or []:
+        if rfp["name"].lower() == rfp_name.lower():
+            rfp_id = rfp["id"]
+            break
+    
+    # Create new RFP if not found
     if not rfp_id:
-        raise HTTPException(status_code=400, detail="RFP ID is required")
+        rfp_data = {
+            "client_id": client_id,
+            "name": rfp_name,
+            "description": f"Auto-created from uploaded file: {filename}",
+            "created_at": datetime.now().isoformat()
+        }
+        rfp_result = supabase.table("client_rfps").insert(rfp_data).execute()
+        rfp_id = rfp_result.data[0]["id"]
+    
+    return rfp_id
+
+@app.post("/jobs/submit")
+async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Submit a job for background processing - auto-creates RFP from filename"""
+    client_id = get_client_id_from_key(x_client_key)
     
     if job_type not in ["process_rfp", "extract_qa"]:
         raise HTTPException(status_code=400, detail="Invalid job type")
+    
+    # Auto-create RFP from filename
+    rfp_id = create_rfp_from_filename(client_id, file.filename)
     
     # Read file content
     file_content = await file.read()
@@ -932,7 +962,7 @@ async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None =
     thread.daemon = True
     thread.start()
     
-    return {"job_id": job_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
+    return {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
 
 @app.get("/jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
