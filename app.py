@@ -5,7 +5,7 @@ import difflib
 import re
 import pandas as pd
 import openpyxl
-from fastapi import FastAPI, UploadFile, Header, HTTPException
+from fastapi import FastAPI, UploadFile, Header, HTTPException, Form, File
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,11 +13,13 @@ from supabase import create_client, Client
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import zipfile
 import tempfile
 from dotenv import load_dotenv
 import asyncio
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -36,8 +38,7 @@ SUPABASE_KEY = _clean_env(os.getenv("SUPABASE_KEY"))
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY for Gemini")
 genai.configure(api_key=GOOGLE_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 gemini = genai.GenerativeModel(GEMINI_MODEL)
 
 # Validate and initialize Supabase client with clearer errors
@@ -46,19 +47,48 @@ if not SUPABASE_URL or not SUPABASE_URL.startswith("https://") or ".supabase.co"
 if not SUPABASE_KEY:
     raise ValueError("SUPABASE_KEY is missing")
 
+# Create Supabase client with default configuration
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FastAPI app
 app = FastAPI()
 
+# Test endpoint to verify connectivity
+@app.get("/test")
+def test_endpoint():
+    print("=== TEST ENDPOINT CALLED ===")
+    return {"message": "Backend is working!", "timestamp": datetime.now().isoformat()}
+
+# Test endpoint for job submission debugging
+@app.post("/jobs/submit-test")
+async def submit_job_test(
+    file: UploadFile = File(...),
+    job_type: str = Form(...),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Test endpoint for job submission debugging"""
+    print(f"=== /jobs/submit-test ENDPOINT CALLED ===")
+    print(f"File: {file.filename}, Job Type: {job_type}, Client Key: {x_client_key}")
+    return {"message": "Test endpoint reached", "file": file.filename, "job_type": job_type}
+
 # CORS for frontend dev and configurable origins
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+allowed_origins = [frontend_origin, "http://127.0.0.1:5173", "http://localhost:5173"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_origin],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=[
+        "*",
+        "Content-Type",
+        "X-Client-Key",
+        "X-RFP-ID",
+    ],
+    expose_headers=[
+        "Content-Disposition",
+    ],
 )
 
 # HELPER FUNCTIONS
@@ -84,7 +114,15 @@ Sheet:
 {sheet_text}
 """
     try:
-        response = gemini.generate_content(prompt)
+        response = gemini.generate_content(
+            prompt,
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            },
+        )
         text = (response.text or "").strip()
         start, end = text.find("["), text.rfind("]")
         if start == -1 or end == -1:
@@ -130,8 +168,10 @@ def get_embedding(text: str) -> list:
     if not text:
         return []
     try:
-        resp = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=text)
-        return (resp.get("embedding") or [])
+        res = genai.embed_content(model="models/embedding-001",
+                                  content=text,
+                                  task_type="retrieval_query")
+        return res["embedding"]
     except Exception as e:
         print(f"Embedding error: {e}")
         return []
@@ -142,15 +182,11 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
         return []
     try:
         res = supabase.rpc(
-            "client_match_questions",
-            {
+            "match_wifi_questions", {
                 "query_embedding": question_embedding,
                 "match_threshold": 0.0,
-                "match_count": 5,
-                "p_client_id": client_id,
-                "p_rfp_id": rfp_id,
-            }
-        ).execute()
+                "match_count": 5
+            }).execute()
         return res.data if res.data else []
     except Exception as e:
         print(f"Supabase error: {e}")
@@ -230,8 +266,8 @@ def find_first_empty_column(ws):
 
 
 # PROCESS EXCEL IN-MEMORY
-def process_excel_file_obj(file_obj: UploadFile, client_id: str, rfp_id: str = None):
-    wb = openpyxl.load_workbook(file_obj.file)
+def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None):
+    wb = openpyxl.load_workbook(file_obj)
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         print(f"Processing sheet: {sheet_name}")
@@ -312,7 +348,12 @@ def get_client_id_from_key(client_key: str | None) -> str:
 @app.post("/process")
 async def process_excel(file: UploadFile, x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
     client_id = get_client_id_from_key(x_client_key)
-    processed_file = process_excel_file_obj(file, client_id, rfp_id)
+    
+    # Read file content into BytesIO like the working script
+    file_content = await file.read()
+    file_obj = io.BytesIO(file_content)
+    
+    processed_file = process_excel_file_obj(file_obj, file.filename, client_id, rfp_id)
     return StreamingResponse(
         processed_file,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -324,8 +365,12 @@ async def process_excel(file: UploadFile, x_client_key: str | None = Header(defa
 
 @app.get("/rfps")
 def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    print(f"=== /rfps ENDPOINT CALLED ===")
+    print(f"RFPs endpoint called with client_key: {x_client_key}")
     client_id = get_client_id_from_key(x_client_key)
+    print(f"Resolved client_id: {client_id}")
     res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
+    print(f"Found {len(res.data or [])} RFPs")
     return {"rfps": res.data or []}
 
 @app.post("/rfps")
@@ -377,18 +422,41 @@ def update_org(payload: dict = Body(...), x_client_key: str | None = Header(defa
 
 @app.get("/org/qa")
 def list_org_qa(x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
-    client_id = get_client_id_from_key(x_client_key)
-    qs_query = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
-    ans_query = supabase.table("client_answers").select("id, answer_text, category, quality_score, last_updated, rfp_id").eq("client_id", client_id)
-    
-    if rfp_id:
-        qs_query = qs_query.eq("rfp_id", rfp_id)
-        ans_query = ans_query.eq("rfp_id", rfp_id)
-    
-    qs = qs_query.order("created_at", desc=True).execute().data or []
-    ans = ans_query.order("last_updated", desc=True).execute().data or []
-    mappings = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", [q["id"] for q in qs] if qs else [""]).execute().data or []
-    return {"questions": qs, "answers": ans, "mappings": mappings}
+    try:
+        print(f"=== /org/qa ENDPOINT CALLED ===")
+        print(f"list_org_qa called with client_key: {x_client_key}, rfp_id: {rfp_id}")
+        client_id = get_client_id_from_key(x_client_key)
+        print(f"Resolved client_id: {client_id}")
+        
+        qs_query = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
+        ans_query = supabase.table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
+        
+        if rfp_id:
+            print(f"Filtering by rfp_id: {rfp_id}")
+            qs_query = qs_query.eq("rfp_id", rfp_id)
+            ans_query = ans_query.eq("rfp_id", rfp_id)
+        else:
+            print("No rfp_id filter - getting all RFPs")
+        
+        qs = qs_query.order("created_at", desc=True).execute().data or []
+        ans = ans_query.order("last_updated", desc=True).execute().data or []
+        print(f"Found {len(qs)} questions and {len(ans)} answers")
+        
+        q_ids = [q.get("id") for q in qs] if qs else []
+        mappings = []
+        if q_ids:
+            mappings = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
+        
+        print(f"Found {len(mappings)} mappings")
+        result = {"questions": qs, "answers": ans, "mappings": mappings}
+        print(f"Returning result with {len(result['questions'])} questions, {len(result['answers'])} answers, {len(result['mappings'])} mappings")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"list_org_qa error: {e}")
+        # Return empty sets rather than 500 to avoid frontend crash
+        return {"questions": [], "answers": [], "mappings": []}
 
 
 @app.post("/org/qa")
@@ -710,24 +778,31 @@ def estimate_processing_time(file_size: int, job_type: str) -> int:
     return 10
 
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
-    """Update job progress in database"""
-    try:
-        updates = {
-            "progress_percent": progress,
-            "current_step": current_step
-        }
-        if result_data:
-            updates["result_data"] = result_data
-        if progress == 100:
-            updates["status"] = "completed"
-            updates["completed_at"] = datetime.now().isoformat()
-        elif progress == -1:
-            updates["status"] = "failed"
-            updates["completed_at"] = datetime.now().isoformat()
-        
-        supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
-    except Exception as e:
-        print(f"Error updating job progress: {e}")
+    """Update job progress in database with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            updates = {
+                "progress_percent": progress,
+                "current_step": current_step
+            }
+            if result_data:
+                updates["result_data"] = result_data
+            if progress == 100:
+                updates["status"] = "completed"
+                updates["completed_at"] = datetime.now().isoformat()
+            elif progress == -1:
+                updates["status"] = "failed"
+                updates["completed_at"] = datetime.now().isoformat()
+            
+            supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
+            return  # Success, exit retry loop
+        except Exception as e:
+            print(f"Error updating job progress (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait 1 second before retry
+            else:
+                print(f"Failed to update job progress after {max_retries} attempts")
 
 def process_rfp_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Background RFP processing function"""
@@ -918,25 +993,58 @@ def create_rfp_from_filename(client_id: str, filename: str) -> str:
     return rfp_id
 
 @app.post("/jobs/submit")
-async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+async def submit_job(
+    file: UploadFile = File(...),
+    job_type: str = Form(...),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
     """Submit a job for background processing - auto-creates RFP from filename"""
-    client_id = get_client_id_from_key(x_client_key)
-    
-    if job_type not in ["process_rfp", "extract_qa"]:
-        raise HTTPException(status_code=400, detail="Invalid job type")
+    try:
+        print(f"=== /jobs/submit ENDPOINT CALLED ===")
+        print(f"Received job submission: file={file.filename}, job_type={job_type}, client_key={x_client_key}")
+        print(f"File content type: {file.content_type}")
+        print(f"File size: {file.size if hasattr(file, 'size') else 'unknown'}")
+        
+        if not file.filename:
+            print("ERROR: No file filename provided")
+            raise HTTPException(status_code=400, detail="No file provided")
+        
+        if not job_type:
+            print("ERROR: No job type provided")
+            raise HTTPException(status_code=400, detail="No job type provided")
+        
+        client_id = get_client_id_from_key(x_client_key)
+        print(f"Resolved client_id: {client_id}")
+        
+        if job_type not in ["process_rfp", "extract_qa"]:
+            print(f"ERROR: Invalid job type: {job_type}")
+            raise HTTPException(status_code=400, detail=f"Invalid job type: {job_type}. Must be 'process_rfp' or 'extract_qa'")
+        
+        print("Validation passed, proceeding with job creation...")
+    except HTTPException as he:
+        print(f"HTTPException in submit_job: {he.detail}")
+        raise
+    except Exception as e:
+        print(f"Error in submit_job: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
     # Auto-create RFP from filename
+    print(f"Creating RFP from filename: {file.filename}")
     rfp_id = create_rfp_from_filename(client_id, file.filename)
+    print(f"Created RFP with ID: {rfp_id}")
     
     # Read file content
+    print("Reading file content...")
     file_content = await file.read()
     file_size = len(file_content)
+    print(f"File size: {file_size} bytes")
     
     # Estimate processing time
     estimated_minutes = estimate_processing_time(file_size, job_type)
     estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
     
     # Create job record
+    print("Creating job record...")
     job_data = {
         "client_id": client_id,
         "rfp_id": rfp_id,
@@ -949,11 +1057,14 @@ async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None =
         "estimated_completion": estimated_completion.isoformat(),
         "created_at": datetime.now().isoformat()
     }
+    print(f"Job data: {job_data}")
     
     job_result = supabase.table("client_jobs").insert(job_data).execute()
     job_id = job_result.data[0]["id"]
+    print(f"Created job with ID: {job_id}")
     
     # Start background processing
+    print(f"Starting background processing for job_type: {job_type}")
     if job_type == "process_rfp":
         thread = threading.Thread(target=process_rfp_background, args=(job_id, file_content, file.filename, client_id, rfp_id))
     else:  # extract_qa
@@ -961,22 +1072,47 @@ async def submit_job(file: UploadFile, job_type: str, x_client_key: str | None =
     
     thread.daemon = True
     thread.start()
+    print(f"Background thread started for job {job_id}")
     
-    return {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
+    result = {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
+    print(f"Returning result: {result}")
+    return result
 
 @app.get("/jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """List all jobs for a client"""
+    """List all jobs for a client with retry logic"""
+    print(f"=== /jobs ENDPOINT CALLED ===")
+    print(f"Jobs endpoint called with client_key: {x_client_key}")
     client_id = get_client_id_from_key(x_client_key)
-    res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
-    return {"jobs": res.data or []}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
+            return {"jobs": res.data or []}
+        except Exception as e:
+            print(f"Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait 1 second before retry
+            else:
+                print(f"Failed to fetch jobs after {max_retries} attempts")
+                return {"jobs": [], "error": "Database connection failed"}
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """Get specific job details"""
+    """Get specific job details with retry logic"""
     client_id = get_client_id_from_key(x_client_key)
-    res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
-    return res.data
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
+            return res.data
+        except Exception as e:
+            print(f"Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait 1 second before retry
+            else:
+                print(f"Failed to fetch job {job_id} after {max_retries} attempts")
+                raise HTTPException(status_code=500, detail="Database connection failed")
 
 @app.delete("/jobs/{job_id}")
 def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):

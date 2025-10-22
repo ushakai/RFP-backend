@@ -93,3 +93,45 @@ returns table(id uuid, question text, answer text, similarity float) language sq
   order by q.embedding <=> query_embedding
   limit match_count;
 $$;
+
+-- Function to add a new Q&A pair
+create or replace function public.add_qa_pair(
+  p_client_key text,
+  p_question text,
+  p_answer text,
+  p_category text default 'General',
+  p_rfp_id uuid default null
+) returns void language plpgsql security definer as $$
+declare
+  v_client_id uuid;
+  v_question_id uuid;
+  v_answer_id uuid;
+begin
+  -- Get client ID from key
+  select id into v_client_id from public.clients where api_key = p_client_key;
+  if not found then
+    raise exception 'Invalid client key';
+  end if;
+
+  -- Insert question
+  insert into public.client_questions (
+    client_id, rfp_id, original_text, normalized_text, category
+  ) values (
+    v_client_id, p_rfp_id, p_question, lower(p_question), p_category
+  ) returning id into v_question_id;
+
+  -- Insert answer
+  insert into public.client_answers (
+    client_id, rfp_id, answer_text, answer_type, character_count, technical_level
+  ) values (
+    v_client_id, p_rfp_id, p_answer, 'General', length(p_answer), 1
+  ) returning id into v_answer_id;
+
+  -- Create mapping
+  insert into public.client_question_answer_mappings (
+    question_id, answer_id, confidence_score, stakeholder_approved
+  ) values (
+    v_question_id, v_answer_id, 1.0, false
+  );
+end;
+$$;
