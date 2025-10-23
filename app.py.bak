@@ -2,26 +2,24 @@ import os
 import io
 import json
 import difflib
-import re
 import pandas as pd
 import openpyxl
-from fastapi import FastAPI, UploadFile, Header, HTTPException, Form, File
-from fastapi import Body
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from supabase import create_client, Client
-from openpyxl.styles import Alignment
-from openpyxl.utils import get_column_letter
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-import zipfile
-import tempfile
-from dotenv import load_dotenv
 import asyncio
-import threading
-import time
 import uuid
-from datetime import datetime, timedelta
+import requests
+from typing import Annotated
+from fastapi import FastAPI, UploadFile, Depends, HTTPException, status, Form
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.middleware.cors import CORSMiddleware
+
+from config import (
+    GOOGLE_API_KEY, SUPABASE_URL, SUPABASE_KEY,
+    FASTAPI_USER, FASTAPI_PASSWORD,
+    WEBHOOK_USER, WEBHOOK_PASSWORD, WEBHOOK_URL
+)
+from models import extract_questions_with_gemini, get_embedding, generate_tailored_answer
+from database import search_supabase, pick_best_match
 
 # CONFIGURATION 
 load_dotenv()
@@ -38,8 +36,33 @@ SUPABASE_KEY = _clean_env(os.getenv("SUPABASE_KEY"))
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY for Gemini")
 genai.configure(api_key=GOOGLE_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro")  # Use standard gemini-pro model
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "embedding-001")
+MAX_CHUNK_SIZE = 15000  # Maximum tokens per chunk, leaving room for prompt and response
 gemini = genai.GenerativeModel(GEMINI_MODEL)
+
+def chunk_text(text: str, max_length: int = MAX_CHUNK_SIZE) -> list[str]:
+    """Split text into chunks of approximately max_length tokens."""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        # Rough estimate: 1 token ≈ 4 characters
+        word_length = (len(word) + 1) // 4  # +1 for space
+        if current_length + word_length > max_length and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_length = word_length
+        else:
+            current_chunk.append(word)
+            current_length += word_length
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
 
 # Validate and initialize Supabase client with clearer errors
 if not SUPABASE_URL or not SUPABASE_URL.startswith("https://") or ".supabase.co" not in SUPABASE_URL:
@@ -47,55 +70,32 @@ if not SUPABASE_URL or not SUPABASE_URL.startswith("https://") or ".supabase.co"
 if not SUPABASE_KEY:
     raise ValueError("SUPABASE_KEY is missing")
 
-# Create Supabase client with default configuration
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FastAPI app
 app = FastAPI()
 
-# Test endpoint to verify connectivity
-@app.get("/test")
-def test_endpoint():
-    print("=== TEST ENDPOINT CALLED ===")
-    return {"message": "Backend is working!", "timestamp": datetime.now().isoformat()}
+# --- FASTAPI SETUP ---
+app = FastAPI()
+security = HTTPBasic()
 
-# Test endpoint for job submission debugging
-@app.post("/jobs/submit-test")
-async def submit_job_test(
-    file: UploadFile = File(...),
-    job_type: str = Form(...),
-    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
-):
-    """Test endpoint for job submission debugging"""
-    print(f"=== /jobs/submit-test ENDPOINT CALLED ===")
-    print(f"File: {file.filename}, Job Type: {job_type}, Client Key: {x_client_key}")
-    return {"message": "Test endpoint reached", "file": file.filename, "job_type": job_type}
-
-# CORS for frontend dev and configurable origins
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-allowed_origins = [frontend_origin, "http://127.0.0.1:5173", "http://localhost:5173"]
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=[
-        "*",
-        "Content-Type",
-        "X-Client-Key",
-        "X-RFP-ID",
-    ],
-    expose_headers=[
-        "Content-Disposition",
-    ],
+    allow_headers=["*"],
 )
 
 # HELPER FUNCTIONS
 
-def extract_questions_with_gemini(sheet_text: str) -> list:
-    prompt = f"""
-You are analyzing an RFP Excel sheet. Identify ALL rows that represent questions or
+def extract_questions_with_llm(sheet_text: str) -> list:
+    # Split text into manageable chunks
+    chunks = chunk_text(sheet_text)
+    all_questions = []
+    
+    base_prompt = """You are analyzing an RFP Excel sheet. Identify ALL rows that represent questions or
 requirements directed at the vendor. Treat both explicit questions (with '?') and
 implicit requirements (like "Vendor must provide X", "Describe how your system handles Y")
 as questions.
@@ -110,27 +110,44 @@ Return JSON array only:
 
 If no questions are found, return [].
 
-Sheet:
-{sheet_text}
+Sheet section:
 """
-    try:
-        response = gemini.generate_content(
-            prompt,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            },
-        )
-        text = (response.text or "").strip()
-        start, end = text.find("["), text.rfind("]")
-        if start == -1 or end == -1:
-            return []
-        return json.loads(text[start:end+1])
-    except Exception as e:
-        print(f"Gemini extract error: {e}")
-        return []
+
+    for i, chunk in enumerate(chunks):
+        try:
+            prompt = f"{base_prompt}\n{chunk}"
+            response = gemini.generate_content(prompt)
+            text = (response.text or "").strip()
+            start, end = text.find("["), text.rfind("]")
+            if start == -1 or end == -1:
+                continue
+            
+            questions = json.loads(text[start:end+1])
+            if questions and isinstance(questions, list):
+                # Adjust row numbers for chunks after the first one
+                if i > 0:
+                    # Estimate rows in previous chunks (rough estimate: 1 row per 50 chars)
+                    prev_rows = sum(len(c) // 50 for c in chunks[:i])
+                    for q in questions:
+                        if "row" in q:
+                            q["row"] += prev_rows
+                
+                all_questions.extend(questions)
+        
+        except Exception as e:
+            print(f"LLM extract error in chunk {i}: {e}")
+            continue
+    
+    # Remove duplicates based on question text
+    seen = set()
+    unique_questions = []
+    for q in all_questions:
+        q_text = q.get("question", "").strip().lower()
+        if q_text and q_text not in seen:
+            seen.add(q_text)
+            unique_questions.append(q)
+    
+    return unique_questions
 
 
 def clean_markdown(text: str) -> str:
@@ -168,10 +185,8 @@ def get_embedding(text: str) -> list:
     if not text:
         return []
     try:
-        res = genai.embed_content(model="models/embedding-001",
-                                  content=text,
-                                  task_type="retrieval_query")
-        return res["embedding"]
+        resp = genai.embed_content(model=GEMINI_EMBEDDING_MODEL, content=text)
+        return (resp.get("embedding") or [])
     except Exception as e:
         print(f"Embedding error: {e}")
         return []
@@ -182,13 +197,15 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
         return []
     try:
         res = supabase.rpc(
-            "client_match_questions", {
+            "client_match_questions",
+            {
                 "query_embedding": question_embedding,
                 "match_threshold": 0.0,
                 "match_count": 5,
                 "p_client_id": client_id,
-                "p_rfp_id": rfp_id
-            }).execute()
+                "p_rfp_id": rfp_id,
+            }
+        ).execute()
         return res.data if res.data else []
     except Exception as e:
         print(f"Supabase error: {e}")
@@ -200,30 +217,34 @@ def pick_best_match(matches: list):
         return None
     return max(matches, key=lambda m: m.get("similarity", 0))
 
+
 def generate_tailored_answer(question: str, matches: list) -> str:
+    # Sort matches by similarity and take top 3 to keep context manageable
+    sorted_matches = sorted(matches, key=lambda m: m.get('similarity', 0), reverse=True)[:3]
+    
     context = "\n".join(
         f"- Q: {m['question']} | A: {m['answer']} (similarity {m['similarity']:.2f})"
-        for m in matches)
+        for m in sorted_matches
+    )
+    
     prompt = f"""
 You are answering an RFP vendor question.  
 
 New Question:
 {question}
 
-Reference Q&A Pairs:
+Reference Q&A Pairs (most relevant first):
 {context}
 
 Write a concise, tailored answer that best addresses the new question using the references.
-If unclear, combine and adapt from references.
+If unclear, combine and adapt from references. Keep the answer focused and under 1000 words.
 """
     try:
         resp = gemini.generate_content(prompt)
-        return resp.text.strip()
+        return (resp.text or "").strip()
     except Exception as e:
-        print(f"Gemini tailored answer error: {e}")
+        print(f"LLM tailored answer error: {e}")
         return "AI could not generate tailored answer."
-
-
 
 
 def _row_text(ws, r: int) -> str:
@@ -267,51 +288,151 @@ def find_first_empty_column(ws):
     return ws.max_column + 1
 
 
+# PROCESS EXCEL IN-MEMORY
+def process_excel_file_obj(file_obj: io.BytesIO, client_id: str, rfp_id: str = None):
+    wb = openpyxl.load_workbook(file_obj)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        print(f"Processing sheet: {sheet_name}")
+
+        df = pd.DataFrame(ws.values)
+        if df.empty:
+            continue
+        sheet_text = df.to_string(index=False, header=False)
+
+        extracted = extract_questions_with_gemini(sheet_text, gemini_model)
+        if not extracted:
+            continue
+
+        ai_col = find_first_empty_column(ws)
+        ws.cell(row=1, column=ai_col, value="AI Answers")
+        # Expand column width and enable wrap
+        ai_col_letter = get_column_letter(ai_col)
+        ws.column_dimensions[ai_col_letter].width = 60
+
+        review_col = ai_col + 1
+        ws.cell(row=1, column=review_col, value="Review Status")
+        review_col_letter = get_column_letter(review_col)
+        ws.column_dimensions[review_col_letter].width = 20
+
+        for item in extracted:
+            qtext = item.get("question", "")
+            reported_row = item.get("row", 0)
+            if not qtext:
+                continue
+
+            write_row = resolve_row(ws, reported_row, qtext)
+            emb = get_embedding(qtext)
+            matches = search_supabase(emb, client_id, rfp_id)
+
+            final_answer = "Not found, needs review."
+            review_status = ""
+
+            if matches:
+                best = pick_best_match(matches)
+                if best and best.get("similarity", 0) >= 0.9:
+                    final_answer = best["answer"]
+                else:
+                    final_answer = generate_tailored_answer(qtext, matches)
+                    review_status = "Need review"
+
+            # Clean formatting from AI output
+            final_answer = clean_markdown(final_answer)
+
+            ai_cell = ws.cell(row=write_row, column=ai_col, value=final_answer)
+            ai_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            if review_status:
+                review_cell = ws.cell(row=write_row, column=review_col, value=review_status)
+                review_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 
-# API ENDPOINT
-def get_client_id_from_key(client_key: str | None) -> str:
-    if not client_key:
-        raise HTTPException(status_code=401, detail="Missing X-Client-Key")
+# --- AUTH DEPENDENCY ---
+def auth_required(credentials: Annotated[HTTPBasicCredentials, Depends(security)]):
+    if credentials.username != FASTAPI_USER or credentials.password != FASTAPI_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
     try:
-        resp = supabase.table("clients").select("id").eq("api_key", client_key).limit(1).execute()
-        rows = resp.data or []
-        if not rows:
+        print(f"Looking up client for key: {client_key[:8]}...")  # Only log first 8 chars for security
+        resp = supabase.from_("clients").select("id, name").eq("api_key", client_key).limit(1).execute()
+        
+        if not resp.data:
+            print(f"No client found for key: {client_key[:8]}")
             raise HTTPException(status_code=401, detail="Invalid X-Client-Key")
-        return rows[0]["id"]
+        
+        client = resp.data[0]
+        print(f"Found client: {client.get('id')} ({client.get('name')})")
+        return client["id"]
+        
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Client lookup error: {e}")
-        raise HTTPException(status_code=500, detail="Client lookup failed")
+        error_msg = str(e)
+        print(f"Client lookup error: {error_msg}")
+        if "connection" in error_msg.lower():
+            raise HTTPException(status_code=503, detail="Database connection failed")
+        elif "permission" in error_msg.lower():
+            raise HTTPException(status_code=403, detail="Database permission denied")
+        else:
+            raise HTTPException(status_code=500, detail=f"Client lookup failed: {error_msg}")
 
 
 @app.post("/process")
-async def process_excel(file: UploadFile, x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
-    client_id = get_client_id_from_key(x_client_key)
-    
-    # Read file content into BytesIO like the working script
-    file_content = await file.read()
-    file_obj = io.BytesIO(file_content)
-    
-    processed_file = process_excel_file_obj(file_obj, file.filename, client_id, rfp_id)
-    return StreamingResponse(
-        processed_file,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
-    )
+async def process_excel(
+    file: UploadFile, 
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
+    rfp_id: str | None = Header(default=None, alias="X-RFP-ID")
+):
+    try:
+        # Validate client
+        client_id = get_client_id_from_key(x_client_key)
+        if not client_id:
+            raise HTTPException(status_code=401, detail="Invalid client key")
+        
+        # Validate file
+        if not file.filename.lower().endswith('.xlsx'):
+            raise HTTPException(status_code=400, detail="Only Excel (.xlsx) files are supported")
+        
+        # Create RFP if not provided
+        if not rfp_id:
+            rfp_id = create_rfp_from_filename(client_id, file.filename)
+            
+        # Read file content
+        file_content = await file.read()
+        
+        # Process Excel file
+        processed_file = process_excel_file_obj(io.BytesIO(file_content), client_id, rfp_id)
+        
+        return StreamingResponse(
+            processed_file,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
+        )
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error processing RFP: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing RFP: {str(e)}"
+        )
 
 
 # --- RFP management routes ---
 
 @app.get("/rfps")
 def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    print(f"=== /rfps ENDPOINT CALLED ===")
-    print(f"RFPs endpoint called with client_key: {x_client_key}")
     client_id = get_client_id_from_key(x_client_key)
-    print(f"Resolved client_id: {client_id}")
     res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
-    print(f"Found {len(res.data or [])} RFPs")
     return {"rfps": res.data or []}
 
 @app.post("/rfps")
@@ -364,40 +485,77 @@ def update_org(payload: dict = Body(...), x_client_key: str | None = Header(defa
 @app.get("/org/qa")
 def list_org_qa(x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
     try:
-        print(f"=== /org/qa ENDPOINT CALLED ===")
-        print(f"list_org_qa called with client_key: {x_client_key}, rfp_id: {rfp_id}")
         client_id = get_client_id_from_key(x_client_key)
-        print(f"Resolved client_id: {client_id}")
+        print(f"Fetching QA pairs for client: {client_id}, RFP: {rfp_id}")
         
-        qs_query = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
-        ans_query = supabase.table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
-        
+        # First get all questions for the client
+        questions_query = supabase.from_("client_questions").select("*").eq("client_id", client_id)
         if rfp_id:
-            print(f"Filtering by rfp_id: {rfp_id}")
-            qs_query = qs_query.eq("rfp_id", rfp_id)
-            ans_query = ans_query.eq("rfp_id", rfp_id)
+            questions_query = questions_query.eq("rfp_id", rfp_id)
+        questions_result = questions_query.execute()
+        questions = questions_result.data or []
+        print(f"Found {len(questions)} questions")
+
+        # Get all answers
+        answers_query = supabase.from_("client_answers").select("*").eq("client_id", client_id)
+        if rfp_id:
+            answers_query = answers_query.eq("rfp_id", rfp_id)
+        answers_result = answers_query.execute()
+        answers = answers_result.data or []
+        print(f"Found {len(answers)} answers")
+
+        # Get all mappings that link questions to answers
+        if questions:
+            mappings_query = supabase.from_("client_question_answer_mappings").select("*")
+            mappings_query = mappings_query.in_("question_id", [q["id"] for q in questions])
+            mappings_result = mappings_query.execute()
+            mappings = mappings_result.data or []
+            print(f"Found {len(mappings)} mappings")
         else:
-            print("No rfp_id filter - getting all RFPs")
+            mappings = []
+
+        # Create a map of answers by their IDs for quick lookup
+        answer_map = {a["id"]: a for a in answers}
         
-        qs = qs_query.order("created_at", desc=True).execute().data or []
-        ans = ans_query.order("last_updated", desc=True).execute().data or []
-        print(f"Found {len(qs)} questions and {len(ans)} answers")
-        
-        q_ids = [q.get("id") for q in qs] if qs else []
-        mappings = []
-        if q_ids:
-            mappings = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
-        
-        print(f"Found {len(mappings)} mappings")
-        result = {"questions": qs, "answers": ans, "mappings": mappings}
-        print(f"Returning result with {len(result['questions'])} questions, {len(result['answers'])} answers, {len(result['mappings'])} mappings")
-        return result
-    except HTTPException:
-        raise
+        # Create a map of question-answer mappings
+        qa_map = {}
+        for m in mappings:
+            if m["answer_id"] in answer_map:
+                qa_map[m["question_id"]] = answer_map[m["answer_id"]]
+
+        # Process questions and their answers
+        processed_questions = []
+        processed_answers = set()
+        processed_mappings = []
+
+        for q in questions:
+            processed_questions.append(q)
+            
+            # If question has an answer, process it
+            if q["id"] in qa_map:
+                answer = qa_map[q["id"]]
+                if answer["id"] not in processed_answers:
+                    answers.append(answer)
+                    processed_answers.add(answer["id"])
+                
+                processed_mappings.append({
+                    "question_id": q["id"],
+                    "answer_id": answer["id"]
+                })
+
+        print(f"Processed data summary:")
+        print(f"- Questions: {len(processed_questions)}")
+        print(f"- Answers: {len(answers)}")
+        print(f"- Mappings: {len(processed_mappings)}")
+
+        return {
+            "questions": processed_questions,
+            "answers": list(answers),
+            "mappings": processed_mappings
+        }
     except Exception as e:
-        print(f"list_org_qa error: {e}")
-        # Return empty sets rather than 500 to avoid frontend crash
-        return {"questions": [], "answers": [], "mappings": []}
+        print(f"Error in list_org_qa: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch QA pairs: {str(e)}")
 
 
 @app.post("/org/qa")
@@ -718,137 +876,154 @@ def estimate_processing_time(file_size: int, job_type: str) -> int:
         return max(3, min(20, file_size // 204800))
     return 10
 
-def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
-    """Resolve the correct row for a question"""
-    max_row = worksheet.max_row
-    if reported_row and 2 <= reported_row <= max_row:
-        return reported_row
-    qnorm = (question_text or "").strip().lower()
-    best_r, best_score = None, 0
-    for r in range(2, max_row + 1):
-        row_text = " ".join(
-            str(worksheet.cell(row=r, column=c).value or "").lower()
-            for c in range(1, worksheet.max_column + 1))
-        s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
-        if s > best_score:
-            best_score, best_r = s, r
-    return best_r or 2
-
-def find_first_empty_column(ws):
-    """Find the first empty column in the worksheet"""
-    for col in range(1, ws.max_column + 2):
-        values = [
-            ws.cell(row=r, column=col).value for r in range(1, ws.max_row + 1)
-        ]
-        if all(v is None for v in values):
-            return col
-    return ws.max_column + 1
-
-def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None) -> io.BytesIO:
-    """Process Excel file using the working code"""
-    wb = openpyxl.load_workbook(file_obj)
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-
-        df = pd.DataFrame(ws.values)
-        if df.empty:
-            continue
-        sheet_text = df.to_string(index=False, header=False)
-
-        extracted = extract_questions_with_gemini(sheet_text)
-        if not extracted:
-            continue
-
-        ai_col = find_first_empty_column(ws)
-        ws.cell(row=1, column=ai_col, value="AI Answers")
-        review_col = ai_col + 1
-        ws.cell(row=1, column=review_col, value="Review Status")
-
-        for item in extracted:
-            qtext = item.get("question", "")
-            reported_row = item.get("row", 0)
-            if not qtext:
-                continue
-
-            write_row = resolve_row(ws, reported_row, qtext)
-            emb = get_embedding(qtext)
-            matches = search_supabase(emb, client_id, rfp_id)
-
-            final_answer = "Not found, needs review."
-            review_status = ""
-
-            if matches:
-                best = pick_best_match(matches)
-                if best and best.get("similarity", 0) >= 0.9:
-                    final_answer = best["answer"]
-                else:
-                    final_answer = generate_tailored_answer(qtext, matches)
-                    review_status = "Need review"
-
-            ws.cell(row=write_row, column=ai_col, value=final_answer)
-            if review_status:
-                ws.cell(row=write_row, column=review_col, value=review_status)
-
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
-
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
-    """Update job progress in database with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            updates = {
-                "progress_percent": progress,
-                "current_step": current_step
-            }
-            if result_data:
-                updates["result_data"] = result_data
-            if progress == 100:
-                updates["status"] = "completed"
-                updates["completed_at"] = datetime.now().isoformat()
-            elif progress == -1:
-                updates["status"] = "failed"
-                updates["completed_at"] = datetime.now().isoformat()
-            
-            supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
-            return  # Success, exit retry loop
-        except Exception as e:
-            print(f"Error updating job progress (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Wait 1 second before retry
-            else:
-                print(f"Failed to update job progress after {max_retries} attempts")
+    """Update job progress in database"""
+    try:
+        updates = {
+            "progress_percent": progress,
+            "current_step": current_step
+        }
+        if result_data:
+            updates["result_data"] = result_data
+        if progress == 100:
+            updates["status"] = "completed"
+            updates["completed_at"] = datetime.now().isoformat()
+        elif progress == -1:
+            updates["status"] = "failed"
+            updates["completed_at"] = datetime.now().isoformat()
+        
+        supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"Error updating job progress: {e}")
 
 def process_rfp_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
-    """Background RFP processing function using the working code"""
+    """Background RFP processing function"""
     try:
         update_job_progress(job_id, 10, "Starting RFP processing...")
         
-        # Use the working process_excel_file_obj function with client_id and rfp_id
-        file_obj = io.BytesIO(file_content)
-        processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id)
+        # Save file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_path = tmp_file.name
         
-        update_job_progress(job_id, 50, "Processing Excel file...")
+        try:
+            update_job_progress(job_id, 20, "Loading Excel file...")
+            wb = openpyxl.load_workbook(tmp_path)
+            
+            total_sheets = len(wb.sheetnames)
+            processed_sheets = 0
+            extracted_questions = []
+            
+            for sheet_name in wb.sheetnames:
+                try:
+                    update_job_progress(job_id, 20 + (processed_sheets * 60 // total_sheets), 
+                                      f"Processing sheet: {sheet_name}")
+                    
+                    ws = wb[sheet_name]
+                    df = pd.DataFrame(ws.values)
+                    if df.empty:
+                        processed_sheets += 1
+                        continue
+                    
+                    sheet_text = df.to_string(index=False, header=False)
+                    questions = extract_questions_with_llm(sheet_text)
+                    
+                    if not questions:
+                        processed_sheets += 1
+                        continue
+                    
+                    for q in questions:
+                        extracted_questions.append({
+                            "question": q.get("question", ""),
+                            "row": q.get("row", 0),
+                            "sheet": sheet_name
+                        })
+                    processed_sheets += 1
+                except Exception as e:
+                    print(f"Error processing sheet {sheet_name}: {e}")
+                    continue
+                
+            # All sheets processed, now generate answers
+            update_job_progress(job_id, 80, "Generating AI answers...")
+            
+            for i, q in enumerate(extracted_questions):
+                try:
+                    progress = 80 + (i * 15 // len(extracted_questions))
+                    update_job_progress(job_id, progress, f"Generating answer for question {i+1}/{len(extracted_questions)}")
+                    
+                    qtext = q.get("question", "")
+                    if not qtext:
+                        continue
+                    
+                    sheet_name = q.get("sheet", "")
+                    ws = wb[sheet_name]
+                    ai_col = find_first_empty_column(ws)
+                    review_col = ai_col + 1
+                    
+                    # Set headers if not already set
+                    if ws.cell(row=1, column=ai_col).value is None:
+                        ws.cell(row=1, column=ai_col, value="AI Answers")
+                        ws.cell(row=1, column=review_col, value="Review Status")
+                    
+                    # Get answer for question
+                    emb = get_embedding(qtext)
+                    matches = []
+                    if emb:
+                        matches = search_supabase(emb, client_id, rfp_id)
+                    
+                    final_answer = "Not found, needs review."
+                    review_status = "Need review"
+                    
+                    if matches:
+                        best = pick_best_match(matches)
+                        if best and best.get("similarity", 0) >= 0.9:
+                            final_answer = best["answer"]
+                            review_status = "Auto-matched"
+                        else:
+                            final_answer = generate_tailored_answer(qtext, matches)
+                            review_status = "AI Generated"
+                    
+                    # Store in Excel with proper formatting
+                    if "row" in q and q["row"] > 0:
+                        row = q["row"]
+                        ai_cell = ws.cell(row=row, column=ai_col, value=final_answer)
+                        ai_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                        review_cell = ws.cell(row=row, column=review_col, value=review_status)
+                        review_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    
+                    # Set column widths
+                    ai_col_letter = get_column_letter(ai_col)
+                    review_col_letter = get_column_letter(review_col)
+                    ws.column_dimensions[ai_col_letter].width = 60
+                    ws.column_dimensions[review_col_letter].width = 20
+                    
+                except Exception as e:
+                    print(f"Error processing question {i+1}: {e}")
+                    continue
+            
+            # Save processed file
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            
+            result_data = {
+                "extracted_questions": extracted_questions,
+                "processed_file": output.getvalue().hex(),
+                "total_questions": len(extracted_questions)
+            }
+            
+            update_job_progress(job_id, 100, "Processing completed!", result_data)
         
-        # Get the processed file content
-        processed_content = processed_output.getvalue()
-        
-        update_job_progress(job_id, 80, "Saving processed file...")
-        
-        # Store the processed file as hex in the database
-        result_data = {
-            "processed_file": processed_content.hex(),
-            "file_name": f"processed_{file_name}",
-            "file_size": len(processed_content)
-        }
-        
-        update_job_progress(job_id, 100, "Processing completed!", result_data)
-        
+        except Exception as e:
+            print(f"Error processing workbook: {e}")
+            update_job_progress(job_id, -1, f"Processing failed: {str(e)}")
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+    
     except Exception as e:
-        print(f"RFP processing error: {e}")
+        print(f"Error in RFP processing: {e}")
         update_job_progress(job_id, -1, f"Processing failed: {str(e)}")
 
 def extract_qa_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
@@ -957,51 +1132,36 @@ async def submit_job(
 ):
     """Submit a job for background processing - auto-creates RFP from filename"""
     try:
-        print(f"=== /jobs/submit ENDPOINT CALLED ===")
         print(f"Received job submission: file={file.filename}, job_type={job_type}, client_key={x_client_key}")
-        print(f"File content type: {file.content_type}")
-        print(f"File size: {file.size if hasattr(file, 'size') else 'unknown'}")
         
         if not file.filename:
-            print("ERROR: No file filename provided")
             raise HTTPException(status_code=400, detail="No file provided")
         
         if not job_type:
-            print("ERROR: No job type provided")
             raise HTTPException(status_code=400, detail="No job type provided")
         
         client_id = get_client_id_from_key(x_client_key)
-        print(f"Resolved client_id: {client_id}")
         
         if job_type not in ["process_rfp", "extract_qa"]:
-            print(f"ERROR: Invalid job type: {job_type}")
             raise HTTPException(status_code=400, detail=f"Invalid job type: {job_type}. Must be 'process_rfp' or 'extract_qa'")
-        
-        print("Validation passed, proceeding with job creation...")
-    except HTTPException as he:
-        print(f"HTTPException in submit_job: {he.detail}")
+    except HTTPException:
         raise
     except Exception as e:
         print(f"Error in submit_job: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
     # Auto-create RFP from filename
-    print(f"Creating RFP from filename: {file.filename}")
     rfp_id = create_rfp_from_filename(client_id, file.filename)
-    print(f"Created RFP with ID: {rfp_id}")
     
     # Read file content
-    print("Reading file content...")
     file_content = await file.read()
     file_size = len(file_content)
-    print(f"File size: {file_size} bytes")
     
     # Estimate processing time
     estimated_minutes = estimate_processing_time(file_size, job_type)
     estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
     
     # Create job record
-    print("Creating job record...")
     job_data = {
         "client_id": client_id,
         "rfp_id": rfp_id,
@@ -1014,14 +1174,11 @@ async def submit_job(
         "estimated_completion": estimated_completion.isoformat(),
         "created_at": datetime.now().isoformat()
     }
-    print(f"Job data: {job_data}")
     
     job_result = supabase.table("client_jobs").insert(job_data).execute()
     job_id = job_result.data[0]["id"]
-    print(f"Created job with ID: {job_id}")
     
     # Start background processing
-    print(f"Starting background processing for job_type: {job_type}")
     if job_type == "process_rfp":
         thread = threading.Thread(target=process_rfp_background, args=(job_id, file_content, file.filename, client_id, rfp_id))
     else:  # extract_qa
@@ -1029,47 +1186,44 @@ async def submit_job(
     
     thread.daemon = True
     thread.start()
-    print(f"Background thread started for job {job_id}")
     
-    result = {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
-    print(f"Returning result: {result}")
-    return result
+    return {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
 
 @app.get("/jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """List all jobs for a client with retry logic"""
-    print(f"=== /jobs ENDPOINT CALLED ===")
-    print(f"Jobs endpoint called with client_key: {x_client_key}")
-    client_id = get_client_id_from_key(x_client_key)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
-            return {"jobs": res.data or []}
-        except Exception as e:
-            print(f"Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Wait 1 second before retry
-            else:
-                print(f"Failed to fetch jobs after {max_retries} attempts")
-                return {"jobs": [], "error": "Database connection failed"}
+    """List all jobs for a client"""
+    try:
+        client_id = get_client_id_from_key(x_client_key)
+        print(f"Fetching jobs for client: {client_id}")
+        
+        # Get jobs with RFP information
+        res = supabase.from_("client_jobs").select("""
+            *,
+            client_rfps(
+                name
+            )
+        """).eq("client_id", client_id).order("created_at", desc=True).execute()
+        
+        # Process the response
+        jobs_data = []
+        if res.data:
+            for job in res.data:
+                rfp_info = job.pop("client_rfps", {})
+                job["rfp_name"] = rfp_info.get("name") if rfp_info else None
+                jobs_data.append(job)
+        
+        print(f"Found {len(jobs_data)} jobs")
+        return {"jobs": jobs_data}
+    except Exception as e:
+        print(f"Error fetching jobs: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """Get specific job details with retry logic"""
+    """Get specific job details"""
     client_id = get_client_id_from_key(x_client_key)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
-            return res.data
-        except Exception as e:
-            print(f"Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Wait 1 second before retry
-            else:
-                print(f"Failed to fetch job {job_id} after {max_retries} attempts")
-                raise HTTPException(status_code=500, detail="Database connection failed")
+    res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
+    return res.data
 
 @app.delete("/jobs/{job_id}")
 def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
