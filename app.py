@@ -23,7 +23,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-# CONFIGURATION 
+# CONFIGURATION
 load_dotenv()
 def _clean_env(value: str | None) -> str:
     if not value:
@@ -126,29 +126,35 @@ Sheet:
         text = (response.text or "").strip()
         start, end = text.find("["), text.rfind("]")
         if start == -1 or end == -1:
+            print(f"Gemini extract: No JSON array found in response for text: {text[:200]}...")
             return []
         return json.loads(text[start:end+1])
     except Exception as e:
-        print(f"Gemini extract error: {e}")
+        print(f"Gemini extract error: {e} - Response text: {text[:200]}...")
         return []
 
 
 def clean_markdown(text: str) -> str:
-    """Remove common Markdown formatting such as **bold**, _italic_, `code`, headings, lists, and links.
-    Keeps only readable plain text.
+    """Remove common Markdown formatting such as **bold**, _italic_, `code`, headings, and links.
+    Keeps only readable plain text with proper wrapping.
     """
     if not text:
         return ""
     cleaned = text
+    
     # Remove images entirely
     cleaned = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", cleaned)
     # Convert markdown links [text](url) -> text
     cleaned = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", cleaned)
     # Remove inline code backticks
     cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
-    # Remove bold/italic markers
-    cleaned = re.sub(r"(\*\*|__)(.*?)\1", r"\2", cleaned)
-    cleaned = re.sub(r"(\*|_)(.*?)\1", r"\2", cleaned)
+    
+    # Remove bold formatting more aggressively
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)  # **bold**
+    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)      # __bold__
+    cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)      # *italic* (treat as bold removal)
+    cleaned = re.sub(r"_([^_]+)_", r"\1", cleaned)        # _italic_ (treat as bold removal)
+    
     # Remove headings (leading #)
     cleaned = re.sub(r"^\s{0,3}#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
     # Remove blockquotes
@@ -158,29 +164,43 @@ def clean_markdown(text: str) -> str:
     cleaned = re.sub(r"^\s*\d+\.\s+", "", cleaned, flags=re.MULTILINE)
     # Remove horizontal rules lines
     cleaned = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "", cleaned, flags=re.MULTILINE)
-    # Collapse multiple spaces/newlines
+    
+    # Clean up whitespace and improve wrapping
     cleaned = re.sub(r"\s+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # Remove excessive whitespace around punctuation
+    cleaned = re.sub(r'\s*([.,!?;:])', r'\1', cleaned)
+    # Remove leading/trailing whitespace from each line
+    cleaned = re.sub(r'^\s+|\s+$', '', cleaned, flags=re.MULTILINE)
+    # Collapse multiple spaces into single space
+    cleaned = re.sub(r' {2,}', ' ', cleaned)
+    
     return cleaned.strip()
 
 
 def get_embedding(text: str) -> list:
     if not text:
+        print("DEBUG: Empty text provided to get_embedding")
         return []
     try:
+        print(f"DEBUG: Generating embedding for text: {text[:50]}...")
         res = genai.embed_content(model="models/embedding-001",
                                   content=text,
                                   task_type="retrieval_query")
-        return res["embedding"]
+        embedding = res["embedding"]
+        print(f"DEBUG: Generated embedding with {len(embedding)} dimensions")
+        return embedding
     except Exception as e:
-        print(f"Embedding error: {e}")
+        print(f"Embedding error: {e} for text: {text[:100]}...")
         return []
 
 
 def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None) -> list:
     if not question_embedding:
+        print("DEBUG: No embedding provided to search_supabase")
         return []
     try:
+        print(f"DEBUG: Searching Supabase with client_id={client_id}, rfp_id={rfp_id}")
         res = supabase.rpc(
             "client_match_questions", {
                 "query_embedding": question_embedding,
@@ -189,9 +209,10 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
                 "p_client_id": client_id,
                 "p_rfp_id": rfp_id
             }).execute()
+        print(f"DEBUG: Supabase RPC response: {res.data if res.data else 'None'}")
         return res.data if res.data else []
     except Exception as e:
-        print(f"Supabase error: {e}")
+        print(f"Supabase search error: {e}")
         return []
 
 
@@ -205,7 +226,7 @@ def generate_tailored_answer(question: str, matches: list) -> str:
         f"- Q: {m['question']} | A: {m['answer']} (similarity {m['similarity']:.2f})"
         for m in matches)
     prompt = f"""
-You are answering an RFP vendor question.  
+You are answering an RFP vendor question.
 
 New Question:
 {question}
@@ -215,12 +236,21 @@ Reference Q&A Pairs:
 
 Write a concise, tailored answer that best addresses the new question using the references.
 If unclear, combine and adapt from references.
+Return only the answer text, without any additional conversational filler or markdown formatting.
 """
     try:
-        resp = gemini.generate_content(prompt)
+        resp = gemini.generate_content(
+            prompt,
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            },
+        )
         return resp.text.strip()
     except Exception as e:
-        print(f"Gemini tailored answer error: {e}")
+        print(f"Gemini tailored answer error: {e} for question: {question[:100]}...")
         return "AI could not generate tailored answer."
 
 
@@ -718,81 +748,139 @@ def estimate_processing_time(file_size: int, job_type: str) -> int:
         return max(3, min(20, file_size // 204800))
     return 10
 
-def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
-    """Resolve the correct row for a question"""
-    max_row = worksheet.max_row
-    if reported_row and 2 <= reported_row <= max_row:
-        return reported_row
-    qnorm = (question_text or "").strip().lower()
-    best_r, best_score = None, 0
-    for r in range(2, max_row + 1):
-        row_text = " ".join(
-            str(worksheet.cell(row=r, column=c).value or "").lower()
-            for c in range(1, worksheet.max_column + 1))
-        s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
-        if s > best_score:
-            best_score, best_r = s, r
-    return best_r or 2
 
-def find_first_empty_column(ws):
-    """Find the first empty column in the worksheet"""
-    for col in range(1, ws.max_column + 2):
-        values = [
-            ws.cell(row=r, column=col).value for r in range(1, ws.max_row + 1)
-        ]
-        if all(v is None for v in values):
-            return col
-    return ws.max_column + 1
-
-def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None) -> io.BytesIO:
+def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None, job_id: str = None) -> io.BytesIO:
     """Process Excel file using the working code"""
+    print(f"DEBUG: process_excel_file_obj started for {filename} (Job ID: {job_id})")
     wb = openpyxl.load_workbook(file_obj)
 
-    for sheet_name in wb.sheetnames:
+    total_sheets = len(wb.sheetnames)
+    processed_sheets_count = 0
+    total_questions_processed = 0
+
+    for sheet_idx, sheet_name in enumerate(wb.sheetnames):
+        update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
+                            f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+        print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
         ws = wb[sheet_name]
 
         df = pd.DataFrame(ws.values)
         if df.empty:
+            print(f"DEBUG: Sheet {sheet_name} is empty, skipping.")
+            processed_sheets_count += 1
             continue
-        sheet_text = df.to_string(index=False, header=False)
-
+        
+        # Convert DataFrame to a string representation for Gemini to analyze
+        # Use header=False to prevent DataFrame column names from being sent as part of sheet_text
+        sheet_text = df.to_string(index=False, header=False) 
+        
+        print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
         extracted = extract_questions_with_gemini(sheet_text)
+        
         if not extracted:
+            print(f"DEBUG: No questions extracted from sheet {sheet_name}.")
+            processed_sheets_count += 1
             continue
+        
+        print(f"DEBUG: Found {len(extracted)} questions in sheet {sheet_name}.")
+        total_questions_processed += len(extracted)
 
         ai_col = find_first_empty_column(ws)
         ws.cell(row=1, column=ai_col, value="AI Answers")
         review_col = ai_col + 1
         ws.cell(row=1, column=review_col, value="Review Status")
 
-        for item in extracted:
+        for q_idx, item in enumerate(extracted):
             qtext = item.get("question", "")
             reported_row = item.get("row", 0)
             if not qtext:
                 continue
 
+            update_job_progress(job_id,
+                                15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / total_questions_processed / 2),
+                                f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
+            
             write_row = resolve_row(ws, reported_row, qtext)
             emb = get_embedding(qtext)
-            matches = search_supabase(emb, client_id, rfp_id)
+            print(f"DEBUG: Question: {qtext[:100]}...")
+            print(f"DEBUG: Embedding length: {len(emb) if emb else 0}")
+            print(f"DEBUG: Client ID: {client_id}, RFP ID: {rfp_id}")
+            
+            # First, let's check if there are any questions in the database for this client
+            try:
+                questions_check = supabase.table("client_questions").select("id, original_text, rfp_id, embedding").eq("client_id", client_id).limit(5).execute()
+                print(f"DEBUG: Found {len(questions_check.data) if questions_check.data else 0} questions in database for client {client_id}")
+                if questions_check.data:
+                    for q in questions_check.data[:2]:
+                        print(f"DEBUG: Sample question: {q.get('original_text', '')[:50]}...")
+                        print(f"DEBUG: Question RFP ID: {q.get('rfp_id', 'None')}")
+                        print(f"DEBUG: Question has embedding: {q.get('embedding') is not None}")
+                        if q.get('embedding'):
+                            print(f"DEBUG: Embedding length: {len(q.get('embedding', []))}")
+            except Exception as e:
+                print(f"DEBUG: Error checking questions in database: {e}")
+            
+            # Search without RFP ID filter to get all matches for the client
+            matches = search_supabase(emb, client_id, None)
+            print(f"DEBUG: Found {len(matches) if matches else 0} matches")
+            if matches:
+                for i, match in enumerate(matches[:3]):  # Show top 3 matches
+                    print(f"DEBUG: Match {i+1}: similarity={match.get('similarity', 0):.3f}, answer={match.get('answer', '')[:50]}...")
 
             final_answer = "Not found, needs review."
             review_status = ""
 
             if matches:
                 best = pick_best_match(matches)
-                if best and best.get("similarity", 0) >= 0.9:
+                print(f"DEBUG: Best match similarity: {best.get('similarity', 0) if best else 0}")
+                if best and best.get("similarity", 0) >= 0.95:
                     final_answer = best["answer"]
+                    review_status = ""
+                    print(f"DEBUG: Using direct answer (95%+ match)")
                 else:
-                    final_answer = generate_tailored_answer(qtext, matches)
-                    review_status = "Need review"
+                    # Filter matches with similarity >= 0.65 for AI generation
+                    filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
+                    print(f"DEBUG: Filtered matches (65%+): {len(filtered_matches)}")
+                    if filtered_matches:
+                        final_answer = generate_tailored_answer(qtext, filtered_matches)
+                        review_status = "Need Review"
+                        print(f"DEBUG: Using AI-generated answer")
+                    else:
+                        final_answer = "Not found, needs review."
+                        review_status = ""
+                        print(f"DEBUG: No matches above 65% threshold")
+            else:
+                print(f"DEBUG: No matches found in database")
+            
+            # Apply cleaning to the final answer before writing to the sheet
+            final_answer = clean_markdown(final_answer)
 
             ws.cell(row=write_row, column=ai_col, value=final_answer)
-            if review_status:
-                ws.cell(row=write_row, column=review_col, value=review_status)
+            ws.cell(row=write_row, column=review_col, value=review_status)
+        processed_sheets_count += 1
 
+    update_job_progress(job_id, 90, "Saving processed Excel file...")
+    print(f"DEBUG: Saving processed Excel file for {filename}.")
+    
+    # Adjust column widths for better text display - only AI Answer and Review Status columns
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        # Set column widths only for AI answer and review status columns
+        if ai_col and ai_col <= ws.max_column:
+            ws.column_dimensions[get_column_letter(ai_col)].width = 80
+        if review_col and review_col <= ws.max_column:
+            ws.column_dimensions[get_column_letter(review_col)].width = 25
+        
+        # Enable text wrapping for the AI answer column
+        if ai_col and ai_col <= ws.max_column:
+            for row in range(1, ws.max_row + 1):
+                cell = ws.cell(row=row, column=ai_col)
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
+    
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
+    print(f"DEBUG: process_excel_file_obj completed for {filename}.")
     return output
 
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
@@ -809,79 +897,92 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
             if progress == 100:
                 updates["status"] = "completed"
                 updates["completed_at"] = datetime.now().isoformat()
-            elif progress == -1:
+            elif progress == -1: # Use -1 for explicit failure
                 updates["status"] = "failed"
                 updates["completed_at"] = datetime.now().isoformat()
+            
+            print(f"DEBUG: Updating job {job_id} - Progress: {progress}%, Step: {current_step}")
+            # Ensure the client is active for Supabase calls, re-create if necessary
+            global supabase
+            if supabase is None:
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             
             supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
             return  # Success, exit retry loop
         except Exception as e:
-            print(f"Error updating job progress (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"ERROR: Error updating job progress {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
-                print(f"Failed to update job progress after {max_retries} attempts")
+                print(f"CRITICAL ERROR: Failed to update job progress for {job_id} after {max_retries} attempts.")
 
 def process_rfp_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Background RFP processing function using the working code"""
+    print(f"DEBUG: Background RFP processing started for job {job_id}")
     try:
-        update_job_progress(job_id, 10, "Starting RFP processing...")
+        update_job_progress(job_id, 10, "Starting RFP processing: Loading file...")
         
-        # Use the working process_excel_file_obj function with client_id and rfp_id
         file_obj = io.BytesIO(file_content)
-        processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id)
+        # Pass job_id to process_excel_file_obj for internal progress updates
+        processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
         
-        update_job_progress(job_id, 50, "Processing Excel file...")
+        # update_job_progress(job_id, 50, "Processing Excel file...") # This is now handled more granularly internally
         
-        # Get the processed file content
         processed_content = processed_output.getvalue()
         
-        update_job_progress(job_id, 80, "Saving processed file...")
+        update_job_progress(job_id, 95, "Finalizing and storing processed file...") # Increased progress for final step
         
-        # Store the processed file as hex in the database
         result_data = {
             "processed_file": processed_content.hex(),
             "file_name": f"processed_{file_name}",
             "file_size": len(processed_content)
         }
         
-        update_job_progress(job_id, 100, "Processing completed!", result_data)
+        update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
+        print(f"DEBUG: Background RFP processing completed successfully for job {job_id}")
         
     except Exception as e:
-        print(f"RFP processing error: {e}")
+        print(f"ERROR: RFP processing background error for job {job_id}: {e}", exc_info=True)
         update_job_progress(job_id, -1, f"Processing failed: {str(e)}")
 
 def extract_qa_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Background QA extraction function"""
+    print(f"DEBUG: Background QA extraction started for job {job_id}")
     try:
-        update_job_progress(job_id, 10, "Starting QA extraction...")
+        update_job_progress(job_id, 10, "Starting QA extraction: Loading file...")
         
-        # Save file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             tmp_file.write(file_content)
             tmp_path = tmp_file.name
         
         try:
-            update_job_progress(job_id, 20, "Loading Excel file...")
+            update_job_progress(job_id, 20, "Loading Excel file for QA extraction...")
             xls = pd.ExcelFile(tmp_path)
             
             total_sheets = len(xls.sheet_names)
             processed_sheets = 0
             extracted_pairs = []
             
-            for sheet in xls.sheet_names:
-                progress = 20 + (processed_sheets * 70 // total_sheets)
-                update_job_progress(job_id, progress, f"Extracting from sheet: {sheet}")
+            for sheet_idx, sheet in enumerate(xls.sheet_names):
+                progress_start_sheet = 20 + (sheet_idx * 70 // total_sheets)
+                progress_end_sheet = 20 + ((sheet_idx + 1) * 70 // total_sheets)
                 
+                update_job_progress(job_id, progress_start_sheet, f"Extracting from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
+                print(f"DEBUG: QA extraction from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
+
                 df = pd.read_excel(tmp_path, sheet_name=sheet, header=None)
                 if df.empty:
+                    print(f"DEBUG: Sheet {sheet} is empty, skipping for QA extraction.")
                     processed_sheets += 1
                     continue
                 
                 sheet_csv = df.to_csv(index=False, header=False)
                 pairs = _extract_qa_pairs(sheet_csv)
                 
-                for p in pairs:
+                for p_idx, p in enumerate(pairs):
+                    # More granular update for each pair found (optional, could be too chatty)
+                    # update_job_progress(job_id, progress_start_sheet + (p_idx * (progress_end_sheet - progress_start_sheet) // len(pairs)),
+                    #                     f"Processing Q&A pair {p_idx + 1}/{len(pairs)} in sheet {sheet}")
                     extracted_pairs.append({
                         "question": p.get("question", ""),
                         "answer": p.get("answer", ""),
@@ -891,32 +992,34 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 
                 processed_sheets += 1
             
-            update_job_progress(job_id, 90, "Saving extracted Q&A pairs...")
+            update_job_progress(job_id, 90, f"Saving {len(extracted_pairs)} extracted Q&A pairs to database...")
+            print(f"DEBUG: Saving {len(extracted_pairs)} extracted Q&A pairs to database for job {job_id}.")
             
-            # Save to database
             created_count = 0
-            for p in extracted_pairs:
+            for p_idx, p in enumerate(extracted_pairs):
                 q = p.get("question", "").strip()
                 a = p.get("answer", "").strip()
                 c = p.get("category", "Other").strip() or "Other"
                 if q and a and _insert_qa_pair(client_id, q, a, c, rfp_id):
                     created_count += 1
+                # Optional: update_job_progress for each saved pair to database
             
             result_data = {
-                "extracted_pairs": extracted_pairs,
-                "created_count": created_count,
-                "total_pairs": len(extracted_pairs)
+                "extracted_pairs_count": len(extracted_pairs), # Renamed for clarity
+                "created_pairs_count": created_count,          # Renamed for clarity
+                "total_sheets_processed": processed_sheets
             }
             
-            update_job_progress(job_id, 100, "QA extraction completed!", result_data)
+            update_job_progress(job_id, 100, "QA extraction completed successfully!", result_data)
+            print(f"DEBUG: Background QA extraction completed successfully for job {job_id}")
             
         finally:
-            # Clean up temp file
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+                print(f"DEBUG: Cleaned up temporary file: {tmp_path}")
                 
     except Exception as e:
-        print(f"QA extraction error: {e}")
+        print(f"ERROR: QA extraction background error for job {job_id}: {e}", exc_info=True)
         update_job_progress(job_id, -1, f"Extraction failed: {str(e)}")
 
 def create_rfp_from_filename(client_id: str, filename: str) -> str:
@@ -927,13 +1030,15 @@ def create_rfp_from_filename(client_id: str, filename: str) -> str:
     rfp_name = ' '.join(word.capitalize() for word in rfp_name.split())  # Title case
     
     # Check if RFP with similar name already exists
-    existing_rfps = supabase.table("client_rfps").select("id, name").eq("client_id", client_id).execute()
+    existing_rfps_res = supabase.table("client_rfps").select("id, name").eq("client_id", client_id).execute()
+    existing_rfps = existing_rfps_res.data or []
     
     # Find exact match or similar name
     rfp_id = None
-    for rfp in existing_rfps.data or []:
+    for rfp in existing_rfps:
         if rfp["name"].lower() == rfp_name.lower():
             rfp_id = rfp["id"]
+            print(f"DEBUG: Found existing RFP '{rfp_name}' with ID: {rfp_id}")
             break
     
     # Create new RFP if not found
@@ -946,6 +1051,7 @@ def create_rfp_from_filename(client_id: str, filename: str) -> str:
         }
         rfp_result = supabase.table("client_rfps").insert(rfp_data).execute()
         rfp_id = rfp_result.data[0]["id"]
+        print(f"DEBUG: Created new RFP '{rfp_name}' with ID: {rfp_id}")
     
     return rfp_id
 
@@ -982,7 +1088,7 @@ async def submit_job(
         print(f"HTTPException in submit_job: {he.detail}")
         raise
     except Exception as e:
-        print(f"Error in submit_job: {e}")
+        print(f"ERROR: Error in submit_job before background task: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
     # Auto-create RFP from filename
@@ -1047,7 +1153,7 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
             res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
             return {"jobs": res.data or []}
         except Exception as e:
-            print(f"Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -1064,7 +1170,7 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
             res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
             return res.data
         except Exception as e:
-            print(f"Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -1075,5 +1181,14 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
 def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Cancel a pending job"""
     client_id = get_client_id_from_key(x_client_key)
-    supabase.table("client_jobs").update({"status": "cancelled"}).eq("id", job_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    # Check if job is pending or processing before cancelling
+    res = supabase.table("client_jobs").select("status").eq("id", job_id).eq("client_id", client_id).single().execute()
+    job_status = res.data.get("status") if res.data else None
+
+    if job_status in ["pending", "processing"]:
+        supabase.table("client_jobs").update({"status": "cancelled", "current_step": "Job cancelled by user", "completed_at": datetime.now().isoformat()}).eq("id", job_id).eq("client_id", client_id).execute()
+        print(f"DEBUG: Job {job_id} cancelled by user.")
+        return {"ok": True, "message": f"Job {job_id} cancelled successfully."}
+    else:
+        print(f"WARN: Attempted to cancel job {job_id} which is in status: {job_status}. Only pending/processing jobs can be cancelled.")
+        raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'. Only pending or processing jobs can be cancelled.")
