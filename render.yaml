@@ -3,6 +3,7 @@ services:
     name: rfp-backend
     env: python
     plan: starter
+    pythonVersion: 3.12
     buildCommand: pip install -r requirements.txt
     startCommand: chmod +x start.sh && ./start.sh
     envVars:
