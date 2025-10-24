@@ -54,13 +54,49 @@ if not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # FastAPI app
-app = FastAPI()
+app = FastAPI(
+    title="RFP Backend API", 
+    version="1.0.0",
+    description="Backend API for RFP processing and management",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Root endpoint
+@app.get("/")
+def root():
+    return {
+        "message": "RFP Backend API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
 
 # Test endpoint to verify connectivity
 @app.get("/test")
 def test_endpoint():
     print("=== TEST ENDPOINT CALLED ===")
     return {"message": "Backend is working!", "timestamp": datetime.now().isoformat()}
+
+# Health check endpoint for Render monitoring
+@app.get("/health")
+def health_check():
+    """Health check endpoint for monitoring"""
+    try:
+        # Test database connectivity
+        supabase.table("clients").select("id").limit(1).execute()
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "disconnected",
+            "error": str(e)
+        }
 
 # Test endpoint for job submission debugging
 @app.post("/jobs/submit-test")
@@ -76,11 +112,28 @@ async def submit_job_test(
 
 # CORS for frontend dev and configurable origins
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-allowed_origins = [frontend_origin, "http://127.0.0.1:5173", "http://localhost:5173"]
+allowed_origins = [
+    frontend_origin, 
+    "http://127.0.0.1:5173", 
+    "http://localhost:5173",
+    "https://localhost:5173",
+    "https://127.0.0.1:5173",
+    "https://rfp-two.vercel.app"  # Production frontend
+]
+
+# Add production origins if they exist
+if os.getenv("RENDER"):
+    # Running on Render
+    allowed_origins.extend([
+        "https://rfp-two.vercel.app",  # Production frontend
+        "https://*.vercel.app",  # Allow any Vercel subdomain
+        "https://*.onrender.com"  # Allow any Render subdomain
+    ])
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?",
+    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1|.*\\.onrender\\.com|.*\\.vercel\\.app)(:\\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=[
@@ -1357,3 +1410,9 @@ def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alia
     else:
         print(f"WARN: Attempted to cancel job {job_id} which is in status: {job_status}. Only pending/processing jobs can be cancelled.")
         raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'. Only pending or processing jobs can be cancelled.")
+
+# Main entry point for Render deployment
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
