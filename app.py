@@ -22,6 +22,9 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # CONFIGURATION
 load_dotenv()
@@ -933,9 +936,9 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
         update_job_progress(job_id, 95, "Finalizing and storing processed file...") # Increased progress for final step
         
         result_data = {
-            "processed_file": processed_content.hex(),
             "file_name": f"processed_{file_name}",
-            "file_size": len(processed_content)
+            "file_size": len(processed_content),
+            "processing_completed": True
         }
         
         update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
@@ -1015,12 +1018,96 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
             
         finally:
             if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-                print(f"DEBUG: Cleaned up temporary file: {tmp_path}")
+                try:
+                    os.unlink(tmp_path)
+                    print(f"DEBUG: Cleaned up temporary file: {tmp_path}")
+                except PermissionError:
+                    print(f"DEBUG: Could not delete temp file {tmp_path} - file may be in use")
+                except Exception as e:
+                    print(f"DEBUG: Error cleaning up temp file: {e}")
                 
     except Exception as e:
-        print(f"ERROR: QA extraction background error for job {job_id}: {e}", exc_info=True)
+        import traceback
+        print(f"ERROR: QA extraction background error for job {job_id}: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
         update_job_progress(job_id, -1, f"Extraction failed: {str(e)}")
+
+# Google Drive Integration Functions
+def get_drive_service(access_token: str):
+    """Create Google Drive service with access token"""
+    credentials = Credentials(token=access_token)
+    return build('drive', 'v3', credentials=credentials)
+
+def find_or_create_folder(service, folder_name: str, parent_folder_id: str = None) -> str:
+    """Find existing folder or create new one"""
+    try:
+        # Search for existing folder
+        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+        if parent_folder_id:
+            query += f" and '{parent_folder_id}' in parents"
+        else:
+            query += " and 'root' in parents"
+        
+        results = service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        
+        if files:
+            return files[0]['id']
+        
+        # Create new folder
+        folder_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        if parent_folder_id:
+            folder_metadata['parents'] = [parent_folder_id]
+        
+        folder = service.files().create(body=folder_metadata, fields='id').execute()
+        return folder.get('id')
+        
+    except Exception as e:
+        print(f"Error finding/creating folder: {e}")
+        return None
+
+def upload_file_to_drive(service, file_content: bytes, filename: str, folder_id: str, mime_type: str = 'application/octet-stream') -> str:
+    """Upload file to Google Drive folder"""
+    try:
+        file_metadata = {
+            'name': filename,
+            'parents': [folder_id]
+        }
+        
+        media = MediaIoBaseUpload(io.BytesIO(file_content), mimetype=mime_type, resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return file.get('id')
+        
+    except Exception as e:
+        print(f"Error uploading file to Drive: {e}")
+        return None
+
+def setup_drive_folders(access_token: str, client_name: str) -> dict:
+    """Setup folder structure in Google Drive"""
+    try:
+        service = get_drive_service(access_token)
+        
+        # Create main client folder
+        client_folder_id = find_or_create_folder(service, f"Your_RFP_{client_name}")
+        if not client_folder_id:
+            return None
+        
+        # Create subfolders
+        processed_folder_id = find_or_create_folder(service, "Processed Files", client_folder_id)
+        unprocessed_folder_id = find_or_create_folder(service, "Unprocessed Files", client_folder_id)
+        
+        return {
+            "client_folder_id": client_folder_id,
+            "processed_folder_id": processed_folder_id,
+            "unprocessed_folder_id": unprocessed_folder_id
+        }
+        
+    except Exception as e:
+        print(f"Error setting up Drive folders: {e}")
+        return None
 
 def create_rfp_from_filename(client_id: str, filename: str) -> str:
     """Auto-create RFP record from filename"""
@@ -1151,7 +1238,11 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
     for attempt in range(max_retries):
         try:
             res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
-            return {"jobs": res.data or []}
+            jobs = res.data or []
+            # Debug: Print job data to see what's being returned
+            for job in jobs[:2]:  # Print first 2 jobs for debugging
+                print(f"DEBUG: Job {job.get('id', 'unknown')} - result_data: {job.get('result_data', {})}")
+            return {"jobs": jobs}
         except Exception as e:
             print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -1159,6 +1250,80 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
             else:
                 print(f"Failed to fetch jobs after {max_retries} attempts")
                 return {"jobs": [], "error": "Database connection failed"}
+
+# Google Drive API endpoints
+@app.post("/drive/setup")
+def setup_drive_folders_endpoint(
+    payload: dict = Body(...),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Setup Google Drive folders for client"""
+    client_id = get_client_id_from_key(x_client_key)
+    access_token = payload.get("access_token")
+    client_name = payload.get("client_name", "Client")
+    
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Access token required")
+    
+    try:
+        folder_structure = setup_drive_folders(access_token, client_name)
+        if folder_structure:
+            return {"success": True, "folders": folder_structure}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to setup Drive folders")
+    except Exception as e:
+        print(f"Drive setup error: {e}")
+        raise HTTPException(status_code=500, detail=f"Drive setup failed: {str(e)}")
+
+@app.post("/drive/upload")
+def upload_to_drive_endpoint(
+    payload: dict = Body(...),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Upload file to Google Drive"""
+    client_id = get_client_id_from_key(x_client_key)
+    access_token = payload.get("access_token")
+    file_content = payload.get("file_content")  # Base64 encoded
+    filename = payload.get("filename")
+    folder_type = payload.get("folder_type", "processed")  # "processed" or "unprocessed"
+    
+    if not all([access_token, file_content, filename]):
+        raise HTTPException(status_code=400, detail="Missing required parameters")
+    
+    try:
+        import base64
+        file_bytes = base64.b64decode(file_content)
+        
+        service = get_drive_service(access_token)
+        
+        # Determine folder based on type
+        if folder_type == "processed":
+            folder_id = payload.get("processed_folder_id")
+        else:
+            folder_id = payload.get("unprocessed_folder_id")
+        
+        if not folder_id:
+            raise HTTPException(status_code=400, detail="Folder ID required")
+        
+        # Determine MIME type based on file extension
+        mime_type = "application/octet-stream"
+        if filename.lower().endswith('.xlsx'):
+            mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif filename.lower().endswith('.xls'):
+            mime_type = "application/vnd.ms-excel"
+        elif filename.lower().endswith('.pdf'):
+            mime_type = "application/pdf"
+        
+        file_id = upload_file_to_drive(service, file_bytes, filename, folder_id, mime_type)
+        
+        if file_id:
+            return {"success": True, "file_id": file_id, "filename": filename}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to upload file")
+            
+    except Exception as e:
+        print(f"Drive upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):

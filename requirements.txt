@@ -6,3 +6,7 @@ supabase
 google-generativeai>=0.7.2
 python-dotenv
 python-multipart
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
