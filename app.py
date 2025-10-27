@@ -969,24 +969,24 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
         gc.collect()
         processed_sheets_count += 1
 
-    update_job_progress(job_id, 90, "Saving processed Excel file...")
-    print(f"DEBUG: Saving processed Excel file for {filename}.")
-    
-    # Adjust column widths for better text display - only AI Answer and Review Status columns
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        # Set column widths only for AI answer and review status columns
-        if ai_col and ai_col <= ws.max_column:
-            ws.column_dimensions[get_column_letter(ai_col)].width = 160  # Doubled from 80 to 160
-        if review_col and review_col <= ws.max_column:
-            ws.column_dimensions[get_column_letter(review_col)].width = 25
+        update_job_progress(job_id, 90, "Saving processed Excel file...")
+        print(f"DEBUG: Saving processed Excel file for {filename}.")
         
-        # Enable text wrapping for the AI answer column
-        if ai_col and ai_col <= ws.max_column:
-            for row in range(1, ws.max_row + 1):
-                cell = ws.cell(row=row, column=ai_col)
-                cell.alignment = Alignment(wrap_text=True, vertical='top')
-    
+        # Adjust column widths for better text display - only AI Answer and Review Status columns
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            # Set column widths only for AI answer and review status columns
+            if ai_col and ai_col <= ws.max_column:
+                ws.column_dimensions[get_column_letter(ai_col)].width = 160  # Doubled from 80 to 160
+            if review_col and review_col <= ws.max_column:
+                ws.column_dimensions[get_column_letter(review_col)].width = 25
+            
+            # Enable text wrapping for the AI answer column
+            if ai_col and ai_col <= ws.max_column:
+                for row in range(1, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=ai_col)
+                    cell.alignment = Alignment(wrap_text=True, vertical='top')
+        
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
