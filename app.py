@@ -21,6 +21,7 @@ import asyncio
 import threading
 import time
 import uuid
+import gc
 from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -170,23 +171,42 @@ Sheet:
 {sheet_text}
 """
     try:
-        response = gemini.generate_content(
-            prompt,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            },
-        )
-        text = (response.text or "").strip()
-        start, end = text.find("["), text.rfind("]")
-        if start == -1 or end == -1:
-            print(f"Gemini extract: No JSON array found in response for text: {text[:200]}...")
+        # Add timeout handling
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Gemini API call timed out")
+        
+        # Set timeout for 60 seconds
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(60)
+        
+        try:
+            response = gemini.generate_content(
+                prompt,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                },
+            )
+            signal.alarm(0)  # Cancel timeout
+            text = (response.text or "").strip()
+            start, end = text.find("["), text.rfind("]")
+            if start == -1 or end == -1:
+                print(f"Gemini extract: No JSON array found in response for text: {text[:200]}...")
+                return []
+            return json.loads(text[start:end+1])
+        except TimeoutError:
+            signal.alarm(0)  # Cancel timeout
+            print("Gemini extract: API call timed out after 60 seconds")
             return []
-        return json.loads(text[start:end+1])
+        finally:
+            signal.alarm(0)  # Ensure timeout is cancelled
+            
     except Exception as e:
-        print(f"Gemini extract error: {e} - Response text: {text[:200]}...")
+        print(f"Gemini extract error: {e}")
         return []
 
 
@@ -295,16 +315,35 @@ If unclear, combine and adapt from references.
 Return only the answer text, without any additional conversational filler or markdown formatting.
 """
     try:
-        resp = gemini.generate_content(
-            prompt,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            },
-        )
-        return resp.text.strip()
+        # Add timeout handling
+        import signal
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Gemini API call timed out")
+        
+        # Set timeout for 45 seconds
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(45)
+        
+        try:
+            resp = gemini.generate_content(
+                prompt,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                },
+            )
+            signal.alarm(0)  # Cancel timeout
+            return resp.text.strip()
+        except TimeoutError:
+            signal.alarm(0)  # Cancel timeout
+            print("Gemini tailored answer: API call timed out after 45 seconds")
+            return "AI could not generate tailored answer (timeout)."
+        finally:
+            signal.alarm(0)  # Ensure timeout is cancelled
+            
     except Exception as e:
         print(f"Gemini tailored answer error: {e} for question: {question[:100]}...")
         return "AI could not generate tailored answer."
@@ -808,17 +847,25 @@ def estimate_processing_time(file_size: int, job_type: str) -> int:
 def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None, job_id: str = None) -> io.BytesIO:
     """Process Excel file using the working code"""
     print(f"DEBUG: process_excel_file_obj started for {filename} (Job ID: {job_id})")
-    wb = openpyxl.load_workbook(file_obj)
+    start_time = time.time()
+    max_processing_time = 1800  # 30 minutes max processing time
+    
+    try:
+        wb = openpyxl.load_workbook(file_obj)
 
-    total_sheets = len(wb.sheetnames)
-    processed_sheets_count = 0
-    total_questions_processed = 0
+        total_sheets = len(wb.sheetnames)
+        processed_sheets_count = 0
+        total_questions_processed = 0
 
-    for sheet_idx, sheet_name in enumerate(wb.sheetnames):
-        update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
-                            f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-        print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-        ws = wb[sheet_name]
+        for sheet_idx, sheet_name in enumerate(wb.sheetnames):
+            # Check if processing time exceeded
+            if time.time() - start_time > max_processing_time:
+                raise Exception(f"Processing timeout: exceeded {max_processing_time/60:.1f} minutes")
+            
+            update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
+                                f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+            print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+            ws = wb[sheet_name]
 
         df = pd.DataFrame(ws.values)
         if df.empty:
@@ -828,7 +875,10 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 
         # Convert DataFrame to a string representation for Gemini to analyze
         # Use header=False to prevent DataFrame column names from being sent as part of sheet_text
+        # Limit sheet text size to prevent memory issues
         sheet_text = df.to_string(index=False, header=False)
+        if len(sheet_text) > 50000:  # Limit to 50KB of text
+            sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
         
         print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
         extracted = extract_questions_with_gemini(sheet_text)
@@ -913,6 +963,10 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
 
             ws.cell(row=write_row, column=ai_col, value=final_answer)
             ws.cell(row=write_row, column=review_col, value=review_status)
+        
+        # Free up memory after processing each sheet
+        del df, sheet_text, extracted
+        gc.collect()
         processed_sheets_count += 1
 
     update_job_progress(job_id, 90, "Saving processed Excel file...")
@@ -933,11 +987,17 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 cell = ws.cell(row=row, column=ai_col)
                 cell.alignment = Alignment(wrap_text=True, vertical='top')
     
-            output = io.BytesIO()
-            wb.save(output)
-            output.seek(0)
-    print(f"DEBUG: process_excel_file_obj completed for {filename}.")
-    return output
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        print(f"DEBUG: process_excel_file_obj completed for {filename} in {time.time() - start_time:.1f}s.")
+        return output
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"Excel processing failed after {processing_time:.1f}s: {str(e)}"
+        print(f"ERROR: process_excel_file_obj error for {filename}: {error_msg}")
+        raise Exception(error_msg)
 
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
     """Update job progress in database with retry logic"""
@@ -975,31 +1035,41 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
 def process_rfp_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Background RFP processing function using the working code"""
     print(f"DEBUG: Background RFP processing started for job {job_id}")
+    start_time = time.time()
+    
     try:
         update_job_progress(job_id, 10, "Starting RFP processing: Loading file...")
+        
+        # Check file size to prevent memory issues
+        file_size_mb = len(file_content) / (1024 * 1024)
+        if file_size_mb > 50:  # 50MB limit
+            raise Exception(f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
+        
+        print(f"DEBUG: Processing file {file_name} ({file_size_mb:.1f}MB)")
         
         file_obj = io.BytesIO(file_content)
         # Pass job_id to process_excel_file_obj for internal progress updates
         processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
         
-        # update_job_progress(job_id, 50, "Processing Excel file...") # This is now handled more granularly internally
-        
         processed_content = processed_output.getvalue()
         
-        update_job_progress(job_id, 95, "Finalizing and storing processed file...") # Increased progress for final step
+        update_job_progress(job_id, 95, "Finalizing and storing processed file...")
         
         result_data = {
             "file_name": f"processed_{file_name}",
             "file_size": len(processed_content),
-            "processing_completed": True
+            "processing_completed": True,
+            "processing_time_seconds": int(time.time() - start_time)
         }
         
         update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
-        print(f"DEBUG: Background RFP processing completed successfully for job {job_id}")
+        print(f"DEBUG: Background RFP processing completed successfully for job {job_id} in {time.time() - start_time:.1f}s")
                 
     except Exception as e:
-        print(f"ERROR: RFP processing background error for job {job_id}: {e}", exc_info=True)
-        update_job_progress(job_id, -1, f"Processing failed: {str(e)}")
+        processing_time = time.time() - start_time
+        error_msg = f"Processing failed after {processing_time:.1f}s: {str(e)}"
+        print(f"ERROR: RFP processing background error for job {job_id}: {error_msg}", exc_info=True)
+        update_job_progress(job_id, -1, error_msg)
 
 def extract_qa_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Background QA extraction function"""
@@ -1201,12 +1271,10 @@ async def submit_job(
     job_type: str = Form(...),
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
 ):
-    """Submit a job for background processing - auto-creates RFP from filename"""
+    """Submit a job for background processing - uses worker process for long-running tasks"""
     try:
         print(f"=== /jobs/submit ENDPOINT CALLED ===")
         print(f"Received job submission: file={file.filename}, job_type={job_type}, client_key={x_client_key}")
-        print(f"File content type: {file.content_type}")
-        print(f"File size: {file.size if hasattr(file, 'size') else 'unknown'}")
         
         if not file.filename:
             print("ERROR: No file filename provided")
@@ -1242,11 +1310,20 @@ async def submit_job(
     file_size = len(file_content)
     print(f"File size: {file_size} bytes")
     
+    # Check file size limit
+    file_size_mb = file_size / (1024 * 1024)
+    if file_size_mb > 50:  # 50MB limit
+        raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
+    
     # Estimate processing time
     estimated_minutes = estimate_processing_time(file_size, job_type)
     estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
     
-    # Create job record
+    # Encode file content as base64 for storage
+    import base64
+    file_content_b64 = base64.b64encode(file_content).decode('utf-8')
+    
+    # Create job record with file content stored in database
     print("Creating job record...")
     job_data = {
         "client_id": client_id,
@@ -1258,26 +1335,27 @@ async def submit_job(
         "progress_percent": 0,
         "current_step": "Job queued for processing",
         "estimated_completion": estimated_completion.isoformat(),
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
+        "job_data": {
+            "file_content": file_content_b64,
+            "file_name": file.filename,
+            "client_id": client_id,
+            "rfp_id": rfp_id
+        }
     }
-    print(f"Job data: {job_data}")
+    print(f"Job data created, file content encoded")
     
     job_result = supabase.table("client_jobs").insert(job_data).execute()
     job_id = job_result.data[0]["id"]
     print(f"Created job with ID: {job_id}")
     
-    # Start background processing
-    print(f"Starting background processing for job_type: {job_type}")
-    if job_type == "process_rfp":
-        thread = threading.Thread(target=process_rfp_background, args=(job_id, file_content, file.filename, client_id, rfp_id))
-    else:  # extract_qa
-        thread = threading.Thread(target=extract_qa_background, args=(job_id, file_content, file.filename, client_id, rfp_id))
-    
-    thread.daemon = True
-    thread.start()
-    print(f"Background thread started for job {job_id}")
-    
-    result = {"job_id": job_id, "rfp_id": rfp_id, "estimated_minutes": estimated_minutes, "status": "submitted"}
+    result = {
+        "job_id": job_id, 
+        "rfp_id": rfp_id, 
+        "estimated_minutes": estimated_minutes, 
+        "status": "submitted",
+        "message": "Job submitted successfully. Processing will begin shortly."
+    }
     print(f"Returning result: {result}")
     return result
 
@@ -1386,7 +1464,30 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
     for attempt in range(max_retries):
         try:
             res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
-            return res.data
+            job_data = res.data
+            
+            if job_data:
+                # Calculate elapsed time and estimated remaining time
+                created_at = datetime.fromisoformat(job_data["created_at"].replace('Z', '+00:00'))
+                elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
+                
+                # Add timing information
+                job_data["elapsed_minutes"] = round(elapsed_minutes, 1)
+                
+                if job_data["status"] == "pending":
+                    job_data["estimated_remaining_minutes"] = job_data.get("estimated_minutes", 10)
+                elif job_data["status"] == "processing":
+                    estimated_total = job_data.get("estimated_minutes", 10)
+                    remaining = max(0, estimated_total - elapsed_minutes)
+                    job_data["estimated_remaining_minutes"] = round(remaining, 1)
+                else:
+                    job_data["estimated_remaining_minutes"] = 0
+                
+                # Remove sensitive data before returning
+                if "job_data" in job_data:
+                    del job_data["job_data"]
+            
+            return job_data
         except Exception as e:
             print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -1394,6 +1495,33 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
             else:
                 print(f"Failed to fetch job {job_id} after {max_retries} attempts")
                 raise HTTPException(status_code=500, detail="Database connection failed")
+
+@app.get("/jobs/{job_id}/status")
+def get_job_status(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Get job status for polling - lightweight endpoint"""
+    client_id = get_client_id_from_key(x_client_key)
+    try:
+        res = supabase.table("client_jobs").select("id, status, progress_percent, current_step, created_at, completed_at").eq("id", job_id).eq("client_id", client_id).single().execute()
+        job = res.data
+        
+        if job:
+            # Calculate elapsed time
+            created_at = datetime.fromisoformat(job["created_at"].replace('Z', '+00:00'))
+            elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
+            
+            return {
+                "job_id": job["id"],
+                "status": job["status"],
+                "progress_percent": job["progress_percent"],
+                "current_step": job["current_step"],
+                "elapsed_minutes": round(elapsed_minutes, 1),
+                "completed_at": job.get("completed_at")
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Job not found")
+    except Exception as e:
+        print(f"ERROR: Error fetching job status {job_id}: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
 
 @app.delete("/jobs/{job_id}")
 def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
@@ -1410,6 +1538,49 @@ def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alia
     else:
         print(f"WARN: Attempted to cancel job {job_id} which is in status: {job_status}. Only pending/processing jobs can be cancelled.")
         raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'. Only pending or processing jobs can be cancelled.")
+
+@app.post("/jobs/cleanup")
+def cleanup_old_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Clean up old completed/failed jobs to free up database space"""
+    client_id = get_client_id_from_key(x_client_key)
+    
+    # Delete jobs older than 7 days that are completed or failed
+    cutoff_date = datetime.now() - timedelta(days=7)
+    
+    try:
+        res = supabase.table("client_jobs").delete().eq("client_id", client_id).in_("status", ["completed", "failed", "cancelled"]).lt("created_at", cutoff_date.isoformat()).execute()
+        
+        deleted_count = len(res.data) if res.data else 0
+        print(f"DEBUG: Cleaned up {deleted_count} old jobs for client {client_id}")
+        
+        return {"ok": True, "deleted_count": deleted_count, "message": f"Cleaned up {deleted_count} old jobs"}
+    except Exception as e:
+        print(f"ERROR: Error cleaning up jobs for client {client_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cleanup jobs")
+
+@app.get("/jobs/stats")
+def get_job_stats(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Get job statistics for the client"""
+    client_id = get_client_id_from_key(x_client_key)
+    
+    try:
+        # Get job counts by status
+        res = supabase.table("client_jobs").select("status").eq("client_id", client_id).execute()
+        jobs = res.data or []
+        
+        stats = {
+            "total": len(jobs),
+            "pending": len([j for j in jobs if j["status"] == "pending"]),
+            "processing": len([j for j in jobs if j["status"] == "processing"]),
+            "completed": len([j for j in jobs if j["status"] == "completed"]),
+            "failed": len([j for j in jobs if j["status"] == "failed"]),
+            "cancelled": len([j for j in jobs if j["status"] == "cancelled"])
+        }
+        
+        return stats
+    except Exception as e:
+        print(f"ERROR: Error getting job stats for client {client_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get job statistics")
 
 # Main entry point for Render deployment
 if __name__ == "__main__":
