@@ -386,27 +386,30 @@ def _row_text(ws, r: int) -> str:
     )
 
 
-def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
-    """Place answer without fuzzy matching.
-    - If question text is empty, return None (drop).
-    - If reported_row is a valid integer >= 2, use it.
-    - Otherwise, append to the end (next row after current max).
-    """
-    qtext = (question_text or "").strip()
-    if not qtext:
-        return None
+def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
+    max_row = worksheet.max_row
+    qnorm = (question_text or "").strip().lower()
 
+    # Prefer a local window around the reported row if provided (±3 rows)
+    if reported_row and 2 <= reported_row <= max_row:
+        start_r = max(2, reported_row - 3)
+        end_r = min(max_row, reported_row + 3)
+        best_r, best_score = reported_row, -1.0
+        for r in range(start_r, end_r + 1):
+            row_text = _row_text(worksheet, r)
+            s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
+            if s > best_score:
+                best_score, best_r = s, r
+        return best_r
+
+    # Fallback to global search when no reported row
     best_r, best_score = None, -1.0
-    for r in range(2, max_row + 1):  # skip header row
+    for r in range(2, max_row + 1):  # skip header
         row_text = _row_text(worksheet, r)
         s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
         if s > best_score:
             best_score, best_r = s, r
-
-    # Only accept strong matches
-    if best_score >= 0.80:
-        return best_r
-    return None
+    return best_r or 2
 
 
 def find_first_empty_column(ws):
@@ -514,39 +517,28 @@ def update_org(payload: dict = Body(...), x_client_key: str | None = Header(defa
 @app.get("/org/qa")
 def list_org_qa(x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
     try:
-        print(f"=== /org/qa ENDPOINT CALLED ===")
-        print(f"list_org_qa called with client_key: {x_client_key}, rfp_id: {rfp_id}")
         client_id = get_client_id_from_key(x_client_key)
-        print(f"Resolved client_id: {client_id}")
-        
         qs_query = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
         ans_query = supabase.table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
-        
+
         if rfp_id:
-            print(f"Filtering by rfp_id: {rfp_id}")
             qs_query = qs_query.eq("rfp_id", rfp_id)
             ans_query = ans_query.eq("rfp_id", rfp_id)
-        else:
-            print("No rfp_id filter - getting all RFPs")
-        
+
         qs = qs_query.order("created_at", desc=True).execute().data or []
         ans = ans_query.order("last_updated", desc=True).execute().data or []
-        print(f"Found {len(qs)} questions and {len(ans)} answers")
-        
+
         q_ids = [q.get("id") for q in qs] if qs else []
         mappings = []
         if q_ids:
             mappings = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
-        
-        print(f"Found {len(mappings)} mappings")
-        result = {"questions": qs, "answers": ans, "mappings": mappings}
-        print(f"Returning result with {len(result['questions'])} questions, {len(result['answers'])} answers, {len(result['mappings'])} mappings")
-        return result
+
+        return {"questions": qs, "answers": ans, "mappings": mappings}
     except HTTPException:
         raise
     except Exception as e:
+        # Keep minimal context for ops without noisy logs
         print(f"list_org_qa error: {e}")
-        # Return empty sets rather than 500 to avoid frontend crash
         return {"questions": [], "answers": [], "mappings": []}
 
 
@@ -1068,6 +1060,7 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
             "summary_type": "Consolidated",
             "character_count": len(consolidated_answer),
             "quality_score": None,
+            "approved": True,
             "client_id": client_id,
             "rfp_id": rfp_id,
         }
@@ -1181,7 +1174,7 @@ def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-
     client_id = get_client_id_from_key(x_client_key)
     try:
         # Fetch summaries
-        s_query = supabase.table("client_summaries").select("id, summary_text, summary_type, character_count, quality_score, created_at, rfp_id, client_id").eq("client_id", client_id)
+        s_query = supabase.table("client_summaries").select("id, summary_text, summary_type, character_count, quality_score, created_at, rfp_id, client_id, approved").eq("client_id", client_id).eq("approved", True)
         if rfp_id:
             s_query = s_query.eq("rfp_id", rfp_id)
         summaries = s_query.order("created_at", desc=True).execute().data or []
@@ -1205,6 +1198,44 @@ def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-
         print(f"list_org_summaries error: {e}")
         return {"summaries": [], "mappings": [], "questions": []}
 
+@app.get("/org/summaries/pending")
+def list_pending_summaries(x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
+    """List pending (unapproved) summaries and their mapped questions for an organization (optionally scoped to an RFP)"""
+    client_id = get_client_id_from_key(x_client_key)
+    try:
+        s_query = supabase.table("client_summaries").select("id, summary_text, summary_type, character_count, quality_score, created_at, rfp_id, client_id, approved").eq("client_id", client_id).eq("approved", False)
+        if rfp_id:
+            s_query = s_query.eq("rfp_id", rfp_id)
+        summaries = s_query.order("created_at", desc=True).execute().data or []
+
+        if not summaries:
+            return {"summaries": [], "mappings": [], "questions": []}
+
+        s_ids = [s["id"] for s in summaries]
+        m_rows = supabase.table("client_question_summary_mappings").select("question_id, summary_id").in_("summary_id", s_ids).execute().data or []
+
+        q_ids = list({m["question_id"] for m in m_rows})
+        questions = []
+        if q_ids:
+            q_rows = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").in_("id", q_ids).execute().data or []
+            questions = q_rows
+
+        return {"summaries": summaries, "mappings": m_rows, "questions": questions}
+    except Exception as e:
+        print(f"list_pending_summaries error: {e}")
+        return {"summaries": [], "mappings": [], "questions": []}
+
+@app.post("/org/summaries/{summary_id}/set-approval")
+def set_summary_approval(summary_id: str, payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """Set approval status for a summary (approved true/false)."""
+    client_id = get_client_id_from_key(x_client_key)
+    approved = bool(payload.get("approved", False))
+    try:
+        supabase.table("client_summaries").update({"approved": approved}).eq("id", summary_id).eq("client_id", client_id).execute()
+        return {"ok": True, "approved": approved}
+    except Exception as e:
+        print(f"set_summary_approval error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update summary approval")
 @app.delete("/answers/{answer_id}")
 def delete_answer(answer_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
@@ -1310,7 +1341,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                         for i, match in enumerate(matches[:3]):  # Show top 3 matches
                             print(f"DEBUG: Match {i+1}: similarity={match.get('similarity', 0):.3f}, answer={match.get('answer', '')[:50]}...")
                         
-                    final_answer = "Not found, needs review."
+                    final_answer = "Not found any relavant question, needs review."
                     review_status = ""
 
                     if matches:
@@ -1522,10 +1553,137 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                     created_count += 1
                 # Optional: update_job_progress for each saved pair to database
             
+            # After saving all pairs, optionally build AI groups/summaries for approval UI
+            def _build_ai_groups_for_job(client_id_param: str, rfp_id_param: str | None):
+                try:
+                    # Fetch all questions
+                    q_query = supabase.table("client_questions").select("id, original_text, rfp_id").eq("client_id", client_id_param)
+                    if rfp_id_param:
+                        q_query = q_query.eq("rfp_id", rfp_id_param)
+                    questions_local = q_query.order("created_at", desc=True).execute().data or []
+
+                    if not questions_local:
+                        return {"groups": [], "message": "No questions found"}
+
+                    # Fetch mappings for answers
+                    q_ids_local = [q["id"] for q in questions_local]
+                    m_rows_local = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids_local).execute().data or []
+                    q_to_a_local = {m["question_id"]: m["answer_id"] for m in m_rows_local}
+
+                    # Fetch answers
+                    a_ids_local = list({aid for aid in q_to_a_local.values() if aid})
+                    a_rows_local = []
+                    if a_ids_local:
+                        a_rows_local = supabase.table("client_answers").select("id, answer_text").in_("id", a_ids_local).execute().data or []
+                    a_map_local = {a["id"]: a.get("answer_text", "") for a in a_rows_local}
+
+                    # Build compact input for the LLM
+                    qa_lines_local = []
+                    for q in questions_local:
+                        qid = q["id"]
+                        qtext = (q.get("original_text") or "").strip()
+                        atext = (a_map_local.get(q_to_a_local.get(qid)) or "").strip()
+                        if not qtext:
+                            continue
+                        qa_lines_local.append({"id": qid, "q": qtext, "a": atext})
+
+                    if not qa_lines_local:
+                        return {"groups": [], "message": "No Q&A pairs available"}
+
+                    qa_text_local = "\n".join([f"ID:{row['id']}\nQ:{row['q']}\nA:{row['a']}" for row in qa_lines_local])
+                    prompt_local = f"""
+You will receive a list of Q&A pairs for a single client (and optionally a specific RFP). Group semantically similar questions together and produce a consolidated Q&A for each group.
+
+Return ONLY strict JSON with this structure:
+{{
+  "groups": [
+    {{
+      "question_ids": ["<id>", "<id>", ...],
+      "consolidated_question": "string",
+      "consolidated_answer": "string"
+    }}
+  ]
+}}
+
+Rules:
+1) "question_ids" must be the exact IDs provided.
+2) Every ID used must exist in the input. Do not invent IDs.
+3) Do not include any text before or after the JSON.
+
+Q&A LIST:
+{qa_text_local}
+"""
+                    try:
+                        response_local = gemini.generate_content(
+                            prompt_local,
+                            safety_settings={
+                                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            },
+                        )
+                        text_local = (response_local.text or "").strip()
+                        s_local, e_local = text_local.find("{"), text_local.rfind("}")
+                        if s_local == -1 or e_local == -1:
+                            return {"groups": [], "message": "LLM returned no JSON"}
+                        data_local = json.loads(text_local[s_local:e_local+1])
+
+                        # Normalize output
+                        raw_groups_local = data_local.get("groups") or []
+                        valid_ids_local = {str(q["id"]) for q in questions_local}
+                        groups_local = []
+                        for g in raw_groups_local:
+                            qids_local = [str(x) for x in (g.get("question_ids") or []) if str(x) in valid_ids_local]
+                            if not qids_local:
+                                continue
+                            groups_local.append({
+                                "question_ids": qids_local,
+                                "consolidated_question": (g.get("consolidated_question") or "").strip(),
+                                "consolidated_answer": (g.get("consolidated_answer") or "").strip(),
+                            })
+                        return {"groups": groups_local}
+                    except Exception as e:
+                        print(f"_build_ai_groups_for_job LLM error: {e}")
+                        return {"groups": [], "message": "AI grouping failed"}
+                except Exception as e:
+                    print(f"_build_ai_groups_for_job error: {e}")
+                    return {"groups": [], "message": "AI grouping error"}
+
+            ai_groups_result = _build_ai_groups_for_job(client_id, rfp_id)
+
+            # Persist pending summaries for each AI group
+            try:
+                for grp in ai_groups_result.get("groups", []):
+                    cq = (grp.get("consolidated_question") or "").strip()
+                    ca = (grp.get("consolidated_answer") or "").strip()
+                    qids = grp.get("question_ids") or []
+                    if not cq or not ca or not qids:
+                        continue
+                    # Insert pending summary
+                    s_ins = supabase.table("client_summaries").insert({
+                        "summary_text": ca,
+                        "summary_type": "Consolidated",
+                        "character_count": len(ca),
+                        "quality_score": None,
+                        "approved": False,
+                        "client_id": client_id,
+                        "rfp_id": rfp_id,
+                    }).execute()
+                    s_id = (s_ins.data or [{}])[0].get("id")
+                    # Map questions to the summary
+                    if s_id:
+                        mappings = [{"question_id": qid, "summary_id": s_id} for qid in qids]
+                        supabase.table("client_question_summary_mappings").insert(mappings).execute()
+            except Exception as e:
+                print(f"WARN: Failed to persist pending summaries: {e}")
+
             result_data = {
                 "extracted_pairs_count": len(extracted_pairs), # Renamed for clarity
                 "created_pairs_count": created_count,          # Renamed for clarity
-                "total_sheets_processed": processed_sheets
+                "total_sheets_processed": processed_sheets,
+                "ai_groups": ai_groups_result.get("groups", []),
+                "ai_groups_count": len(ai_groups_result.get("groups", [])),
             }
             
             update_job_progress(job_id, 100, "QA extraction completed successfully!", result_data)
