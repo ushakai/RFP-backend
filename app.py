@@ -387,12 +387,13 @@ def _row_text(ws, r: int) -> str:
 
 
 def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
-    """Find the best matching row across the entire sheet for the given question.
-    Returns the row index if best similarity >= 0.95, otherwise None to drop.
+    """Place answer without fuzzy matching.
+    - If question text is empty, return None (drop).
+    - If reported_row is a valid integer >= 2, use it.
+    - Otherwise, append to the end (next row after current max).
     """
-    max_row = worksheet.max_row
-    qnorm = (question_text or "").strip().lower()
-    if not qnorm:
+    qtext = (question_text or "").strip()
+    if not qtext:
         return None
 
     best_r, best_score = None, -1.0
@@ -403,7 +404,7 @@ def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
             best_score, best_r = s, r
 
     # Only accept strong matches
-    if best_score >= 0.95:
+    if best_score >= 0.80:
         return best_r
     return None
 
@@ -899,6 +900,114 @@ Return ONLY a JSON object with this exact format:
     except Exception as e:
         print(f"Error analyzing similarities: {e}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@app.post("/org/qa/ai-group")
+def ai_group_qa(payload: dict = Body(default={}), x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
+    """AI-driven grouping of all Q&A pairs for a client (optionally scoped to an RFP).
+    Returns groups with question_ids and consolidated Q/A without using embeddings.
+    Response schema:
+    { "groups": [ { "question_ids": [..], "consolidated_question": str, "consolidated_answer": str } ] }
+    """
+    client_id = get_client_id_from_key(x_client_key)
+    try:
+        # Fetch all questions
+        q_query = supabase.table("client_questions").select("id, original_text, rfp_id").eq("client_id", client_id)
+        if rfp_id:
+            q_query = q_query.eq("rfp_id", rfp_id)
+        questions = q_query.order("created_at", desc=True).execute().data or []
+
+        if not questions:
+            return {"groups": [], "message": "No questions found"}
+
+        # Fetch mappings for answers
+        q_ids = [q["id"] for q in questions]
+        m_rows = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
+        q_to_a = {m["question_id"]: m["answer_id"] for m in m_rows}
+
+        # Fetch answers
+        a_ids = list({aid for aid in q_to_a.values() if aid})
+        a_rows = []
+        if a_ids:
+            a_rows = supabase.table("client_answers").select("id, answer_text").in_("id", a_ids).execute().data or []
+        a_map = {a["id"]: a.get("answer_text", "") for a in a_rows}
+
+        # Build compact input for the LLM
+        qa_lines = []
+        for q in questions:
+            qid = q["id"]
+            qtext = (q.get("original_text") or "").strip()
+            atext = (a_map.get(q_to_a.get(qid)) or "").strip()
+            if not qtext:
+                continue
+            qa_lines.append({"id": qid, "q": qtext, "a": atext})
+
+        if not qa_lines:
+            return {"groups": [], "message": "No Q&A pairs available"}
+
+        # Prompt Gemini to group and summarize
+        # We keep the format strictly JSON. If the output is too large, consider batching in the future.
+        qa_text = "\n".join([f"ID:{row['id']}\nQ:{row['q']}\nA:{row['a']}" for row in qa_lines])
+        prompt = f"""
+You will receive a list of Q&A pairs for a single client (and optionally a specific RFP). Group semantically similar questions together and produce a consolidated Q&A for each group.
+
+Return ONLY strict JSON with this structure:
+{{
+  "groups": [
+    {{
+      "question_ids": ["<id>", "<id>", ...],
+      "consolidated_question": "string",
+      "consolidated_answer": "string"
+    }}
+  ]
+}}
+
+Rules:
+1) "question_ids" must be the exact IDs provided.
+2) Every ID used must exist in the input. Do not invent IDs.
+3) Do not include any text before or after the JSON.
+
+Q&A LIST:
+{qa_text}
+"""
+        try:
+            response = gemini.generate_content(
+                prompt,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                },
+            )
+            text = (response.text or "").strip()
+            s, e = text.find("{"), text.rfind("}")
+            if s == -1 or e == -1:
+                return {"groups": [], "message": "LLM returned no JSON"}
+            data = json.loads(text[s:e+1])
+
+            # Normalize output
+            raw_groups = data.get("groups") or []
+            groups = []
+            for g in raw_groups:
+                qids = [str(x) for x in (g.get("question_ids") or []) if str(x) in {str(q["id"]) for q in questions}]
+                if not qids:
+                    continue
+                groups.append({
+                    "question_ids": qids,
+                    "consolidated_question": (g.get("consolidated_question") or "").strip(),
+                    "consolidated_answer": (g.get("consolidated_answer") or "").strip(),
+                })
+            return {"groups": groups}
+        except Exception as e:
+            print(f"ai_group_qa LLM error: {e}")
+            return {"groups": [], "message": "AI grouping failed"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ai_group_qa error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to group Q&A")
 
 
 @app.post("/org/qa/approve-summary")
