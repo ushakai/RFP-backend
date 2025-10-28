@@ -386,30 +386,26 @@ def _row_text(ws, r: int) -> str:
     )
 
 
-def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
+def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
+    """Find the best matching row across the entire sheet for the given question.
+    Returns the row index if best similarity >= 0.95, otherwise None to drop.
+    """
     max_row = worksheet.max_row
     qnorm = (question_text or "").strip().lower()
+    if not qnorm:
+        return None
 
-    # Prefer a local window around the reported row if provided (±3 rows)
-    if reported_row and 2 <= reported_row <= max_row:
-        start_r = max(2, reported_row - 3)
-        end_r = min(max_row, reported_row + 3)
-        best_r, best_score = reported_row, -1.0
-        for r in range(start_r, end_r + 1):
-            row_text = _row_text(worksheet, r)
-            s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
-            if s > best_score:
-                best_score, best_r = s, r
-        return best_r
-
-    # Fallback to global search when no reported row
     best_r, best_score = None, -1.0
-    for r in range(2, max_row + 1):  # skip header
+    for r in range(2, max_row + 1):  # skip header row
         row_text = _row_text(worksheet, r)
         s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
         if s > best_score:
             best_score, best_r = s, r
-    return best_r or 2
+
+    # Only accept strong matches
+    if best_score >= 0.95:
+        return best_r
+    return None
 
 
 def find_first_empty_column(ws):
@@ -1180,7 +1176,8 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 for q_idx, item in enumerate(extracted):
                     qtext = item.get("question", "")
                     reported_row = item.get("row", 0)
-                    if not qtext:
+                    # Drop null/empty/whitespace-only questions
+                    if not qtext or not str(qtext).strip():
                         continue
                         
                     update_job_progress(job_id,
@@ -1188,6 +1185,10 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                                         f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
                     
                     write_row = resolve_row(ws, reported_row, qtext)
+                    # If no strong match across the sheet, drop this question
+                    if write_row is None:
+                        print(f"DEBUG: Dropping question not found with >=0.95 match: {qtext[:80]}...")
+                        continue
                     emb = get_embedding(qtext)
                     print(f"DEBUG: Question: {qtext[:100]}...")
                     print(f"DEBUG: Embedding length: {len(emb) if emb else 0}")
@@ -1249,7 +1250,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
             ws = wb[sheet_name]
             # Set column widths only for AI answer and review status columns
             if ai_col and ai_col <= ws.max_column:
-                ws.column_dimensions[get_column_letter(ai_col)].width = 160  # Doubled from 80 to 160
+                ws.column_dimensions[get_column_letter(ai_col)].width = 40
             if review_col and review_col <= ws.max_column:
                 ws.column_dimensions[get_column_letter(review_col)].width = 25
             
