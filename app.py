@@ -386,7 +386,7 @@ def _row_text(ws, r: int) -> str:
     )
 
 
-def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
+def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
     max_row = worksheet.max_row
     qnorm = (question_text or "").strip().lower()
 
@@ -409,7 +409,7 @@ def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
         s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
         if s > best_score:
             best_score, best_r = s, r
-    return best_r or 2
+    return best_r
 
 
 def find_first_empty_column(ws):
@@ -1263,7 +1263,19 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
     max_processing_time = 1800  # 30 minutes max processing time
     
     try:
-        wb = openpyxl.load_workbook(file_obj)
+        # Keep original bytes for robust pandas-based reads per sheet
+        try:
+            original_bytes = file_obj.getvalue()
+        except Exception:
+            file_obj.seek(0)
+            original_bytes = file_obj.read()
+
+        wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
+        # Use pandas for more reliable sheet parsing (handles types, merged/blank cells better)
+        try:
+            xls = pd.ExcelFile(io.BytesIO(original_bytes))
+        except Exception:
+            xls = None
 
         total_sheets = len(wb.sheetnames)
         processed_sheets_count = 0
@@ -1284,9 +1296,26 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
                 ws = wb[sheet_name]
 
-                df = pd.DataFrame(ws.values)
-                if df.empty:
-                    print(f"DEBUG: Sheet {sheet_name} is empty, skipping.")
+                # Prefer pandas to read the sheet reliably; fallback to openpyxl values
+                df = None
+                try:
+                    if xls is not None:
+                        df = pd.read_excel(xls, sheet_name=sheet_name, header=None, engine="openpyxl")
+                except Exception as e:
+                    print(f"DEBUG: Pandas read failed for sheet {sheet_name}: {e}; falling back to openpyxl values.")
+                if df is None:
+                    df = pd.DataFrame(ws.values)
+
+                # Drop fully empty rows/columns before emptiness check
+                if df is not None:
+                    try:
+                        df = df.dropna(how='all')
+                        df = df.dropna(axis=1, how='all')
+                    except Exception:
+                        pass
+
+                if df is None or df.empty:
+                    print(f"DEBUG: Sheet {sheet_name} is empty after cleanup, skipping.")
                     processed_sheets_count += 1
                     continue
                     
@@ -1299,9 +1328,19 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 
                 print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
                 extracted = extract_questions_with_gemini(sheet_text)
+                # Retry up to 2 additional times if no questions returned
+                retry_attempt = 0
+                while (not extracted or len(extracted) == 0) and retry_attempt < 2:
+                    retry_attempt += 1
+                    print(f"DEBUG: No questions extracted from sheet {sheet_name}. Retrying attempt {retry_attempt}/2...")
+                    try:
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                    extracted = extract_questions_with_gemini(sheet_text)
                 
-                if not extracted:
-                    print(f"DEBUG: No questions extracted from sheet {sheet_name}.")
+                if not extracted or len(extracted) == 0:
+                    print(f"DEBUG: No questions extracted from sheet {sheet_name} after retries.")
                     processed_sheets_count += 1
                     continue
                 
@@ -1317,7 +1356,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                     qtext = item.get("question", "")
                     reported_row = item.get("row", 0)
                     # Drop null/empty/whitespace-only questions
-                    if not qtext or not str(qtext).strip():
+                    if not qtext:
                         continue
                         
                     update_job_progress(job_id,
@@ -1527,6 +1566,12 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 
                 sheet_csv = df.to_csv(index=False, header=False)
                 pairs = _extract_qa_pairs(sheet_csv)
+                # Retry up to 2 additional times if no pairs extracted
+                retry_attempt = 0
+                while (not pairs or len(pairs) == 0) and retry_attempt < 2:
+                    retry_attempt += 1
+                    print(f"DEBUG: No Q&A pairs extracted from sheet {sheet}. Retrying attempt {retry_attempt}/2...")
+                    pairs = _extract_qa_pairs(sheet_csv)
                 
                 for p_idx, p in enumerate(pairs):
                     # More granular update for each pair found (optional, could be too chatty)
