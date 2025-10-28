@@ -907,7 +907,9 @@ Return ONLY a JSON object with this exact format:
 
 @app.post("/org/qa/approve-summary")
 def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
-    """Approve a summary - adds it to database and removes the constituent questions"""
+    """Approve a summary - adds consolidated QA plus summary records and mappings.
+    This preserves original questions; it no longer deletes them.
+    """
     client_id = get_client_id_from_key(x_client_key)
     
     question_ids = payload.get("question_ids", [])
@@ -920,7 +922,7 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
     try:
         # Create embedding for consolidated question
         q_emb = get_embedding(consolidated_question)
-        
+
         # Insert consolidated question
         q_row = {
             "original_text": consolidated_question,
@@ -932,7 +934,7 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
         }
         q_ins = supabase.table("client_questions").insert(q_row).execute()
         new_q_id = (q_ins.data or [{}])[0].get("id")
-        
+
         # Insert consolidated answer
         a_row = {
             "answer_text": consolidated_answer,
@@ -944,7 +946,7 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
         }
         a_ins = supabase.table("client_answers").insert(a_row).execute()
         new_a_id = (a_ins.data or [{}])[0].get("id")
-        
+
         # Create mapping for consolidated QA
         if new_q_id and new_a_id:
             supabase.table("client_question_answer_mappings").insert({
@@ -952,25 +954,34 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
                 "answer_id": new_a_id,
                 "confidence_score": 1.0,
                 "context_requirements": None,
-                "stakeholder_approved": True,  # Mark as approved since user approved it
+                "stakeholder_approved": True,
             }).execute()
-        
-        # Delete old questions and their mappings
-        for q_id in question_ids:
-            # Delete mappings first
-            supabase.table("client_question_answer_mappings").delete().eq("question_id", q_id).execute()
-            # Delete the question
-            supabase.table("client_questions").delete().eq("id", q_id).eq("client_id", client_id).execute()
-        
-        # Note: Old answers are kept as they might be referenced elsewhere
-        
+
+        # Insert summary record
+        s_row = {
+            "summary_text": consolidated_answer,
+            "summary_type": "Consolidated",
+            "character_count": len(consolidated_answer),
+            "quality_score": None,
+            "client_id": client_id,
+            "rfp_id": rfp_id,
+        }
+        s_ins = supabase.table("client_summaries").insert(s_row).execute()
+        new_s_id = (s_ins.data or [{}])[0].get("id")
+
+        # Map all original questions to the summary
+        if new_s_id and question_ids:
+            mappings = [{"question_id": qid, "summary_id": new_s_id} for qid in question_ids]
+            supabase.table("client_question_summary_mappings").insert(mappings).execute()
+
         return {
             "success": True,
             "new_question_id": new_q_id,
             "new_answer_id": new_a_id,
-            "removed_questions": len(question_ids)
+            "new_summary_id": new_s_id,
+            "mapped_questions": len(question_ids)
         }
-        
+
     except Exception as e:
         print(f"Error approving summary: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to approve summary: {str(e)}")
@@ -1057,6 +1068,37 @@ def update_answer(answer_id: str, payload: dict = Body(...), x_client_key: str |
         updates["character_count"] = len(updates["answer_text"])
     res = supabase.table("client_answers").update(updates).eq("id", answer_id).eq("client_id", client_id).execute()
     return {"ok": True}
+
+
+@app.get("/org/summaries")
+def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
+    """List summaries and their mapped questions for an organization (optionally scoped to an RFP)"""
+    client_id = get_client_id_from_key(x_client_key)
+    try:
+        # Fetch summaries
+        s_query = supabase.table("client_summaries").select("id, summary_text, summary_type, character_count, quality_score, created_at, rfp_id, client_id").eq("client_id", client_id)
+        if rfp_id:
+            s_query = s_query.eq("rfp_id", rfp_id)
+        summaries = s_query.order("created_at", desc=True).execute().data or []
+
+        if not summaries:
+            return {"summaries": [], "mappings": [], "questions": []}
+
+        # Fetch mappings
+        s_ids = [s["id"] for s in summaries]
+        m_rows = supabase.table("client_question_summary_mappings").select("question_id, summary_id").in_("summary_id", s_ids).execute().data or []
+
+        # Fetch questions
+        q_ids = list({m["question_id"] for m in m_rows})
+        questions = []
+        if q_ids:
+            q_rows = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").in_("id", q_ids).execute().data or []
+            questions = q_rows
+
+        return {"summaries": summaries, "mappings": m_rows, "questions": questions}
+    except Exception as e:
+        print(f"list_org_summaries error: {e}")
+        return {"summaries": [], "mappings": [], "questions": []}
 
 @app.delete("/answers/{answer_id}")
 def delete_answer(answer_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):

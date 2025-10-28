@@ -42,6 +42,26 @@ create table if not exists public.client_answers (
   last_updated timestamptz default now()
 );
 
+-- Summaries per client (consolidated across similar questions)
+create table if not exists public.client_summaries (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  rfp_id uuid references public.client_rfps(id) on delete cascade,
+  summary_text text not null,
+  summary_type text, -- e.g., 'Consolidated'
+  character_count int,
+  quality_score int,
+  created_at timestamptz default now()
+);
+
+-- Mapping questions to a summary
+create table if not exists public.client_question_summary_mappings (
+  id uuid primary key default gen_random_uuid(),
+  question_id uuid references public.client_questions(id) on delete cascade,
+  summary_id uuid references public.client_summaries(id) on delete cascade,
+  created_at timestamptz default now()
+);
+
 -- Mappings (renamed to client_question_answer_mappings)
 create table if not exists public.client_question_answer_mappings (
   id uuid primary key default gen_random_uuid(),
