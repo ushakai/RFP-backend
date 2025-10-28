@@ -426,17 +426,34 @@ def find_first_empty_column(ws):
 def get_client_id_from_key(client_key: str | None) -> str:
     if not client_key:
         raise HTTPException(status_code=401, detail="Missing X-Client-Key")
-    try:
-        resp = supabase.table("clients").select("id").eq("api_key", client_key).limit(1).execute()
-        rows = resp.data or []
-        if not rows:
-            raise HTTPException(status_code=401, detail="Invalid X-Client-Key")
-        return rows[0]["id"]
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Client lookup error: {e}")
-        raise HTTPException(status_code=500, detail="Client lookup failed")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = supabase.table("clients").select("id").eq("api_key", client_key).limit(1).execute()
+            rows = resp.data or []
+            if not rows:
+                raise HTTPException(status_code=401, detail="Invalid X-Client-Key")
+            return rows[0]["id"]
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Client lookup error: {e}")
+            # Recreate supabase client and retry on transient errors
+            try:
+                global supabase
+                if supabase is None:
+                    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+                else:
+                    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            except Exception as reinit_err:
+                print(f"Supabase re-init failed: {reinit_err}")
+            if attempt < max_retries - 1:
+                try:
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                continue
+            raise HTTPException(status_code=500, detail="Client lookup failed")
 
 
 @app.post("/process")
@@ -626,9 +643,26 @@ Sheet Data:
         s, e = text.find("["), text.rfind("]")
         if s == -1 or e == -1:
             return []
-        return json.loads(text[s:e+1])
+        pairs = json.loads(text[s:e+1])
+        # If answer exists but question missing, synthesize a fallback question
+        normalized = []
+        for p in pairs:
+            q = (p.get("question") or "").strip()
+            a = (p.get("answer") or "").strip()
+            if not a:
+                continue
+            if not q:
+                q = "Auto-generated question from answer"
+            normalized.append({
+                "question": q,
+                "answer": a,
+                "row": p.get("row", 0),
+                "category": (p.get("category") or "Other").strip() or "Other",
+            })
+        return normalized
     except Exception as e:
-        print(f"extract_qa_pairs error: {e}")
+        # Reduce noisy logs
+        print(f"extract_qa_pairs error")
         return []
 
 
@@ -1256,6 +1290,47 @@ def estimate_processing_time(file_size: int, job_type: str) -> int:
     return 10
 
 
+def _estimate_minutes_from_chars(file_bytes: bytes, job_type: str) -> int:
+    """Estimate processing time based on total character count across all sheets.
+    Falls back to file-size estimation on error.
+    """
+    try:
+        bio = io.BytesIO(file_bytes)
+        xls = pd.ExcelFile(bio)
+        total_chars = 0
+        for sheet in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet, header=None, engine="openpyxl")
+                if df is None or df.empty:
+                    continue
+                # Drop fully empty rows/cols, then convert to strings
+                df = df.dropna(how='all')
+                df = df.dropna(axis=1, how='all')
+                if df.empty:
+                    continue
+                # Convert to strings and sum lengths; use tab as cell sep and newline as row sep
+                # to approximate real characters analyzed
+                texts = df.astype(str).apply(lambda row: "\t".join(row.values), axis=1)
+                sheet_chars = sum(len(s) for s in texts)
+                total_chars += sheet_chars
+            except Exception:
+                continue
+
+        # Base rates per job type (characters per minute)
+        if job_type == "process_rfp":
+            chars_per_min = 12000  # more conservative to reflect real processing
+            min_minutes, max_minutes = 5, 90
+        else:  # extract_qa
+            chars_per_min = 20000
+            min_minutes, max_minutes = 3, 60
+
+        estimated = int(max(min_minutes, min(max_minutes, (total_chars // max(1, chars_per_min)) + 1)))
+        # Ensure at least 1 minute if tiny
+        return max(1, estimated)
+    except Exception:
+        # Fallback: use previous file-size based estimator
+        return estimate_processing_time(len(file_bytes), job_type)
+
 def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None, job_id: str = None) -> io.BytesIO:
     """Process Excel file using the working code"""
     print(f"DEBUG: process_excel_file_obj started for {filename} (Job ID: {job_id})")
@@ -1293,7 +1368,8 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 
                 update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
                                     f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-                print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+                if False:
+                    print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
                 ws = wb[sheet_name]
 
                 # Prefer pandas to read the sheet reliably; fallback to openpyxl values
@@ -1326,13 +1402,13 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 if len(sheet_text) > 50000:  # Limit to 50KB of text
                     sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
                 
-                print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
+                
                 extracted = extract_questions_with_gemini(sheet_text)
                 # Retry up to 2 additional times if no questions returned
                 retry_attempt = 0
                 while (not extracted or len(extracted) == 0) and retry_attempt < 2:
                     retry_attempt += 1
-                    print(f"DEBUG: No questions extracted from sheet {sheet_name}. Retrying attempt {retry_attempt}/2...")
+                    
                     try:
                         time.sleep(0.5)
                     except Exception:
@@ -1340,7 +1416,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                     extracted = extract_questions_with_gemini(sheet_text)
                 
                 if not extracted or len(extracted) == 0:
-                    print(f"DEBUG: No questions extracted from sheet {sheet_name} after retries.")
+                    
                     processed_sheets_count += 1
                     continue
                 
@@ -1366,19 +1442,14 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                     write_row = resolve_row(ws, reported_row, qtext)
                     # If no strong match across the sheet, drop this question
                     if write_row is None:
-                        print(f"DEBUG: Dropping question not found with >=0.95 match: {qtext[:80]}...")
+                    
                         continue
                     emb = get_embedding(qtext)
-                    print(f"DEBUG: Question: {qtext[:100]}...")
-                    print(f"DEBUG: Embedding length: {len(emb) if emb else 0}")
-                    print(f"DEBUG: Client ID: {client_id}, RFP ID: {rfp_id}")
+                    
                     
                     # Search without RFP ID filter to get all matches for the client
                     matches = search_supabase(emb, client_id, None)
-                    print(f"DEBUG: Found {len(matches) if matches else 0} matches")
-                    if matches:
-                        for i, match in enumerate(matches[:3]):  # Show top 3 matches
-                            print(f"DEBUG: Match {i+1}: similarity={match.get('similarity', 0):.3f}, answer={match.get('answer', '')[:50]}...")
+                    
                         
                     final_answer = "Not found any relavant question, needs review."
                     review_status = ""
@@ -1389,21 +1460,21 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                         if best and best.get("similarity", 0) >= 0.95:
                             final_answer = best["answer"]
                             review_status = ""
-                            print(f"DEBUG: Using direct answer (95%+ match)")
+                            
                         else:
                             # Filter matches with similarity >= 0.65 for AI generation
                             filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
-                            print(f"DEBUG: Filtered matches (65%+): {len(filtered_matches)}")
+                            
                             if filtered_matches:
                                 final_answer = generate_tailored_answer(qtext, filtered_matches)
                                 review_status = "Need Review"
-                                print(f"DEBUG: Using AI-generated answer")
+                                
                             else:
                                 final_answer = "Not found, needs review."
                                 review_status = ""
-                                print(f"DEBUG: No matches above 65% threshold")
+                                
                     else:
-                        print(f"DEBUG: No matches found in database")
+                        
                     
                     # Apply cleaning to the final answer before writing to the sheet
                     final_answer = clean_markdown(final_answer)
@@ -1422,7 +1493,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 continue
 
         update_job_progress(job_id, 90, "Saving processed Excel file...")
-        print(f"DEBUG: Saving processed Excel file for {filename}.")
+        
         
         # Adjust column widths for better text display - only AI Answer and Review Status columns
         for sheet_name in wb.sheetnames:
@@ -1556,7 +1627,7 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 progress_end_sheet = 20 + ((sheet_idx + 1) * 70 // total_sheets)
                 
                 update_job_progress(job_id, progress_start_sheet, f"Extracting from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
-                print(f"DEBUG: QA extraction from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
+                
                 
                 df = pd.read_excel(tmp_path, sheet_name=sheet, header=None)
                 if df.empty:
@@ -1910,8 +1981,8 @@ async def submit_job(
     if file_size_mb > 50:  # 50MB limit
         raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
     
-    # Estimate processing time
-    estimated_minutes = estimate_processing_time(file_size, job_type)
+    # Estimate processing time using total character count across all sheets
+    estimated_minutes = _estimate_minutes_from_chars(file_content, job_type)
     estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
     
     # Encode file content as base64 for storage
@@ -1971,6 +2042,12 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
             return {"jobs": jobs}
         except Exception as e:
             print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
+            # Recreate supabase client on error
+            try:
+                global supabase
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            except Exception as reinit_err:
+                print(f"Supabase re-init failed in /jobs: {reinit_err}")
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -2085,6 +2162,11 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
             return job_data
         except Exception as e:
             print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            try:
+                global supabase
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            except Exception as reinit_err:
+                print(f"Supabase re-init failed in /jobs/{job_id}: {reinit_err}")
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
