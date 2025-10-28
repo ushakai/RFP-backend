@@ -1474,7 +1474,8 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                                 review_status = ""
                                 
                     else:
-                        
+                        final_answer = "Not found, needs review."
+                        review_status = ""
                     
                     # Apply cleaning to the final answer before writing to the sheet
                     final_answer = clean_markdown(final_answer)
