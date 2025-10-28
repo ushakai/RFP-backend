@@ -3,9 +3,9 @@ services:
     name: rfp-backend
     env: python
     plan: starter
-    pythonVersion: 3.12
+    pythonVersion: 3.11
     buildCommand: pip install -r requirements.txt
-    startCommand: chmod +x start.sh && ./start.sh
+    startCommand: chmod +x start_multi_worker.sh && ./start_multi_worker.sh
     envVars:
       - key: GOOGLE_API_KEY
         sync: false

@@ -171,39 +171,53 @@ Sheet:
 {sheet_text}
 """
     try:
-        # Add timeout handling
-        import signal
+        # Windows-compatible timeout handling using threading
+        import threading
+        import time
         
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Gemini API call timed out")
+        result = [None]
+        error = [None]
         
-        # Set timeout for 60 seconds
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(60)
+        def api_call():
+            try:
+                response = gemini.generate_content(
+                    prompt,
+                    safety_settings={
+                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    },
+                )
+                result[0] = response
+            except Exception as e:
+                error[0] = e
         
-        try:
-            response = gemini.generate_content(
-                prompt,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                },
-            )
-            signal.alarm(0)  # Cancel timeout
-            text = (response.text or "").strip()
-            start, end = text.find("["), text.rfind("]")
-            if start == -1 or end == -1:
-                print(f"Gemini extract: No JSON array found in response for text: {text[:200]}...")
-                return []
-            return json.loads(text[start:end+1])
-        except TimeoutError:
-            signal.alarm(0)  # Cancel timeout
+        # Start API call in thread
+        thread = threading.Thread(target=api_call)
+        thread.daemon = True
+        thread.start()
+        
+        # Wait for completion with timeout
+        thread.join(timeout=60)
+        
+        if thread.is_alive():
             print("Gemini extract: API call timed out after 60 seconds")
             return []
-        finally:
-            signal.alarm(0)  # Ensure timeout is cancelled
+        
+        if error[0]:
+            raise error[0]
+        
+        if not result[0]:
+            print("Gemini extract: No response received")
+            return []
+        
+        text = (result[0].text or "").strip()
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1:
+            print(f"Gemini extract: No JSON array found in response for text: {text[:200]}...")
+            return []
+        return json.loads(text[start:end+1])
             
     except Exception as e:
         print(f"Gemini extract error: {e}")
@@ -315,34 +329,48 @@ If unclear, combine and adapt from references.
 Return only the answer text, without any additional conversational filler or markdown formatting.
 """
     try:
-        # Add timeout handling
-        import signal
+        # Windows-compatible timeout handling using threading
+        import threading
+        import time
         
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Gemini API call timed out")
+        result = [None]
+        error = [None]
         
-        # Set timeout for 45 seconds
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(45)
+        def api_call():
+            try:
+                resp = gemini.generate_content(
+                    prompt,
+                    safety_settings={
+                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    },
+                )
+                result[0] = resp
+            except Exception as e:
+                error[0] = e
         
-        try:
-            resp = gemini.generate_content(
-                prompt,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                },
-            )
-            signal.alarm(0)  # Cancel timeout
-            return resp.text.strip()
-        except TimeoutError:
-            signal.alarm(0)  # Cancel timeout
+        # Start API call in thread
+        thread = threading.Thread(target=api_call)
+        thread.daemon = True
+        thread.start()
+        
+        # Wait for completion with timeout
+        thread.join(timeout=45)
+        
+        if thread.is_alive():
             print("Gemini tailored answer: API call timed out after 45 seconds")
             return "AI could not generate tailored answer (timeout)."
-        finally:
-            signal.alarm(0)  # Ensure timeout is cancelled
+        
+        if error[0]:
+            raise error[0]
+        
+        if not result[0]:
+            print("Gemini tailored answer: No response received")
+            return "AI could not generate tailored answer."
+        
+        return result[0].text.strip()
             
     except Exception as e:
         print(f"Gemini tailored answer error: {e} for question: {question[:100]}...")
@@ -742,6 +770,212 @@ def _extract_score(resp_text: str) -> int:
     return -1
 
 
+@app.post("/org/qa/analyze-similarities")
+def analyze_qa_similarities(payload: dict = Body(default={}), x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
+    """Analyze QA pairs to find similar questions and create summary suggestions"""
+    client_id = get_client_id_from_key(x_client_key)
+    similarity_threshold = payload.get("similarity_threshold", 0.85)  # 85% similarity by default
+    
+    try:
+        # Get all QA pairs with embeddings
+        questions_res = supabase.table("client_questions").select("id, original_text, embedding, rfp_id").eq("client_id", client_id)
+        if rfp_id:
+            questions_res = questions_res.eq("rfp_id", rfp_id)
+        questions = questions_res.execute().data or []
+        
+        if len(questions) < 2:
+            return {"groups": [], "message": "Not enough QA pairs to analyze"}
+        
+        # Get answer mappings
+        q_ids = [q["id"] for q in questions]
+        mappings_res = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute()
+        mappings = mappings_res.data or []
+        mapping_dict = {m["question_id"]: m["answer_id"] for m in mappings}
+        
+        # Get answers
+        a_ids = list(set(mapping_dict.values()))
+        if not a_ids:
+            return {"groups": [], "message": "No answers found for questions"}
+        
+        answers_res = supabase.table("client_answers").select("id, answer_text").in_("id", a_ids).execute()
+        answers = answers_res.data or []
+        answer_dict = {a["id"]: a["answer_text"] for a in answers}
+        
+        # Find similar question groups using embeddings
+        similar_groups = []
+        processed_questions = set()
+        
+        for i, q1 in enumerate(questions):
+            if q1["id"] in processed_questions:
+                continue
+                
+            emb1 = q1.get("embedding")
+            if not emb1 or not isinstance(emb1, list):
+                continue
+            
+            group = [q1]
+            processed_questions.add(q1["id"])
+            
+            # Find similar questions
+            for j, q2 in enumerate(questions):
+                if i >= j or q2["id"] in processed_questions:
+                    continue
+                
+                emb2 = q2.get("embedding")
+                if not emb2 or not isinstance(emb2, list):
+                    continue
+                
+                # Calculate cosine similarity
+                try:
+                    import numpy as np
+                    similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+                    
+                    if similarity >= similarity_threshold:
+                        group.append(q2)
+                        processed_questions.add(q2["id"])
+                except Exception as e:
+                    print(f"Error calculating similarity: {e}")
+                    continue
+            
+            # Only keep groups with 2+ questions
+            if len(group) >= 2:
+                # Create summary using AI
+                questions_text = "\n".join([f"- {q['original_text']}" for q in group])
+                answers_text = "\n".join([f"- {answer_dict.get(mapping_dict.get(q['id']), 'No answer')}" for q in group])
+                
+                summary_prompt = f"""
+You are consolidating similar Q&A pairs into a single comprehensive Q&A pair.
+
+Similar Questions:
+{questions_text}
+
+Their Answers:
+{answers_text}
+
+Create:
+1. A consolidated question that covers all the similar questions
+2. A comprehensive answer that combines all the answers
+
+Return ONLY a JSON object with this exact format:
+{{"question": "consolidated question here", "answer": "comprehensive answer here"}}
+"""
+                
+                try:
+                    response = gemini.generate_content(
+                        summary_prompt,
+                        safety_settings={
+                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        },
+                    )
+                    
+                    resp_text = (response.text or "").strip()
+                    start, end = resp_text.find("{"), resp_text.rfind("}")
+                    if start != -1 and end != -1:
+                        summary_data = json.loads(resp_text[start:end+1])
+                        
+                        similar_groups.append({
+                            "group_id": f"group_{len(similar_groups)}",
+                            "questions": [
+                                {
+                                    "id": q["id"],
+                                    "text": q["original_text"],
+                                    "answer": answer_dict.get(mapping_dict.get(q["id"]), "No answer")
+                                } for q in group
+                            ],
+                            "suggested_question": summary_data.get("question", ""),
+                            "suggested_answer": summary_data.get("answer", ""),
+                            "similarity_count": len(group)
+                        })
+                except Exception as e:
+                    print(f"Error creating summary: {e}")
+                    continue
+        
+        return {
+            "groups": similar_groups,
+            "total_groups": len(similar_groups),
+            "total_questions_analyzed": len(questions),
+            "similarity_threshold": similarity_threshold
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing similarities: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@app.post("/org/qa/approve-summary")
+def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
+    """Approve a summary - adds it to database and removes the constituent questions"""
+    client_id = get_client_id_from_key(x_client_key)
+    
+    question_ids = payload.get("question_ids", [])
+    consolidated_question = payload.get("consolidated_question", "").strip()
+    consolidated_answer = payload.get("consolidated_answer", "").strip()
+    
+    if not question_ids or not consolidated_question or not consolidated_answer:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    
+    try:
+        # Create embedding for consolidated question
+        q_emb = get_embedding(consolidated_question)
+        
+        # Insert consolidated question
+        q_row = {
+            "original_text": consolidated_question,
+            "normalized_text": consolidated_question.lower(),
+            "embedding": q_emb,
+            "category": "Consolidated",
+            "client_id": client_id,
+            "rfp_id": rfp_id,
+        }
+        q_ins = supabase.table("client_questions").insert(q_row).execute()
+        new_q_id = (q_ins.data or [{}])[0].get("id")
+        
+        # Insert consolidated answer
+        a_row = {
+            "answer_text": consolidated_answer,
+            "answer_type": "Consolidated",
+            "character_count": len(consolidated_answer),
+            "technical_level": 1,
+            "client_id": client_id,
+            "rfp_id": rfp_id,
+        }
+        a_ins = supabase.table("client_answers").insert(a_row).execute()
+        new_a_id = (a_ins.data or [{}])[0].get("id")
+        
+        # Create mapping for consolidated QA
+        if new_q_id and new_a_id:
+            supabase.table("client_question_answer_mappings").insert({
+                "question_id": new_q_id,
+                "answer_id": new_a_id,
+                "confidence_score": 1.0,
+                "context_requirements": None,
+                "stakeholder_approved": True,  # Mark as approved since user approved it
+            }).execute()
+        
+        # Delete old questions and their mappings
+        for q_id in question_ids:
+            # Delete mappings first
+            supabase.table("client_question_answer_mappings").delete().eq("question_id", q_id).execute()
+            # Delete the question
+            supabase.table("client_questions").delete().eq("id", q_id).eq("client_id", client_id).execute()
+        
+        # Note: Old answers are kept as they might be referenced elsewhere
+        
+        return {
+            "success": True,
+            "new_question_id": new_q_id,
+            "new_answer_id": new_a_id,
+            "removed_questions": len(question_ids)
+        }
+        
+    except Exception as e:
+        print(f"Error approving summary: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to approve summary: {str(e)}")
+
+
 @app.post("/org/qa/score")
 def score_org_answers(payload: dict = Body(default={}), x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
     client_id = get_client_id_from_key(x_client_key)
@@ -857,117 +1091,113 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
         processed_sheets_count = 0
         total_questions_processed = 0
 
+        # Initialize ai_col and review_col to None for error handling
+        ai_col = None
+        review_col = None
+        
         for sheet_idx, sheet_name in enumerate(wb.sheetnames):
-            # Check if processing time exceeded
-            if time.time() - start_time > max_processing_time:
-                raise Exception(f"Processing timeout: exceeded {max_processing_time/60:.1f} minutes")
-            
-            update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
-                                f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-            print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-            ws = wb[sheet_name]
-
-        df = pd.DataFrame(ws.values)
-        if df.empty:
-            print(f"DEBUG: Sheet {sheet_name} is empty, skipping.")
-            processed_sheets_count += 1
-            continue
-                
-        # Convert DataFrame to a string representation for Gemini to analyze
-        # Use header=False to prevent DataFrame column names from being sent as part of sheet_text
-        # Limit sheet text size to prevent memory issues
-        sheet_text = df.to_string(index=False, header=False)
-        if len(sheet_text) > 50000:  # Limit to 50KB of text
-            sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
-        
-        print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
-        extracted = extract_questions_with_gemini(sheet_text)
-        
-        if not extracted:
-            print(f"DEBUG: No questions extracted from sheet {sheet_name}.")
-            processed_sheets_count += 1
-            continue
-        
-        print(f"DEBUG: Found {len(extracted)} questions in sheet {sheet_name}.")
-        total_questions_processed += len(extracted)
-
-        ai_col = find_first_empty_column(ws)
-        ws.cell(row=1, column=ai_col, value="AI Answers")
-        review_col = ai_col + 1
-        ws.cell(row=1, column=review_col, value="Review Status")
-
-        for q_idx, item in enumerate(extracted):
-            qtext = item.get("question", "")
-            reported_row = item.get("row", 0)
-            if not qtext:
-                continue
-                
-            update_job_progress(job_id,
-                                15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / total_questions_processed / 2),
-                                f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
-            
-            write_row = resolve_row(ws, reported_row, qtext)
-            emb = get_embedding(qtext)
-            print(f"DEBUG: Question: {qtext[:100]}...")
-            print(f"DEBUG: Embedding length: {len(emb) if emb else 0}")
-            print(f"DEBUG: Client ID: {client_id}, RFP ID: {rfp_id}")
-            
-            # First, let's check if there are any questions in the database for this client
             try:
-                questions_check = supabase.table("client_questions").select("id, original_text, rfp_id, embedding").eq("client_id", client_id).limit(5).execute()
-                print(f"DEBUG: Found {len(questions_check.data) if questions_check.data else 0} questions in database for client {client_id}")
-                if questions_check.data:
-                    for q in questions_check.data[:2]:
-                        print(f"DEBUG: Sample question: {q.get('original_text', '')[:50]}...")
-                        print(f"DEBUG: Question RFP ID: {q.get('rfp_id', 'None')}")
-                        print(f"DEBUG: Question has embedding: {q.get('embedding') is not None}")
-                        if q.get('embedding'):
-                            print(f"DEBUG: Embedding length: {len(q.get('embedding', []))}")
-            except Exception as e:
-                print(f"DEBUG: Error checking questions in database: {e}")
-            
-            # Search without RFP ID filter to get all matches for the client
-            matches = search_supabase(emb, client_id, None)
-            print(f"DEBUG: Found {len(matches) if matches else 0} matches")
-            if matches:
-                for i, match in enumerate(matches[:3]):  # Show top 3 matches
-                    print(f"DEBUG: Match {i+1}: similarity={match.get('similarity', 0):.3f}, answer={match.get('answer', '')[:50]}...")
+                # Check if processing time exceeded
+                if time.time() - start_time > max_processing_time:
+                    raise Exception(f"Processing timeout: exceeded {max_processing_time/60:.1f} minutes")
                 
-                final_answer = "Not found, needs review."
-            review_status = ""
+                update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
+                                    f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+                print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+                ws = wb[sheet_name]
 
-            if matches:
-                best = pick_best_match(matches)
-                print(f"DEBUG: Best match similarity: {best.get('similarity', 0) if best else 0}")
-                if best and best.get("similarity", 0) >= 0.95:
-                    final_answer = best["answer"]
+                df = pd.DataFrame(ws.values)
+                if df.empty:
+                    print(f"DEBUG: Sheet {sheet_name} is empty, skipping.")
+                    processed_sheets_count += 1
+                    continue
+                    
+                # Convert DataFrame to a string representation for Gemini to analyze
+                # Use header=False to prevent DataFrame column names from being sent as part of sheet_text
+                # Limit sheet text size to prevent memory issues
+                sheet_text = df.to_string(index=False, header=False)
+                if len(sheet_text) > 50000:  # Limit to 50KB of text
+                    sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
+                
+                print(f"DEBUG: Extracting questions from sheet {sheet_name} with Gemini.")
+                extracted = extract_questions_with_gemini(sheet_text)
+                
+                if not extracted:
+                    print(f"DEBUG: No questions extracted from sheet {sheet_name}.")
+                    processed_sheets_count += 1
+                    continue
+                
+                print(f"DEBUG: Found {len(extracted)} questions in sheet {sheet_name}.")
+                total_questions_processed += len(extracted)
+
+                ai_col = find_first_empty_column(ws)
+                ws.cell(row=1, column=ai_col, value="AI Answers")
+                review_col = ai_col + 1
+                ws.cell(row=1, column=review_col, value="Review Status")
+
+                for q_idx, item in enumerate(extracted):
+                    qtext = item.get("question", "")
+                    reported_row = item.get("row", 0)
+                    if not qtext:
+                        continue
+                        
+                    update_job_progress(job_id,
+                                        15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / len(extracted) / 2 / total_sheets),
+                                        f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
+                    
+                    write_row = resolve_row(ws, reported_row, qtext)
+                    emb = get_embedding(qtext)
+                    print(f"DEBUG: Question: {qtext[:100]}...")
+                    print(f"DEBUG: Embedding length: {len(emb) if emb else 0}")
+                    print(f"DEBUG: Client ID: {client_id}, RFP ID: {rfp_id}")
+                    
+                    # Search without RFP ID filter to get all matches for the client
+                    matches = search_supabase(emb, client_id, None)
+                    print(f"DEBUG: Found {len(matches) if matches else 0} matches")
+                    if matches:
+                        for i, match in enumerate(matches[:3]):  # Show top 3 matches
+                            print(f"DEBUG: Match {i+1}: similarity={match.get('similarity', 0):.3f}, answer={match.get('answer', '')[:50]}...")
+                        
+                    final_answer = "Not found, needs review."
                     review_status = ""
-                    print(f"DEBUG: Using direct answer (95%+ match)")
-                else:
-                    # Filter matches with similarity >= 0.65 for AI generation
-                    filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
-                    print(f"DEBUG: Filtered matches (65%+): {len(filtered_matches)}")
-                    if filtered_matches:
-                        final_answer = generate_tailored_answer(qtext, filtered_matches)
-                        review_status = "Need Review"
-                        print(f"DEBUG: Using AI-generated answer")
-                    else:
-                        final_answer = "Not found, needs review."
-                        review_status = ""
-                        print(f"DEBUG: No matches above 65% threshold")
-            else:
-                print(f"DEBUG: No matches found in database")
-            
-            # Apply cleaning to the final answer before writing to the sheet
-            final_answer = clean_markdown(final_answer)
 
-            ws.cell(row=write_row, column=ai_col, value=final_answer)
-            ws.cell(row=write_row, column=review_col, value=review_status)
-        
-        # Free up memory after processing each sheet
-        del df, sheet_text, extracted
-        gc.collect()
-        processed_sheets_count += 1
+                    if matches:
+                        best = pick_best_match(matches)
+                        print(f"DEBUG: Best match similarity: {best.get('similarity', 0) if best else 0}")
+                        if best and best.get("similarity", 0) >= 0.95:
+                            final_answer = best["answer"]
+                            review_status = ""
+                            print(f"DEBUG: Using direct answer (95%+ match)")
+                        else:
+                            # Filter matches with similarity >= 0.65 for AI generation
+                            filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
+                            print(f"DEBUG: Filtered matches (65%+): {len(filtered_matches)}")
+                            if filtered_matches:
+                                final_answer = generate_tailored_answer(qtext, filtered_matches)
+                                review_status = "Need Review"
+                                print(f"DEBUG: Using AI-generated answer")
+                            else:
+                                final_answer = "Not found, needs review."
+                                review_status = ""
+                                print(f"DEBUG: No matches above 65% threshold")
+                    else:
+                        print(f"DEBUG: No matches found in database")
+                    
+                    # Apply cleaning to the final answer before writing to the sheet
+                    final_answer = clean_markdown(final_answer)
+
+                    ws.cell(row=write_row, column=ai_col, value=final_answer)
+                    ws.cell(row=write_row, column=review_col, value=review_status)
+                
+                # Free up memory after processing each sheet
+                del df, sheet_text, extracted
+                gc.collect()
+                processed_sheets_count += 1
+                
+            except Exception as sheet_error:
+                print(f"ERROR: Failed to process sheet {sheet_name}: {sheet_error}")
+                # Continue to next sheet rather than failing entire workbook
+                continue
 
         update_job_progress(job_id, 90, "Saving processed Excel file...")
         print(f"DEBUG: Saving processed Excel file for {filename}.")
@@ -1006,7 +1236,8 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
         try:
             updates = {
                 "progress_percent": progress,
-                "current_step": current_step
+                "current_step": current_step,
+                "last_updated": datetime.now().isoformat()
             }
             if result_data:
                 updates["result_data"] = result_data
@@ -1055,11 +1286,20 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
         
         update_job_progress(job_id, 95, "Finalizing and storing processed file...")
         
+        # Store both original and processed files for comparison
+        import base64
+        processed_file_b64 = base64.b64encode(processed_content).decode('utf-8')
+        original_file_b64 = base64.b64encode(file_content).decode('utf-8')
+        
         result_data = {
             "file_name": f"processed_{file_name}",
             "file_size": len(processed_content),
             "processing_completed": True,
-            "processing_time_seconds": int(time.time() - start_time)
+            "processing_time_seconds": int(time.time() - start_time),
+            "processed_file": processed_file_b64,  # Store as base64
+            "original_file": original_file_b64,    # Store original for comparison
+            "sheets_processed": processed_sheets_count,
+            "total_questions": total_questions_processed
         }
         
         update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)

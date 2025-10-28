@@ -68,6 +68,7 @@ create table if not exists public.client_jobs (
   started_at timestamptz,
   completed_at timestamptz,
   error_message text,
+  job_data jsonb, -- stores input file content and parameters
   result_data jsonb, -- stores extracted questions/answers or processing results
   created_at timestamptz default now()
 );

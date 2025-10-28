@@ -8,10 +8,10 @@ bind = f"0.0.0.0:{os.getenv('PORT', 8000)}"
 backlog = 2048
 
 # Worker processes
-workers = 2  # Good for Render starter plan
+workers = 1  # Reduced to 1 since we have 4 background workers handling jobs
 worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
-timeout = 120
+timeout = 3000  # Increased timeout for long-running API calls
 keepalive = 2
 
 # Restart workers periodically to prevent memory leaks
