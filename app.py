@@ -150,25 +150,68 @@ app.add_middleware(
 
 # HELPER FUNCTIONS
 
-def extract_questions_with_gemini(sheet_text: str) -> list:
+def extract_questions_with_gemini(text: str) -> list:
     prompt = f"""
-You are analyzing an RFP Excel sheet. Identify ALL rows that represent questions or
-requirements directed at the vendor. Treat both explicit questions (with '?') and
-implicit requirements (like "Vendor must provide X", "Describe how your system handles Y")
-as questions.
+    You are analyzing an RFP (Request for Proposal) Excel sheet. Your task is to identify ALL questions, requirements, and statements that expect responses from vendors/bidders.
 
-Return only a JSON array where each object has:
-- "question": the extracted question/requirement text (cleaned and concise).
-- "row": the row number in the sheet (1-based).
-Return JSON array only:
-[
-  {{"question": "Question text here", "row": 5}}
-]
+    CONTEXT ABOUT RFP SHEETS:
+    - RFPs typically contain questions that vendors must answer
+    - Questions may be explicit (with "?") or implicit requirements
+    - Headers often indicate question categories (Technical, Financial, Operational, etc.)
+    - Some cells may contain instructions or requirements rather than direct questions
+    - Look for patterns like "Vendor must...", "Please provide...", "Describe...", "Explain..."
+    - Questions may be in different columns or rows
+    - Some questions may be embedded in longer text blocks
 
-If no questions are found, return [].
+    ANALYSIS GUIDELINES:
+    1. Look for explicit questions ending with "?"
+    2. Identify implicit requirements that need responses
+    3. Find statements that ask for information, descriptions, or explanations
+    4. Consider context from surrounding cells (headers, categories)
+    5. Include incomplete statements that expect answers
+    6. Look for conditional requirements ("If...", "When...", "In case of...")
 
-Sheet:
-{sheet_text}
+    ADVANCED PATTERN RECOGNITION:
+    - Direct questions: "What is your pricing model?"
+    - Requirements: "Vendor must provide 24/7 support"
+    - Instructions: "Describe your implementation approach"
+    - Conditionals: "If you offer discounts, please specify"
+    - Process questions: "How does your system handle X?"
+    - Definition questions: "What is your company's experience?"
+    - Timeline questions: "When will you complete the project?"
+    - Location questions: "Where is your data center located?"
+
+    SCORING CRITERIA FOR QUESTION DETECTION:
+    - Question marks (?): Highest priority
+    - Question words (what, how, when, where, why, who, which): High priority
+    - Action verbs (provide, describe, explain, list, detail, specify): High priority
+    - RFP terms (vendor, contractor, bidder, proposal): High priority
+    - Conditional statements (if, when, whether): Medium priority
+    - Request patterns (please, tell us, give us): Medium priority
+
+    Return ONLY a JSON array in this exact format:
+    [
+        {{
+            "question": "exact question text as it appears",
+            "row": <row number where found>,
+            "category": "Technical|Financial|Operational|Compliance|Other",
+            "confidence": <score from 0.0 to 1.0>,
+            "type": "Direct|Requirement|Instruction|Conditional|Process|Definition|Timeline|Location"
+        }}
+    ]
+    If no question found, return [].
+    Rules:
+    - Include ALL questions/requirements, even if they seem similar
+    - Use the exact text as it appears in the document
+    - Assign confidence scores based on how clearly it's a question
+    - If unsure about category, use "Other"
+    - If no questions found, return empty array []
+    - Do not include explanations or additional text
+    - Consider the context of headers and surrounding content
+    - Be thorough - it's better to include borderline cases than miss real questions
+
+    Sheet content to analyze:
+    {text}
 """
     try:
         # Windows-compatible timeout handling using threading
@@ -222,6 +265,372 @@ Sheet:
     except Exception as e:
         print(f"Gemini extract error: {e}")
         return []
+
+
+def _prepare_sheet_context(df, sheet_name: str, ws) -> str:
+    """Prepare sheet text with structural context for better AI analysis"""
+    
+    # Get sheet dimensions and basic info
+    max_row = ws.max_row
+    max_col = ws.max_column
+    total_cells = max_row * max_col
+    
+    # Analyze first few rows for headers
+    headers = []
+    for row in range(1, min(6, max_row + 1)):  # Check first 5 rows
+        row_data = []
+        for col in range(1, min(max_col + 1, 10)):  # Check first 10 columns
+            cell_value = ws.cell(row=row, column=col).value
+            if cell_value and str(cell_value).strip():
+                row_data.append(str(cell_value).strip())
+        if row_data:
+            headers.append(f"Row {row}: {' | '.join(row_data)}")
+    
+    # Get column headers (first row)
+    column_headers = []
+    for col in range(1, min(max_col + 1, 15)):  # First 15 columns
+        cell_value = ws.cell(row=1, column=col).value
+        if cell_value and str(cell_value).strip():
+            column_headers.append(str(cell_value).strip())
+    
+    # Analyze content patterns
+    question_indicators = []
+    requirement_words = ['must', 'shall', 'should', 'will', 'provide', 'describe', 'explain', 'list', 'detail', 'specify']
+    
+    # Sample some cells to understand content patterns
+    sample_cells = []
+    for row in range(1, min(max_row + 1, 20)):  # Sample first 20 rows
+        for col in range(1, min(max_col + 1, 10)):  # Sample first 10 columns
+            cell_value = ws.cell(row=row, column=col).value
+            if cell_value and len(str(cell_value).strip()) > 20:
+                cell_text = str(cell_value).strip().lower()
+                if any(word in cell_text for word in requirement_words) or '?' in str(cell_value):
+                    sample_cells.append(f"Row {row}, Col {col}: {str(cell_value)[:100]}...")
+                    if len(sample_cells) >= 10:  # Limit samples
+                        break
+        if len(sample_cells) >= 10:
+            break
+    
+    # Build context string
+    context_parts = [
+        f"SHEET ANALYSIS: '{sheet_name}'",
+        f"Dimensions: {max_row} rows × {max_col} columns ({total_cells} total cells)",
+        "",
+        "COLUMN HEADERS:",
+        " | ".join(column_headers) if column_headers else "No clear headers detected",
+        "",
+        "STRUCTURAL CONTEXT:",
+        "\n".join(headers[:5]) if headers else "No structured headers found",
+        "",
+        "CONTENT SAMPLES (potential questions/requirements):",
+        "\n".join(sample_cells) if sample_cells else "No obvious question patterns detected",
+        "",
+        "FULL SHEET CONTENT:",
+        df.to_string(index=False, header=False)
+    ]
+    
+    return "\n".join(context_parts)
+
+
+def extract_questions_pattern_based(text: str) -> list:
+    """Extract questions using advanced pattern matching with scoring and heuristics"""
+    import re
+    
+    questions = []
+    lines = text.split('\n')
+    
+    # Enhanced question patterns with weights
+    question_patterns = [
+        (r'[?]', 1.0, "Direct question"),  # Highest weight for direct questions
+        (r'(?:what|how|when|where|why|who|which)\s+.*', 0.9, "Question word"),
+        (r'(?:can|could|would|should|do|does|did|is|are|was|were)\s+.*', 0.8, "Auxiliary verb"),
+        (r'(?:please\s+)?(?:provide|describe|explain|list|detail|specify|outline|clarify)\s+.*', 0.85, "Action verb"),
+        (r'(?:if|whether)\s+.*', 0.7, "Conditional"),
+        (r'(?:tell\s+us|give\s+us|show\s+us)\s+.*', 0.8, "Request"),
+        (r'(?:vendor|contractor|bidder|proposer)\s+(?:must|should|shall|will)\s+.*', 0.9, "RFP requirement"),
+        (r'(?:describe|explain|detail|specify|outline|clarify|provide|list|show|demonstrate)\s+.*', 0.8, "Instruction"),
+        (r'(?:in\s+case\s+of|when|if)\s+.*', 0.75, "Conditional requirement"),
+    ]
+    
+    # Semantic similarity patterns for implicit questions
+    semantic_patterns = [
+        (r'(?:how\s+does|how\s+will|how\s+can)\s+.*', 0.9, "Process question"),
+        (r'(?:what\s+is|what\s+are|what\s+would)\s+.*', 0.9, "Definition question"),
+        (r'(?:when\s+will|when\s+can|when\s+should)\s+.*', 0.85, "Timeline question"),
+        (r'(?:where\s+is|where\s+will|where\s+can)\s+.*', 0.8, "Location question"),
+    ]
+    
+    # Scoring system for question likelihood
+    def calculate_question_score(line: str, pattern_match: tuple) -> float:
+        pattern, weight, description = pattern_match
+        base_score = weight
+        
+        # Length bonus (longer text often more complete)
+        length_bonus = min(len(line) / 100, 0.2)  # Max 20% bonus
+        
+        # Keyword density bonus
+        question_keywords = ['question', 'requirement', 'specification', 'criteria', 'standard']
+        keyword_bonus = sum(0.05 for word in question_keywords if word in line.lower())
+        
+        # Punctuation bonus
+        punctuation_bonus = 0.1 if '?' in line else 0.05 if any(p in line for p in [':', ';']) else 0
+        
+        # Context bonus (if line contains RFP-specific terms)
+        rfp_terms = ['vendor', 'contractor', 'bidder', 'proposal', 'response', 'submission']
+        context_bonus = sum(0.03 for term in rfp_terms if term in line.lower())
+        
+        return base_score + length_bonus + keyword_bonus + punctuation_bonus + context_bonus
+    
+    # Process each line with scoring
+    scored_candidates = []
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line or len(line) < 10:  # Skip very short lines
+            continue
+        
+        best_score = 0
+        best_pattern = None
+        
+        # Check all patterns
+        all_patterns = question_patterns + semantic_patterns
+        for pattern_match in all_patterns:
+            if re.search(pattern_match[0], line, re.IGNORECASE):
+                score = calculate_question_score(line, pattern_match)
+                if score > best_score:
+                    best_score = score
+                    best_pattern = pattern_match
+        
+        # Threshold tuning - adjust based on precision/recall needs
+        threshold = 0.6  # Balanced threshold
+        if best_score >= threshold:
+            scored_candidates.append({
+                'question': line,
+                'row': i + 1,
+                'score': best_score,
+                'pattern': best_pattern[2] if best_pattern else 'Unknown',
+                'category': 'Other'
+            })
+    
+    # Sort by score and return top candidates
+    scored_candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Return questions with their metadata
+    questions = []
+    for candidate in scored_candidates:
+        questions.append({
+            "question": candidate['question'],
+            "row": candidate['row'],
+            "category": candidate['category']
+        })
+    
+    return questions
+
+
+def extract_questions_combined(sheet_text: str) -> list:
+    """Use enhanced Gemini with all context for comprehensive question detection"""
+    
+    # Extract comprehensive context metadata
+    context_info = _extract_context_metadata(sheet_text)
+    
+    # Enhance the sheet text with all context information
+    enhanced_sheet_text = _build_enhanced_context(sheet_text, context_info)
+    
+    # Use Gemini with all the enhanced context
+    questions = extract_questions_with_gemini(enhanced_sheet_text)
+    
+    # If Gemini found questions, return them
+    if questions and len(questions) > 0:
+        return questions
+    
+    # If no questions found, return empty list
+    return []
+
+
+def _build_enhanced_context(sheet_text: str, context_info: dict) -> str:
+    """Build comprehensive context for AI analysis"""
+    
+    context_parts = [
+        "=== COMPREHENSIVE RFP ANALYSIS CONTEXT ===",
+        "",
+        "DOCUMENT METADATA:",
+        f"- Total lines: {context_info['total_lines']}",
+        f"- Non-empty lines: {context_info['non_empty_lines']}",
+        f"- Content density: {context_info['content_density']:.2f}",
+        f"- Question marks found: {context_info['question_marks']}",
+        f"- Colons found: {context_info['colons']}",
+        f"- Semicolons found: {context_info['semicolons']}",
+        "",
+        "RFP INDICATORS:",
+        f"- RFP-specific terms: {context_info['rfp_term_count']}",
+        f"- Question words: {context_info['question_word_count']}",
+        "",
+        "STRUCTURAL ANALYSIS:",
+        "Potential headers detected:",
+    ] + (context_info['potential_headers'] if context_info['potential_headers'] else ["None detected"]) + [
+        "",
+        "QUESTION DETECTION PATTERNS TO LOOK FOR:",
+        "1. Direct questions with '?'",
+        "2. Question words: what, how, when, where, why, who, which",
+        "3. Action verbs: provide, describe, explain, list, detail, specify",
+        "4. RFP requirements: vendor must, contractor should, bidder will",
+        "5. Conditional statements: if, when, whether, in case of",
+        "6. Request patterns: please, tell us, give us, show us",
+        "7. Process questions: how does, how will, how can",
+        "8. Definition questions: what is, what are, what would",
+        "9. Timeline questions: when will, when can, when should",
+        "10. Location questions: where is, where will, where can",
+        "",
+        "SCORING GUIDELINES:",
+        "- Confidence 0.9-1.0: Clear direct questions with '?'",
+        "- Confidence 0.8-0.9: Strong question words or RFP requirements",
+        "- Confidence 0.7-0.8: Action verbs or conditional statements",
+        "- Confidence 0.6-0.7: Request patterns or borderline cases",
+        "- Confidence 0.5-0.6: Weak indicators but potential questions",
+        "",
+        "=== ACTUAL SHEET CONTENT ===",
+        "",
+        sheet_text
+    ]
+    
+    return "\n".join(context_parts)
+
+
+def _extract_context_metadata(sheet_text: str) -> dict:
+    """Extract metadata about the sheet content for better context"""
+    lines = sheet_text.split('\n')
+    
+    # Analyze content structure
+    total_lines = len(lines)
+    non_empty_lines = [line for line in lines if line.strip()]
+    
+    # Count different types of content
+    question_marks = sum(1 for line in lines if '?' in line)
+    colons = sum(1 for line in lines if ':' in line)
+    semicolons = sum(1 for line in lines if ';' in line)
+    
+    # Identify potential headers (short lines, often capitalized)
+    potential_headers = []
+    for i, line in enumerate(lines[:10]):  # Check first 10 lines
+        line = line.strip()
+        if 5 <= len(line) <= 50 and line.isupper():
+            potential_headers.append(f"Row {i+1}: {line}")
+    
+    # Identify RFP-specific terms
+    rfp_terms = ['vendor', 'contractor', 'bidder', 'proposal', 'response', 'submission', 'requirement', 'specification']
+    rfp_term_count = sum(1 for line in lines for term in rfp_terms if term in line.lower())
+    
+    # Identify question indicators
+    question_words = ['what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'could', 'would', 'should']
+    question_word_count = sum(1 for line in lines for word in question_words if word in line.lower())
+    
+    return {
+        'total_lines': total_lines,
+        'non_empty_lines': len(non_empty_lines),
+        'question_marks': question_marks,
+        'colons': colons,
+        'semicolons': semicolons,
+        'potential_headers': potential_headers,
+        'rfp_term_count': rfp_term_count,
+        'question_word_count': question_word_count,
+        'content_density': len(non_empty_lines) / max(total_lines, 1)
+    }
+
+
+def _enhance_questions_with_context(questions: list, context_info: dict) -> list:
+    """Enhance questions with contextual information"""
+    enhanced = []
+    
+    for q in questions:
+        enhanced_q = q.copy()
+        
+        # Add confidence score based on context
+        confidence = 0.8  # Base confidence
+        
+        # Boost confidence if question has question mark
+        if '?' in q.get('question', ''):
+            confidence += 0.1
+        
+        # Boost confidence if RFP terms are present
+        if context_info['rfp_term_count'] > 0:
+            confidence += 0.05
+        
+        # Boost confidence if question words are present
+        if context_info['question_word_count'] > 0:
+            confidence += 0.05
+        
+        enhanced_q['confidence'] = min(confidence, 1.0)
+        enhanced.append(enhanced_q)
+    
+    return enhanced
+
+
+def _extract_questions_semantic_similarity(sheet_text: str, context_info: dict) -> list:
+    """Extract questions using semantic similarity as last resort"""
+    lines = sheet_text.split('\n')
+    questions = []
+    
+    # Define semantic templates for different question types
+    semantic_templates = [
+        ("What is", 0.9),
+        ("How does", 0.9),
+        ("When will", 0.85),
+        ("Where is", 0.8),
+        ("Why does", 0.85),
+        ("Who is", 0.8),
+        ("Which", 0.8),
+        ("Please provide", 0.9),
+        ("Describe", 0.85),
+        ("Explain", 0.85),
+        ("List", 0.8),
+        ("Detail", 0.8),
+        ("Specify", 0.8),
+        ("Vendor must", 0.9),
+        ("Contractor should", 0.9),
+    ]
+    
+    # Calculate semantic similarity using simple word overlap
+    def calculate_similarity(text: str, template: str) -> float:
+        text_words = set(text.lower().split())
+        template_words = set(template.lower().split())
+        
+        if not template_words:
+            return 0
+        
+        overlap = len(text_words.intersection(template_words))
+        return overlap / len(template_words)
+    
+    # Find lines with high semantic similarity to question templates
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if len(line) < 15:  # Skip short lines
+            continue
+        
+        best_similarity = 0
+        best_template = None
+        
+        for template, weight in semantic_templates:
+            similarity = calculate_similarity(line, template)
+            weighted_similarity = similarity * weight
+            
+            if weighted_similarity > best_similarity:
+                best_similarity = weighted_similarity
+                best_template = template
+        
+        # Threshold for semantic similarity
+        if best_similarity >= 0.3:  # Lower threshold for semantic matching
+            questions.append({
+                "question": line,
+                "row": i + 1,
+                "category": "Other",
+                "similarity": best_similarity,
+                "template": best_template
+            })
+    
+    # Sort by similarity and return top candidates
+    questions.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    # Return top 20 most similar questions
+    return questions[:20]
 
 
 def clean_markdown(text: str) -> str:
@@ -386,6 +795,42 @@ def _row_text(ws, r: int) -> str:
     )
 
 
+def find_question_in_sheet(worksheet, question_text: str) -> int | None:
+    """Search for question text in all cells of the worksheet and return the row number where found"""
+    if not question_text or not question_text.strip():
+        return None
+    
+    qnorm = question_text.strip().lower()
+    max_row = worksheet.max_row
+    max_col = worksheet.max_column
+    
+    # Search through all cells in the worksheet
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
+            cell = worksheet.cell(row=row, column=col)
+            if cell.value is None:
+                continue
+            
+            cell_text = str(cell.value).strip().lower()
+            if not cell_text:
+                continue
+            
+            # Check for exact match or high similarity
+            if qnorm == cell_text:
+                return row
+            
+            # Check for partial match (question text contained in cell or vice versa)
+            if qnorm in cell_text or cell_text in qnorm:
+                return row
+            
+            # Use difflib for fuzzy matching
+            similarity = difflib.SequenceMatcher(None, qnorm, cell_text).ratio()
+            if similarity >= 0.8:  # 80% similarity threshold
+                return row
+    
+    return None
+
+
 def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
     max_row = worksheet.max_row
     qnorm = (question_text or "").strip().lower()
@@ -424,6 +869,7 @@ def find_first_empty_column(ws):
 
 # API ENDPOINT
 def get_client_id_from_key(client_key: str | None) -> str:
+    global supabase
     if not client_key:
         raise HTTPException(status_code=401, detail="Missing X-Client-Key")
     max_retries = 3
@@ -440,7 +886,6 @@ def get_client_id_from_key(client_key: str | None) -> str:
             print(f"Client lookup error: {e}")
             # Recreate supabase client and retry on transient errors
             try:
-                global supabase
                 if supabase is None:
                     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
                 else:
@@ -453,7 +898,7 @@ def get_client_id_from_key(client_key: str | None) -> str:
                 except Exception:
                     pass
                 continue
-            raise HTTPException(status_code=500, detail="Client lookup failed")
+        raise HTTPException(status_code=500, detail="Client lookup failed")
 
 
 @app.post("/process")
@@ -477,7 +922,7 @@ async def process_excel(file: UploadFile, x_client_key: str | None = Header(defa
 @app.get("/rfps")
 def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     print(f"=== /rfps ENDPOINT CALLED ===")
-    print(f"RFPs endpoint called with client_key: {x_client_key}")
+    print("RFPs endpoint called")
     client_id = get_client_id_from_key(x_client_key)
     print(f"Resolved client_id: {client_id}")
     res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
@@ -1368,8 +1813,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 
                 update_job_progress(job_id, 15 + int(sheet_idx * 70 / total_sheets / 2),
                                     f"Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
-                if False:
-                    print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
+                print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
                 ws = wb[sheet_name]
 
                 # Prefer pandas to read the sheet reliably; fallback to openpyxl values
@@ -1396,14 +1840,13 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                     continue
                     
                 # Convert DataFrame to a string representation for Gemini to analyze
-                # Use header=False to prevent DataFrame column names from being sent as part of sheet_text
-                # Limit sheet text size to prevent memory issues
-                sheet_text = df.to_string(index=False, header=False)
+                # Include structural context about the sheet
+                sheet_text = _prepare_sheet_context(df, sheet_name, ws)
                 if len(sheet_text) > 50000:  # Limit to 50KB of text
                     sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
                 
                 
-                extracted = extract_questions_with_gemini(sheet_text)
+                extracted = extract_questions_combined(sheet_text)
                 # Retry up to 2 additional times if no questions returned
                 retry_attempt = 0
                 while (not extracted or len(extracted) == 0) and retry_attempt < 2:
@@ -1413,7 +1856,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                         time.sleep(0.5)
                     except Exception:
                         pass
-                    extracted = extract_questions_with_gemini(sheet_text)
+                    extracted = extract_questions_combined(sheet_text)
                 
                 if not extracted or len(extracted) == 0:
                     
@@ -1431,6 +1874,13 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 for q_idx, item in enumerate(extracted):
                     qtext = item.get("question", "")
                     reported_row = item.get("row", 0)
+                    confidence = item.get("confidence", 0.8)
+                    question_type = item.get("type", "Other")
+                    
+                    # Skip low confidence questions (optional filtering)
+                    if confidence < 0.3:
+                        continue
+                    
                     # Drop null/empty/whitespace-only questions
                     if not qtext:
                         continue
@@ -1439,19 +1889,19 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                                         15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / len(extracted) / 2 / total_sheets),
                                         f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
                     
-                    write_row = resolve_row(ws, reported_row, qtext)
-                    # If no strong match across the sheet, drop this question
+                    # Search for the question text in all cells of the sheet
+                    write_row = find_question_in_sheet(ws, qtext)
+                    # If no match found in any cell, skip this question
                     if write_row is None:
-                    
                         continue
-                    emb = get_embedding(qtext)
                     
+                    # Get answer for the detected question
+                    emb = get_embedding(qtext)
                     
                     # Search without RFP ID filter to get all matches for the client
                     matches = search_supabase(emb, client_id, None)
-                    
                         
-                    final_answer = "Not found any relavant question, needs review."
+                    final_answer = "Not found any relevant question, needs review."
                     review_status = ""
 
                     if matches:
@@ -1460,19 +1910,15 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                         if best and best.get("similarity", 0) >= 0.95:
                             final_answer = best["answer"]
                             review_status = ""
-                            
                         else:
                             # Filter matches with similarity >= 0.65 for AI generation
                             filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
-                            
                             if filtered_matches:
                                 final_answer = generate_tailored_answer(qtext, filtered_matches)
                                 review_status = "Need Review"
-                                
                             else:
                                 final_answer = "Not found, needs review."
                                 review_status = ""
-                                
                     else:
                         final_answer = "Not found, needs review."
                         review_status = ""
@@ -1643,7 +2089,7 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 while (not pairs or len(pairs) == 0) and retry_attempt < 2:
                     retry_attempt += 1
                     print(f"DEBUG: No Q&A pairs extracted from sheet {sheet}. Retrying attempt {retry_attempt}/2...")
-                    pairs = _extract_qa_pairs(sheet_csv)
+                pairs = _extract_qa_pairs(sheet_csv)
                 
                 for p_idx, p in enumerate(pairs):
                     # More granular update for each pair found (optional, could be too chatty)
@@ -1941,7 +2387,7 @@ async def submit_job(
     """Submit a job for background processing - uses worker process for long-running tasks"""
     try:
         print(f"=== /jobs/submit ENDPOINT CALLED ===")
-        print(f"Received job submission: file={file.filename}, job_type={job_type}, client_key={x_client_key}")
+        print(f"Received job submission: file={file.filename}, job_type={job_type}")
         
         if not file.filename:
             print("ERROR: No file filename provided")
@@ -2023,29 +2469,29 @@ async def submit_job(
         "status": "submitted",
         "message": "Job submitted successfully. Processing will begin shortly."
     }
-    print(f"Returning result: {result}")
+    print(f"Returning job submission result for job_id={result.get('job_id')}")
     return result
 
 @app.get("/jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    global supabase
     """List all jobs for a client with retry logic"""
     print(f"=== /jobs ENDPOINT CALLED ===")
-    print(f"Jobs endpoint called with client_key: {x_client_key}")
+    print("Jobs endpoint called")
     client_id = get_client_id_from_key(x_client_key)
     max_retries = 3
     for attempt in range(max_retries):
         try:
             res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
             jobs = res.data or []
-            # Debug: Print job data to see what's being returned
+            # Minimal debug: show job id and status only to avoid dumping large payloads
             for job in jobs[:2]:  # Print first 2 jobs for debugging
-                print(f"DEBUG: Job {job.get('id', 'unknown')} - result_data: {job.get('result_data', {})}")
+                print(f"DEBUG: Job {job.get('id', 'unknown')} - status: {job.get('status')} progress: {job.get('progress_percent')}")
             return {"jobs": jobs}
         except Exception as e:
             print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
             # Recreate supabase client on error
             try:
-                global supabase
                 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             except Exception as reinit_err:
                 print(f"Supabase re-init failed in /jobs: {reinit_err}")
@@ -2131,6 +2577,7 @@ def upload_to_drive_endpoint(
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    global supabase
     """Get specific job details with retry logic"""
     client_id = get_client_id_from_key(x_client_key)
     max_retries = 3
@@ -2164,7 +2611,6 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
         except Exception as e:
             print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
             try:
-                global supabase
                 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             except Exception as reinit_err:
                 print(f"Supabase re-init failed in /jobs/{job_id}: {reinit_err}")

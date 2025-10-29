@@ -51,6 +51,7 @@ create table if not exists public.client_summaries (
   summary_type text, -- e.g., 'Consolidated'
   character_count int,
   quality_score int,
+  approved boolean default false,
   created_at timestamptz default now()
 );
 

@@ -55,5 +55,8 @@ done
 echo "All 4 workers started successfully"
 echo "Starting Gunicorn server with Uvicorn workers..."
 
+# Ensure Uvicorn lifespan is disabled to avoid CancelledError noise during deploys
+export UVICORN_LIFESPAN=off
+
 # Start the application with Gunicorn for production
 exec gunicorn app:app --config gunicorn.conf.py
