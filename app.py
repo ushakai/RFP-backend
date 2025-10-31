@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import traceback # Import traceback module
 
 # CONFIGURATION 
 load_dotenv()
@@ -92,6 +93,8 @@ def health_check():
             "database": "connected"
         }
     except Exception as e:
+        print(f"ERROR: Health check failed: {e}")
+        traceback.print_exc()
         return {
             "status": "unhealthy",
             "timestamp": datetime.now().isoformat(),
@@ -151,73 +154,28 @@ app.add_middleware(
 # HELPER FUNCTIONS
 
 def extract_questions_with_gemini(text: str) -> list:
+    # Simplified prompt based on user's v1 code
     prompt = f"""
-    You are analyzing an RFP (Request for Proposal) Excel sheet. Your task is to identify ALL questions, requirements, and statements that expect responses from vendors/bidders.
+You are analyzing an RFP Excel sheet. Identify ALL rows that represent questions or
+requirements directed at the vendor. Treat both explicit questions (with '?') and
+implicit requirements (like "Vendor must provide X", "Describe how your system handles Y")
+as questions.
 
-    CONTEXT ABOUT RFP SHEETS:
-    - RFPs typically contain questions that vendors must answer
-    - Questions may be explicit (with "?") or implicit requirements
-    - Headers often indicate question categories (Technical, Financial, Operational, etc.)
-    - Some cells may contain instructions or requirements rather than direct questions
-    - Look for patterns like "Vendor must...", "Please provide...", "Describe...", "Explain..."
-    - Questions may be in different columns or rows
-    - Some questions may be embedded in longer text blocks
+Return only a JSON array where each object has:
+- "question": the extracted question/requirement text (cleaned and concise).
+- "row": the row number in the sheet (1-based).
+Return JSON array only:
+[
+  {{"question": "Question text here", "row": 5}}
+]
 
-    ANALYSIS GUIDELINES:
-    1. Look for explicit questions ending with "?"
-    2. Identify implicit requirements that need responses
-    3. Find statements that ask for information, descriptions, or explanations
-    4. Consider context from surrounding cells (headers, categories)
-    5. Include incomplete statements that expect answers
-    6. Look for conditional requirements ("If...", "When...", "In case of...")
+If no questions are found, return [].
 
-    ADVANCED PATTERN RECOGNITION:
-    - Direct questions: "What is your pricing model?"
-    - Requirements: "Vendor must provide 24/7 support"
-    - Instructions: "Describe your implementation approach"
-    - Conditionals: "If you offer discounts, please specify"
-    - Process questions: "How does your system handle X?"
-    - Definition questions: "What is your company's experience?"
-    - Timeline questions: "When will you complete the project?"
-    - Location questions: "Where is your data center located?"
-
-    SCORING CRITERIA FOR QUESTION DETECTION:
-    - Question marks (?): Highest priority
-    - Question words (what, how, when, where, why, who, which): High priority
-    - Action verbs (provide, describe, explain, list, detail, specify): High priority
-    - RFP terms (vendor, contractor, bidder, proposal): High priority
-    - Conditional statements (if, when, whether): Medium priority
-    - Request patterns (please, tell us, give us): Medium priority
-
-    Return ONLY a JSON array in this exact format:
-    [
-        {{
-            "question": "exact question text as it appears",
-            "row": <row number where found>,
-            "category": "Technical|Financial|Operational|Compliance|Other",
-            "confidence": <score from 0.0 to 1.0>,
-            "type": "Direct|Requirement|Instruction|Conditional|Process|Definition|Timeline|Location"
-        }}
-    ]
-    If no question found, return [].
-    Rules:
-    - Include ALL questions/requirements, even if they seem similar
-    - Use the exact text as it appears in the document
-    - Assign confidence scores based on how clearly it's a question
-    - If unsure about category, use "Other"
-    - If no questions found, return empty array []
-    - Do not include explanations or additional text
-    - Consider the context of headers and surrounding content
-    - Be thorough - it's better to include borderline cases than miss real questions
-
-    Sheet content to analyze:
-    {text}
+Sheet:
+{text}
 """
     try:
         # Windows-compatible timeout handling using threading
-        import threading
-        import time
-        
         result = [None]
         error = [None]
         
@@ -226,10 +184,10 @@ def extract_questions_with_gemini(text: str) -> list:
                 response = gemini.generate_content(
                     prompt,
                     safety_settings={
-                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
                     },
                 )
                 result[0] = response
@@ -242,7 +200,7 @@ def extract_questions_with_gemini(text: str) -> list:
         thread.start()
         
         # Wait for completion with timeout
-        thread.join(timeout=60)
+        thread.join(timeout=100) 
         
         if thread.is_alive():
             print("Gemini extract: API call timed out after 60 seconds")
@@ -264,373 +222,61 @@ def extract_questions_with_gemini(text: str) -> list:
             
     except Exception as e:
         print(f"Gemini extract error: {e}")
+        traceback.print_exc() # Print full traceback
         return []
 
 
 def _prepare_sheet_context(df, sheet_name: str, ws) -> str:
     """Prepare sheet text with structural context for better AI analysis"""
     
-    # Get sheet dimensions and basic info
+    # Get sheet dimensions
     max_row = ws.max_row
     max_col = ws.max_column
-    total_cells = max_row * max_col
     
-    # Analyze first few rows for headers
-    headers = []
-    for row in range(1, min(6, max_row + 1)):  # Check first 5 rows
-        row_data = []
-        for col in range(1, min(max_col + 1, 10)):  # Check first 10 columns
-            cell_value = ws.cell(row=row, column=col).value
-            if cell_value and str(cell_value).strip():
-                row_data.append(str(cell_value).strip())
-        if row_data:
-            headers.append(f"Row {row}: {' | '.join(row_data)}")
-    
-    # Get column headers (first row)
-    column_headers = []
-    for col in range(1, min(max_col + 1, 15)):  # First 15 columns
-        cell_value = ws.cell(row=1, column=col).value
-        if cell_value and str(cell_value).strip():
-            column_headers.append(str(cell_value).strip())
-    
-    # Analyze content patterns
-    question_indicators = []
-    requirement_words = ['must', 'shall', 'should', 'will', 'provide', 'describe', 'explain', 'list', 'detail', 'specify']
-    
-    # Sample some cells to understand content patterns
-    sample_cells = []
-    for row in range(1, min(max_row + 1, 20)):  # Sample first 20 rows
-        for col in range(1, min(max_col + 1, 10)):  # Sample first 10 columns
-            cell_value = ws.cell(row=row, column=col).value
-            if cell_value and len(str(cell_value).strip()) > 20:
-                cell_text = str(cell_value).strip().lower()
-                if any(word in cell_text for word in requirement_words) or '?' in str(cell_value):
-                    sample_cells.append(f"Row {row}, Col {col}: {str(cell_value)[:100]}...")
-                    if len(sample_cells) >= 10:  # Limit samples
-                        break
-        if len(sample_cells) >= 10:
-            break
-    
-    # Build context string
     context_parts = [
-        f"SHEET ANALYSIS: '{sheet_name}'",
-        f"Dimensions: {max_row} rows × {max_col} columns ({total_cells} total cells)",
+        f"--- SHEET: '{sheet_name}' ---",
+        f"Sheet Dimensions: {max_row} rows x {max_col} columns",
         "",
-        "COLUMN HEADERS:",
-        " | ".join(column_headers) if column_headers else "No clear headers detected",
-        "",
-        "STRUCTURAL CONTEXT:",
-        "\n".join(headers[:5]) if headers else "No structured headers found",
-        "",
-        "CONTENT SAMPLES (potential questions/requirements):",
-        "\n".join(sample_cells) if sample_cells else "No obvious question patterns detected",
-        "",
-        "FULL SHEET CONTENT:",
-        df.to_string(index=False, header=False)
+        "STRUCTURAL CONTEXT (first few rows & columns to identify headers/categories):",
     ]
+    
+    # Analyze first few rows for headers and initial context
+    # Limit rows to 10 and columns to 15 for context efficiency
+    for r_idx in range(1, min(max_row + 1, 10)):
+        row_values = []
+        for c_idx in range(1, min(max_col + 1, 15)):
+            cell_value = ws.cell(row=r_idx, column=c_idx).value
+            if cell_value is not None:
+                row_values.append(str(cell_value).strip())
+        if row_values:
+            context_parts.append(f"Row {r_idx}: {' | '.join(row_values)}")
+    
+    context_parts.append("")
+    context_parts.append("FULL SHEET DATA (to identify specific questions/requirements):")
+    
+    # Convert DataFrame to string, truncating if too large
+    df_string = df.to_string(index=False, header=False)
+    if len(df_string) > 20000: # Limit raw data string to 20KB to save tokens
+        df_string = df_string[:20000] + "\n... [Remaining sheet data truncated]"
+    context_parts.append(df_string)
     
     return "\n".join(context_parts)
 
-
-def extract_questions_pattern_based(text: str) -> list:
-    """Extract questions using advanced pattern matching with scoring and heuristics"""
-    import re
-    
-    questions = []
-    lines = text.split('\n')
-    
-    # Enhanced question patterns with weights
-    question_patterns = [
-        (r'[?]', 1.0, "Direct question"),  # Highest weight for direct questions
-        (r'(?:what|how|when|where|why|who|which)\s+.*', 0.9, "Question word"),
-        (r'(?:can|could|would|should|do|does|did|is|are|was|were)\s+.*', 0.8, "Auxiliary verb"),
-        (r'(?:please\s+)?(?:provide|describe|explain|list|detail|specify|outline|clarify)\s+.*', 0.85, "Action verb"),
-        (r'(?:if|whether)\s+.*', 0.7, "Conditional"),
-        (r'(?:tell\s+us|give\s+us|show\s+us)\s+.*', 0.8, "Request"),
-        (r'(?:vendor|contractor|bidder|proposer)\s+(?:must|should|shall|will)\s+.*', 0.9, "RFP requirement"),
-        (r'(?:describe|explain|detail|specify|outline|clarify|provide|list|show|demonstrate)\s+.*', 0.8, "Instruction"),
-        (r'(?:in\s+case\s+of|when|if)\s+.*', 0.75, "Conditional requirement"),
-    ]
-    
-    # Semantic similarity patterns for implicit questions
-    semantic_patterns = [
-        (r'(?:how\s+does|how\s+will|how\s+can)\s+.*', 0.9, "Process question"),
-        (r'(?:what\s+is|what\s+are|what\s+would)\s+.*', 0.9, "Definition question"),
-        (r'(?:when\s+will|when\s+can|when\s+should)\s+.*', 0.85, "Timeline question"),
-        (r'(?:where\s+is|where\s+will|where\s+can)\s+.*', 0.8, "Location question"),
-    ]
-    
-    # Scoring system for question likelihood
-    def calculate_question_score(line: str, pattern_match: tuple) -> float:
-        pattern, weight, description = pattern_match
-        base_score = weight
-        
-        # Length bonus (longer text often more complete)
-        length_bonus = min(len(line) / 100, 0.2)  # Max 20% bonus
-        
-        # Keyword density bonus
-        question_keywords = ['question', 'requirement', 'specification', 'criteria', 'standard']
-        keyword_bonus = sum(0.05 for word in question_keywords if word in line.lower())
-        
-        # Punctuation bonus
-        punctuation_bonus = 0.1 if '?' in line else 0.05 if any(p in line for p in [':', ';']) else 0
-        
-        # Context bonus (if line contains RFP-specific terms)
-        rfp_terms = ['vendor', 'contractor', 'bidder', 'proposal', 'response', 'submission']
-        context_bonus = sum(0.03 for term in rfp_terms if term in line.lower())
-        
-        return base_score + length_bonus + keyword_bonus + punctuation_bonus + context_bonus
-    
-    # Process each line with scoring
-    scored_candidates = []
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line or len(line) < 10:  # Skip very short lines
-            continue
-        
-        best_score = 0
-        best_pattern = None
-        
-        # Check all patterns
-        all_patterns = question_patterns + semantic_patterns
-        for pattern_match in all_patterns:
-            if re.search(pattern_match[0], line, re.IGNORECASE):
-                score = calculate_question_score(line, pattern_match)
-                if score > best_score:
-                    best_score = score
-                    best_pattern = pattern_match
-        
-        # Threshold tuning - adjust based on precision/recall needs
-        threshold = 0.6  # Balanced threshold
-        if best_score >= threshold:
-            scored_candidates.append({
-                'question': line,
-                'row': i + 1,
-                'score': best_score,
-                'pattern': best_pattern[2] if best_pattern else 'Unknown',
-                'category': 'Other'
-            })
-    
-    # Sort by score and return top candidates
-    scored_candidates.sort(key=lambda x: x['score'], reverse=True)
-    
-    # Return questions with their metadata
-    questions = []
-    for candidate in scored_candidates:
-        questions.append({
-            "question": candidate['question'],
-            "row": candidate['row'],
-            "category": candidate['category']
-        })
-    
-    return questions
-
-
+# Consolidated question extraction (simplified)
 def extract_questions_combined(sheet_text: str) -> list:
-    """Use enhanced Gemini with all context for comprehensive question detection"""
+    """
+    Primary method for question extraction using a simplified Gemini prompt.
+    """
+    print("DEBUG: Attempting simplified Gemini-based question extraction...")
+    gemini_questions = extract_questions_with_gemini(sheet_text)
+    if gemini_questions:
+        print(f"DEBUG: Gemini extracted {len(gemini_questions)} questions.")
+    else:
+        print("DEBUG: Simplified Gemini extraction found no questions or failed.")
     
-    # Extract comprehensive context metadata
-    context_info = _extract_context_metadata(sheet_text)
-    
-    # Enhance the sheet text with all context information
-    enhanced_sheet_text = _build_enhanced_context(sheet_text, context_info)
-    
-    # Use Gemini with all the enhanced context
-    questions = extract_questions_with_gemini(enhanced_sheet_text)
-    
-    # If Gemini found questions, return them
-    if questions and len(questions) > 0:
-        return questions
-    
-    # If no questions found, return empty list
-    return []
-
-
-def _build_enhanced_context(sheet_text: str, context_info: dict) -> str:
-    """Build comprehensive context for AI analysis"""
-    
-    context_parts = [
-        "=== COMPREHENSIVE RFP ANALYSIS CONTEXT ===",
-        "",
-        "DOCUMENT METADATA:",
-        f"- Total lines: {context_info['total_lines']}",
-        f"- Non-empty lines: {context_info['non_empty_lines']}",
-        f"- Content density: {context_info['content_density']:.2f}",
-        f"- Question marks found: {context_info['question_marks']}",
-        f"- Colons found: {context_info['colons']}",
-        f"- Semicolons found: {context_info['semicolons']}",
-        "",
-        "RFP INDICATORS:",
-        f"- RFP-specific terms: {context_info['rfp_term_count']}",
-        f"- Question words: {context_info['question_word_count']}",
-        "",
-        "STRUCTURAL ANALYSIS:",
-        "Potential headers detected:",
-    ] + (context_info['potential_headers'] if context_info['potential_headers'] else ["None detected"]) + [
-        "",
-        "QUESTION DETECTION PATTERNS TO LOOK FOR:",
-        "1. Direct questions with '?'",
-        "2. Question words: what, how, when, where, why, who, which",
-        "3. Action verbs: provide, describe, explain, list, detail, specify",
-        "4. RFP requirements: vendor must, contractor should, bidder will",
-        "5. Conditional statements: if, when, whether, in case of",
-        "6. Request patterns: please, tell us, give us, show us",
-        "7. Process questions: how does, how will, how can",
-        "8. Definition questions: what is, what are, what would",
-        "9. Timeline questions: when will, when can, when should",
-        "10. Location questions: where is, where will, where can",
-        "",
-        "SCORING GUIDELINES:",
-        "- Confidence 0.9-1.0: Clear direct questions with '?'",
-        "- Confidence 0.8-0.9: Strong question words or RFP requirements",
-        "- Confidence 0.7-0.8: Action verbs or conditional statements",
-        "- Confidence 0.6-0.7: Request patterns or borderline cases",
-        "- Confidence 0.5-0.6: Weak indicators but potential questions",
-        "",
-        "=== ACTUAL SHEET CONTENT ===",
-        "",
-        sheet_text
-    ]
-    
-    return "\n".join(context_parts)
-
-
-def _extract_context_metadata(sheet_text: str) -> dict:
-    """Extract metadata about the sheet content for better context"""
-    lines = sheet_text.split('\n')
-    
-    # Analyze content structure
-    total_lines = len(lines)
-    non_empty_lines = [line for line in lines if line.strip()]
-    
-    # Count different types of content
-    question_marks = sum(1 for line in lines if '?' in line)
-    colons = sum(1 for line in lines if ':' in line)
-    semicolons = sum(1 for line in lines if ';' in line)
-    
-    # Identify potential headers (short lines, often capitalized)
-    potential_headers = []
-    for i, line in enumerate(lines[:10]):  # Check first 10 lines
-        line = line.strip()
-        if 5 <= len(line) <= 50 and line.isupper():
-            potential_headers.append(f"Row {i+1}: {line}")
-    
-    # Identify RFP-specific terms
-    rfp_terms = ['vendor', 'contractor', 'bidder', 'proposal', 'response', 'submission', 'requirement', 'specification']
-    rfp_term_count = sum(1 for line in lines for term in rfp_terms if term in line.lower())
-    
-    # Identify question indicators
-    question_words = ['what', 'how', 'when', 'where', 'why', 'who', 'which', 'can', 'could', 'would', 'should']
-    question_word_count = sum(1 for line in lines for word in question_words if word in line.lower())
-    
-    return {
-        'total_lines': total_lines,
-        'non_empty_lines': len(non_empty_lines),
-        'question_marks': question_marks,
-        'colons': colons,
-        'semicolons': semicolons,
-        'potential_headers': potential_headers,
-        'rfp_term_count': rfp_term_count,
-        'question_word_count': question_word_count,
-        'content_density': len(non_empty_lines) / max(total_lines, 1)
-    }
-
-
-def _enhance_questions_with_context(questions: list, context_info: dict) -> list:
-    """Enhance questions with contextual information"""
-    enhanced = []
-    
-    for q in questions:
-        enhanced_q = q.copy()
-        
-        # Add confidence score based on context
-        confidence = 0.8  # Base confidence
-        
-        # Boost confidence if question has question mark
-        if '?' in q.get('question', ''):
-            confidence += 0.1
-        
-        # Boost confidence if RFP terms are present
-        if context_info['rfp_term_count'] > 0:
-            confidence += 0.05
-        
-        # Boost confidence if question words are present
-        if context_info['question_word_count'] > 0:
-            confidence += 0.05
-        
-        enhanced_q['confidence'] = min(confidence, 1.0)
-        enhanced.append(enhanced_q)
-    
-    return enhanced
-
-
-def _extract_questions_semantic_similarity(sheet_text: str, context_info: dict) -> list:
-    """Extract questions using semantic similarity as last resort"""
-    lines = sheet_text.split('\n')
-    questions = []
-    
-    # Define semantic templates for different question types
-    semantic_templates = [
-        ("What is", 0.9),
-        ("How does", 0.9),
-        ("When will", 0.85),
-        ("Where is", 0.8),
-        ("Why does", 0.85),
-        ("Who is", 0.8),
-        ("Which", 0.8),
-        ("Please provide", 0.9),
-        ("Describe", 0.85),
-        ("Explain", 0.85),
-        ("List", 0.8),
-        ("Detail", 0.8),
-        ("Specify", 0.8),
-        ("Vendor must", 0.9),
-        ("Contractor should", 0.9),
-    ]
-    
-    # Calculate semantic similarity using simple word overlap
-    def calculate_similarity(text: str, template: str) -> float:
-        text_words = set(text.lower().split())
-        template_words = set(template.lower().split())
-        
-        if not template_words:
-            return 0
-        
-        overlap = len(text_words.intersection(template_words))
-        return overlap / len(template_words)
-    
-    # Find lines with high semantic similarity to question templates
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if len(line) < 15:  # Skip short lines
-            continue
-        
-        best_similarity = 0
-        best_template = None
-        
-        for template, weight in semantic_templates:
-            similarity = calculate_similarity(line, template)
-            weighted_similarity = similarity * weight
-            
-            if weighted_similarity > best_similarity:
-                best_similarity = weighted_similarity
-                best_template = template
-        
-        # Threshold for semantic similarity
-        if best_similarity >= 0.3:  # Lower threshold for semantic matching
-            questions.append({
-                "question": line,
-                "row": i + 1,
-                "category": "Other",
-                "similarity": best_similarity,
-                "template": best_template
-            })
-    
-    # Sort by similarity and return top candidates
-    questions.sort(key=lambda x: x['similarity'], reverse=True)
-    
-    # Return top 20 most similar questions
-    return questions[:20]
+    # Optional: basic deduplication if needed, but for now we trust Gemini's output
+    # For now, we return directly as per simplified logic
+    return gemini_questions
 
 
 def clean_markdown(text: str) -> str:
@@ -682,15 +328,14 @@ def get_embedding(text: str) -> list:
         print("DEBUG: Empty text provided to get_embedding")
         return []
     try:
-        print(f"DEBUG: Generating embedding for text: {text[:50]}...")
         res = genai.embed_content(model="models/embedding-001",
                                   content=text,
                                   task_type="retrieval_query")
         embedding = res["embedding"]
-        print(f"DEBUG: Generated embedding with {len(embedding)} dimensions")
         return embedding
     except Exception as e:
         print(f"Embedding error: {e} for text: {text[:100]}...")
+        traceback.print_exc()
         return []
 
 
@@ -700,10 +345,11 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
         return []
     try:
         print(f"DEBUG: Searching Supabase with client_id={client_id}, rfp_id={rfp_id}")
+        # Note: Using 'client_match_questions' as this is the RPC in your current setup
         res = supabase.rpc(
             "client_match_questions", {
                 "query_embedding": question_embedding,
-                "match_threshold": 0.0,
+                "match_threshold": 0.5, # Keep 0.0 here for broader search, filter later
                 "match_count": 5,
                 "p_client_id": client_id,
                 "p_rfp_id": rfp_id
@@ -712,6 +358,7 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
         return res.data if res.data else []
     except Exception as e:
         print(f"Supabase search error: {e}")
+        traceback.print_exc()
         return []
 
 
@@ -738,10 +385,6 @@ If unclear, combine and adapt from references.
 Return only the answer text, without any additional conversational filler or markdown formatting.
 """
     try:
-        # Windows-compatible timeout handling using threading
-        import threading
-        import time
-        
         result = [None]
         error = [None]
         
@@ -750,22 +393,20 @@ Return only the answer text, without any additional conversational filler or mar
                 resp = gemini.generate_content(
                     prompt,
                     safety_settings={
-                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARMS_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
                     },
                 )
                 result[0] = resp
             except Exception as e:
                 error[0] = e
         
-        # Start API call in thread
         thread = threading.Thread(target=api_call)
         thread.daemon = True
         thread.start()
         
-        # Wait for completion with timeout
         thread.join(timeout=45)
         
         if thread.is_alive():
@@ -783,89 +424,104 @@ Return only the answer text, without any additional conversational filler or mar
             
     except Exception as e:
         print(f"Gemini tailored answer error: {e} for question: {question[:100]}...")
+        traceback.print_exc()
         return "AI could not generate tailored answer."
 
 
-
-
 def _row_text(ws, r: int) -> str:
+    """Extracts concatenated text from a given row, ignoring empty cells."""
     return " ".join(
-        str(ws.cell(row=r, column=c).value or "").lower()
+        str(ws.cell(row=r, column=c).value or "").strip().lower()
         for c in range(1, ws.max_column + 1)
+        if ws.cell(row=r, column=c).value is not None and str(ws.cell(row=r, column=c).value).strip() != ''
     )
-
-
-def find_question_in_sheet(worksheet, question_text: str) -> int | None:
-    """Search for question text in all cells of the worksheet and return the row number where found"""
-    if not question_text or not question_text.strip():
-        return None
-    
-    qnorm = question_text.strip().lower()
-    max_row = worksheet.max_row
-    max_col = worksheet.max_column
-    
-    # Search through all cells in the worksheet
-    for row in range(1, max_row + 1):
-        for col in range(1, max_col + 1):
-            cell = worksheet.cell(row=row, column=col)
-            if cell.value is None:
-                continue
-            
-            cell_text = str(cell.value).strip().lower()
-            if not cell_text:
-                continue
-            
-            # Check for exact match or high similarity
-            if qnorm == cell_text:
-                return row
-            
-            # Check for partial match (question text contained in cell or vice versa)
-            if qnorm in cell_text or cell_text in qnorm:
-                return row
-            
-            # Use difflib for fuzzy matching
-            similarity = difflib.SequenceMatcher(None, qnorm, cell_text).ratio()
-            if similarity >= 0.8:  # 80% similarity threshold
-                return row
-    
-    return None
-
 
 def resolve_row(worksheet, reported_row: int, question_text: str) -> int | None:
     max_row = worksheet.max_row
-    qnorm = (question_text or "").strip().lower()
+    min_data_row = 2  # Never write answers to headers, always start from row 2
+    qnorm = (question_text or '').strip().lower()
 
-    # Prefer a local window around the reported row if provided (±3 rows)
-    if reported_row and 2 <= reported_row <= max_row:
-        start_r = max(2, reported_row - 3)
-        end_r = min(max_row, reported_row + 3)
-        best_r, best_score = reported_row, -1.0
-        for r in range(start_r, end_r + 1):
-            row_text = _row_text(worksheet, r)
-            s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
-            if s > best_score:
-                best_score, best_r = s, r
-        return best_r
-
-    # Fallback to global search when no reported row
-    best_r, best_score = None, -1.0
-    for r in range(2, max_row + 1):  # skip header
+    # If reported row is valid for data, use it directly (v1-like behavior)
+    if reported_row and min_data_row <= reported_row <= max_row:
+        # Additional check: ensure the reported row actually contains some text
+        row_content_check = _row_text(worksheet, reported_row)
+        if row_content_check:
+            print(f"DEBUG: Resolved row for '{qnorm[:50]}...' using reported row {reported_row} (contains content).")
+            return reported_row
+        else:
+            print(f"DEBUG: Reported row {reported_row} for '{qnorm[:50]}...' is empty, falling back to fuzzy search.")
+    
+    # Fallback to global fuzzy search on data rows only, similar to v1 but ensuring min_data_row
+    best_r, best_score = None, 0.0
+    for r in range(min_data_row, max_row + 1):
         row_text = _row_text(worksheet, r)
+        if not row_text.strip() or len(row_text.strip()) < 10: # Skip very short/empty rows
+            continue
         s = difflib.SequenceMatcher(None, qnorm, row_text).ratio()
-        if s > best_score:
+        if s > best_score: # No explicit threshold, just pick the best
             best_score, best_r = s, r
-    return best_r
+            
+    if best_r and best_r >= min_data_row:
+        print(f"DEBUG: Resolved row for '{qnorm[:50]}...' using fuzzy search -> {best_r} (Score: {best_score:.2f})")
+        return best_r
+        
+    print(f"WARN: Could not resolve a suitable data row for question: '{qnorm[:100]}...'")
+    return None
 
 
-def find_first_empty_column(ws):
-    for col in range(1, ws.max_column + 2):
-        values = [ws.cell(row=r, column=col).value for r in range(1, ws.max_row + 1)]
-        if all(v is None for v in values):
-            return col
-    return ws.max_column + 1
+def find_first_empty_data_column(ws):
+    """
+    Finds the first entirely empty column after the rightmost column that contains
+    a header in the first row OR any data in any subsequent row.
+    Ensures it's not column A (index 1).
+    """
+    max_row = ws.max_row or 2
+    max_col = ws.max_column or 2 
+    
+    rightmost_filled_col = 2
+    # Check row 1 for headers
+    for col in range(1, max_col + 1):
+        header_cell_value = ws.cell(row=1, column=col).value
+        if header_cell_value is not None and str(header_cell_value).strip() != '':
+            rightmost_filled_col = max(rightmost_filled_col, col)
 
+    # Check data rows (from row 2 onwards) for content
+    for col in range(1, max_col + 1):
+        for row in range(2, max_row + 1): 
+            data_cell_value = ws.cell(row=row, column=col).value
+            if data_cell_value is not None and str(data_cell_value).strip() != '':
+                rightmost_filled_col = max(rightmost_filled_col, col)
+                break # Move to next column if data found in this one
 
+    # Start search for empty column from the column immediately after the rightmost filled column.
+    # Ensure it's at least column 2 (B) if rightmost_filled_col was 1.
+    candidate_start_col = rightmost_filled_col + 1
+    
+    # Explicitly ensure AI answers don't go into column A.
+    # If the sheet is empty, rightmost_filled_col might be 1, so candidate_start_col would be 2. This is correct.
+    # If rightmost_filled_col is, say, 5, candidate_start_col is 6. This is also correct.
 
+    current_candidate_col = candidate_start_col
+    
+    # Iterate to find the first entirely empty column
+    # Add a safety break to prevent infinite loops on malformed or extremely dense sheets
+    search_limit = max_col + 50 # Search up to 50 columns beyond current max_col
+    while current_candidate_col <= search_limit:
+        is_column_empty = True
+        for r in range(1, max_row + 1): # Check all rows in the candidate column
+            if ws.cell(row=r, column=current_candidate_col).value is not None and \
+               str(ws.cell(row=r, column=current_candidate_col).value).strip() != '':
+                is_column_empty = False
+                break
+        
+        if is_column_empty:
+            print(f"DEBUG: Identified column {get_column_letter(current_candidate_col)} as the first empty data column.")
+            return current_candidate_col
+        
+        current_candidate_col += 1
+        
+    print(f"WARN: Could not find an entirely empty column after checking {search_limit} columns. Returning {current_candidate_col-1} as fallback.")
+    return current_candidate_col -1 # Return the last checked column + 1 as a fallback, or if no empty found, the next
 
 # API ENDPOINT
 def get_client_id_from_key(client_key: str | None) -> str:
@@ -884,6 +540,7 @@ def get_client_id_from_key(client_key: str | None) -> str:
             raise
         except Exception as e:
             print(f"Client lookup error: {e}")
+            traceback.print_exc()
             # Recreate supabase client and retry on transient errors
             try:
                 if supabase is None:
@@ -892,6 +549,7 @@ def get_client_id_from_key(client_key: str | None) -> str:
                     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             except Exception as reinit_err:
                 print(f"Supabase re-init failed: {reinit_err}")
+                traceback.print_exc()
             if attempt < max_retries - 1:
                 try:
                     time.sleep(0.5)
@@ -905,13 +563,14 @@ def get_client_id_from_key(client_key: str | None) -> str:
 async def process_excel(file: UploadFile, x_client_key: str | None = Header(default=None, alias="X-Client-Key"), rfp_id: str | None = Header(default=None, alias="X-RFP-ID")):
     client_id = get_client_id_from_key(x_client_key)
     
-    # Read file content into BytesIO like the working script
     file_content = await file.read()
     file_obj = io.BytesIO(file_content)
     
-    processed_file = process_excel_file_obj(file_obj, file.filename, client_id, rfp_id)
+    # Capture the return values for sheets and questions processed
+    processed_file_io, processed_sheets_count, total_questions_processed = process_excel_file_obj(file_obj, file.filename, client_id, rfp_id)
+    
     return StreamingResponse(
-        processed_file,
+        processed_file_io,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
     )
@@ -925,9 +584,14 @@ def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
     print("RFPs endpoint called")
     client_id = get_client_id_from_key(x_client_key)
     print(f"Resolved client_id: {client_id}")
-    res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
-    print(f"Found {len(res.data or [])} RFPs")
-    return {"rfps": res.data or []}
+    try:
+        res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
+        print(f"Found {len(res.data or [])} RFPs")
+        return {"rfps": res.data or []}
+    except Exception as e:
+        print(f"Error listing RFPs: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to list RFPs")
 
 @app.post("/rfps")
 def create_rfp(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
@@ -939,8 +603,13 @@ def create_rfp(payload: dict = Body(...), x_client_key: str | None = Header(defa
     }
     if not rfp_data["name"]:
         raise HTTPException(status_code=400, detail="RFP name is required")
-    res = supabase.table("client_rfps").insert(rfp_data).execute()
-    return {"rfp": res.data[0] if res.data else None}
+    try:
+        res = supabase.table("client_rfps").insert(rfp_data).execute()
+        return {"rfp": res.data[0] if res.data else None}
+    except Exception as e:
+        print(f"Error creating RFP: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to create RFP")
 
 @app.put("/rfps/{rfp_id}")
 def update_rfp(rfp_id: str, payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
@@ -950,30 +619,50 @@ def update_rfp(rfp_id: str, payload: dict = Body(...), x_client_key: str | None 
         updates["name"] = updates["name"].strip()
     if "description" in updates:
         updates["description"] = updates["description"].strip()
-    res = supabase.table("client_rfps").update(updates).eq("id", rfp_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        res = supabase.table("client_rfps").update(updates).eq("id", rfp_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error updating RFP {rfp_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update RFP")
 
 @app.delete("/rfps/{rfp_id}")
 def delete_rfp(rfp_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
-    supabase.table("client_rfps").delete().eq("id", rfp_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        supabase.table("client_rfps").delete().eq("id", rfp_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error deleting RFP {rfp_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to delete RFP")
 
 # --- Organization-focused routes ---
 
 @app.get("/org")
 def get_org(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
-    res = supabase.table("clients").select("id, name, sector, contact_email").eq("id", client_id).single().execute()
-    return res.data
+    try:
+        res = supabase.table("clients").select("id, name, sector, contact_email").eq("id", client_id).single().execute()
+        return res.data
+    except Exception as e:
+        print(f"Error getting organization data: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to get organization data")
 
 
 @app.put("/org")
 def update_org(payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
     updates = {k: v for k, v in payload.items() if k in ("name", "sector", "contact_email")}
-    supabase.table("clients").update(updates).eq("id", client_id).execute()
-    return {"ok": True}
+    try:
+        supabase.table("clients").update(updates).eq("id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error updating organization data: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update organization data")
 
 
 @app.get("/org/qa")
@@ -1001,6 +690,7 @@ def list_org_qa(x_client_key: str | None = Header(default=None, alias="X-Client-
     except Exception as e:
         # Keep minimal context for ops without noisy logs
         print(f"list_org_qa error: {e}")
+        traceback.print_exc()
         return {"questions": [], "answers": [], "mappings": []}
 
 
@@ -1053,6 +743,7 @@ def ingest_org_qa(payload: dict = Body(...), x_client_key: str | None = Header(d
                 created += 1
         except Exception as e:
             print(f"ingest_org_qa error: {e}")
+            traceback.print_exc()
             continue
     return {"created": created}
 
@@ -1107,7 +798,8 @@ Sheet Data:
         return normalized
     except Exception as e:
         # Reduce noisy logs
-        print(f"extract_qa_pairs error")
+        print(f"extract_qa_pairs error: {e}")
+        traceback.print_exc()
         return []
 
 
@@ -1145,6 +837,7 @@ def _insert_qa_pair(client_id: str, question_text: str, answer_text: str, catego
             return True
     except Exception as e:
         print(f"_insert_qa_pair error: {e}")
+        traceback.print_exc()
     return False
 
 
@@ -1177,6 +870,7 @@ async def extract_qa_from_upload(file: UploadFile, x_client_key: str | None = He
                             created += 1
             except Exception as e:
                 print(f"extract_qa_from_upload excel error: {e}")
+                traceback.print_exc()
 
         if file.filename.lower().endswith(".zip"):
             try:
@@ -1190,6 +884,7 @@ async def extract_qa_from_upload(file: UploadFile, x_client_key: str | None = He
                             _process_excel(os.path.join(root, fn))
             except Exception as e:
                 print(f"extract_qa_from_upload zip error: {e}")
+                traceback.print_exc()
         elif file.filename.lower().endswith(".xlsx"):
             _process_excel(tmp_path)
         else:
@@ -1303,6 +998,7 @@ def analyze_qa_similarities(payload: dict = Body(default={}), x_client_key: str 
                         processed_questions.add(q2["id"])
                 except Exception as e:
                     print(f"Error calculating similarity: {e}")
+                    traceback.print_exc()
                     continue
             
             # Only keep groups with 2+ questions
@@ -1332,10 +1028,10 @@ Return ONLY a JSON object with this exact format:
                     response = gemini.generate_content(
                         summary_prompt,
                         safety_settings={
-                            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARMS_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARMS_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARMS_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                            HarmCategory.HARMS_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
                         },
                     )
                     
@@ -1359,6 +1055,7 @@ Return ONLY a JSON object with this exact format:
                         })
                 except Exception as e:
                     print(f"Error creating summary: {e}")
+                    traceback.print_exc()
                     continue
         
         return {
@@ -1370,6 +1067,7 @@ Return ONLY a JSON object with this exact format:
         
     except Exception as e:
         print(f"Error analyzing similarities: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
@@ -1445,10 +1143,10 @@ Q&A LIST:
             response = gemini.generate_content(
                 prompt,
                 safety_settings={
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARMS_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARMS_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARMS_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARMS_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
                 },
             )
             text = (response.text or "").strip()
@@ -1459,9 +1157,10 @@ Q&A LIST:
 
             # Normalize output
             raw_groups = data.get("groups") or []
+            valid_ids_local = {str(x["id"]) for x in questions} # Corrected to use x["id"]
             groups = []
             for g in raw_groups:
-                qids = [str(x) for x in (g.get("question_ids") or []) if str(x) in {str(q["id"]) for q in questions}]
+                qids = [str(x) for x in (g.get("question_ids") or []) if str(x) in valid_ids_local]
                 if not qids:
                     continue
                 groups.append({
@@ -1472,12 +1171,14 @@ Q&A LIST:
             return {"groups": groups}
         except Exception as e:
             print(f"ai_group_qa LLM error: {e}")
+            traceback.print_exc()
             return {"groups": [], "message": "AI grouping failed"}
 
     except HTTPException:
         raise
     except Exception as e:
         print(f"ai_group_qa error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to group Q&A")
 
 
@@ -1561,6 +1262,7 @@ def approve_qa_summary(payload: dict = Body(...), x_client_key: str | None = Hea
 
     except Exception as e:
         print(f"Error approving summary: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to approve summary: {str(e)}")
 
 
@@ -1577,6 +1279,7 @@ def score_org_answers(payload: dict = Body(default={}), x_client_key: str | None
         ).execute().data or []
     except Exception as e:
         print(f"score_org_answers fetch error: {e}")
+        traceback.print_exc()
         rows = []
 
     # filter to this org and optionally RFP
@@ -1605,6 +1308,7 @@ def score_org_answers(payload: dict = Body(default={}), x_client_key: str | None
             resp_text = resp.text or ""
         except Exception as e:
             print(f"score_org_answers LLM error: {e}")
+            traceback.print_exc()
             resp_text = ""
 
         score = _extract_score(resp_text)
@@ -1616,6 +1320,7 @@ def score_org_answers(payload: dict = Body(default={}), x_client_key: str | None
             updated += 1
         except Exception as e:
             print(f"score_org_answers update error: {e}")
+            traceback.print_exc()
 
     return {"updated": updated}
 
@@ -1628,14 +1333,24 @@ def update_question(question_id: str, payload: dict = Body(...), x_client_key: s
     updates = {k: v for k, v in payload.items() if k in ("original_text", "category")}
     if "original_text" in updates:
         updates["normalized_text"] = updates["original_text"].lower()
-    res = supabase.table("client_questions").update(updates).eq("id", question_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        res = supabase.table("client_questions").update(updates).eq("id", question_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error updating question {question_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update question")
 
 @app.delete("/questions/{question_id}")
 def delete_question(question_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
-    supabase.table("client_questions").delete().eq("id", question_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        supabase.table("client_questions").delete().eq("id", question_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error deleting question {question_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to delete question")
 
 @app.put("/answers/{answer_id}")
 def update_answer(answer_id: str, payload: dict = Body(...), x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
@@ -1643,8 +1358,13 @@ def update_answer(answer_id: str, payload: dict = Body(...), x_client_key: str |
     updates = {k: v for k, v in payload.items() if k in ("answer_text", "quality_score")}
     if "answer_text" in updates:
         updates["character_count"] = len(updates["answer_text"])
-    res = supabase.table("client_answers").update(updates).eq("id", answer_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        res = supabase.table("client_answers").update(updates).eq("id", answer_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error updating answer {answer_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to update answer")
 
 
 @app.get("/org/summaries")
@@ -1652,7 +1372,6 @@ def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-
     """List summaries and their mapped questions for an organization (optionally scoped to an RFP)"""
     client_id = get_client_id_from_key(x_client_key)
     try:
-        # Fetch summaries
         s_query = supabase.table("client_summaries").select("id, summary_text, summary_type, character_count, quality_score, created_at, rfp_id, client_id, approved").eq("client_id", client_id).eq("approved", True)
         if rfp_id:
             s_query = s_query.eq("rfp_id", rfp_id)
@@ -1661,11 +1380,9 @@ def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-
         if not summaries:
             return {"summaries": [], "mappings": [], "questions": []}
 
-        # Fetch mappings
         s_ids = [s["id"] for s in summaries]
         m_rows = supabase.table("client_question_summary_mappings").select("question_id, summary_id").in_("summary_id", s_ids).execute().data or []
 
-        # Fetch questions
         q_ids = list({m["question_id"] for m in m_rows})
         questions = []
         if q_ids:
@@ -1675,6 +1392,7 @@ def list_org_summaries(x_client_key: str | None = Header(default=None, alias="X-
         return {"summaries": summaries, "mappings": m_rows, "questions": questions}
     except Exception as e:
         print(f"list_org_summaries error: {e}")
+        traceback.print_exc()
         return {"summaries": [], "mappings": [], "questions": []}
 
 @app.get("/org/summaries/pending")
@@ -1702,6 +1420,7 @@ def list_pending_summaries(x_client_key: str | None = Header(default=None, alias
         return {"summaries": summaries, "mappings": m_rows, "questions": questions}
     except Exception as e:
         print(f"list_pending_summaries error: {e}")
+        traceback.print_exc()
         return {"summaries": [], "mappings": [], "questions": []}
 
 @app.post("/org/summaries/{summary_id}/set-approval")
@@ -1714,12 +1433,18 @@ def set_summary_approval(summary_id: str, payload: dict = Body(...), x_client_ke
         return {"ok": True, "approved": approved}
     except Exception as e:
         print(f"set_summary_approval error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to update summary approval")
 @app.delete("/answers/{answer_id}")
 def delete_answer(answer_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
-    supabase.table("client_answers").delete().eq("id", answer_id).eq("client_id", client_id).execute()
-    return {"ok": True}
+    try:
+        supabase.table("client_answers").delete().eq("id", answer_id).eq("client_id", client_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"delete_answer error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to delete answer")
 
 
 # --- Job Management System ---
@@ -1758,7 +1483,9 @@ def _estimate_minutes_from_chars(file_bytes: bytes, job_type: str) -> int:
                 texts = df.astype(str).apply(lambda row: "\t".join(row.values), axis=1)
                 sheet_chars = sum(len(s) for s in texts)
                 total_chars += sheet_chars
-            except Exception:
+            except Exception as e:
+                print(f"Error in _estimate_minutes_from_chars for sheet {sheet}: {e}")
+                traceback.print_exc()
                 continue
 
         # Base rates per job type (characters per minute)
@@ -1772,42 +1499,37 @@ def _estimate_minutes_from_chars(file_bytes: bytes, job_type: str) -> int:
         estimated = int(max(min_minutes, min(max_minutes, (total_chars // max(1, chars_per_min)) + 1)))
         # Ensure at least 1 minute if tiny
         return max(1, estimated)
-    except Exception:
+    except Exception as e:
+        print(f"Error in _estimate_minutes_from_chars: {e}")
+        traceback.print_exc()
         # Fallback: use previous file-size based estimator
         return estimate_processing_time(len(file_bytes), job_type)
 
-def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None, job_id: str = None) -> io.BytesIO:
-    """Process Excel file using the working code"""
+def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, rfp_id: str = None, job_id: str = None) -> tuple[io.BytesIO, int, int]:
+    """
+    Process Excel file, add AI answers, and return the processed file as BytesIO,
+    along with counts of processed sheets and questions.
+    """
     print(f"DEBUG: process_excel_file_obj started for {filename} (Job ID: {job_id})")
     start_time = time.time()
     max_processing_time = 1800  # 30 minutes max processing time
     
+    _processed_sheets_count = 0
+    _total_questions_processed = 0
+
     try:
-        # Keep original bytes for robust pandas-based reads per sheet
-        try:
-            original_bytes = file_obj.getvalue()
-        except Exception:
-            file_obj.seek(0)
-            original_bytes = file_obj.read()
+        original_bytes = file_obj.getvalue()
 
         wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
-        # Use pandas for more reliable sheet parsing (handles types, merged/blank cells better)
-        try:
-            xls = pd.ExcelFile(io.BytesIO(original_bytes))
-        except Exception:
-            xls = None
+        xls = pd.ExcelFile(io.BytesIO(original_bytes))
 
         total_sheets = len(wb.sheetnames)
-        processed_sheets_count = 0
-        total_questions_processed = 0
-
-        # Initialize ai_col and review_col to None for error handling
+        
         ai_col = None
         review_col = None
         
         for sheet_idx, sheet_name in enumerate(wb.sheetnames):
             try:
-                # Check if processing time exceeded
                 if time.time() - start_time > max_processing_time:
                     raise Exception(f"Processing timeout: exceeded {max_processing_time/60:.1f} minutes")
                 
@@ -1816,72 +1538,49 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 print(f"DEBUG: Processing sheet {sheet_idx + 1}/{total_sheets}: {sheet_name}")
                 ws = wb[sheet_name]
 
-                # Prefer pandas to read the sheet reliably; fallback to openpyxl values
-                df = None
-                try:
-                    if xls is not None:
-                        df = pd.read_excel(xls, sheet_name=sheet_name, header=None, engine="openpyxl")
-                except Exception as e:
-                    print(f"DEBUG: Pandas read failed for sheet {sheet_name}: {e}; falling back to openpyxl values.")
-                if df is None:
-                    df = pd.DataFrame(ws.values)
-
-                # Drop fully empty rows/columns before emptiness check
+                df = pd.read_excel(xls, sheet_name=sheet_name, header=None, engine="openpyxl")
+                
                 if df is not None:
                     try:
                         df = df.dropna(how='all')
                         df = df.dropna(axis=1, how='all')
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"WARN: Error dropping empty rows/cols in sheet {sheet_name}: {e}")
+                        traceback.print_exc()
 
                 if df is None or df.empty:
                     print(f"DEBUG: Sheet {sheet_name} is empty after cleanup, skipping.")
-                    processed_sheets_count += 1
+                    _processed_sheets_count += 1
                     continue
                     
-                # Convert DataFrame to a string representation for Gemini to analyze
-                # Include structural context about the sheet
                 sheet_text = _prepare_sheet_context(df, sheet_name, ws)
-                if len(sheet_text) > 50000:  # Limit to 50KB of text
-                    sheet_text = sheet_text[:50000] + "\n... [truncated for memory optimization]"
-                
+                if len(sheet_text) > 50000:
+                    sheet_text = sheet_text[:50000] + "\n... [truncated for token limits]"
                 
                 extracted = extract_questions_combined(sheet_text)
-                # Retry up to 2 additional times if no questions returned
-                retry_attempt = 0
-                while (not extracted or len(extracted) == 0) and retry_attempt < 2:
-                    retry_attempt += 1
-                    
-                    try:
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                    extracted = extract_questions_combined(sheet_text)
                 
-                if not extracted or len(extracted) == 0:
-                    
-                    processed_sheets_count += 1
+                # No confidence filtering, directly use extracted questions
+                if not extracted:
+                    print(f"DEBUG: No questions found in sheet {sheet_name}.")
+                    _processed_sheets_count += 1
                     continue
                 
                 print(f"DEBUG: Found {len(extracted)} questions in sheet {sheet_name}.")
-                total_questions_processed += len(extracted)
+                _total_questions_processed += len(extracted)
 
-                ai_col = find_first_empty_column(ws)
-                ws.cell(row=1, column=ai_col, value="AI Answers")
+                ai_col = find_first_empty_data_column(ws)
+                ws.cell(row=1, column=ai_col, value="AI Answers").alignment = Alignment(wrap_text=True)
                 review_col = ai_col + 1
-                ws.cell(row=1, column=review_col, value="Review Status")
+                ws.cell(row=1, column=review_col, value="Review Status").alignment = Alignment(wrap_text=True)
+
+                # Set default column widths for new columns
+                ws.column_dimensions[get_column_letter(ai_col)].width = 20
+                ws.column_dimensions[get_column_letter(review_col)].width = 15
 
                 for q_idx, item in enumerate(extracted):
-                    qtext = item.get("question", "")
+                    qtext = item.get("question", "").strip()
                     reported_row = item.get("row", 0)
-                    confidence = item.get("confidence", 0.8)
-                    question_type = item.get("type", "Other")
                     
-                    # Skip low confidence questions (optional filtering)
-                    if confidence < 0.3:
-                        continue
-                    
-                    # Drop null/empty/whitespace-only questions
                     if not qtext:
                         continue
                         
@@ -1889,84 +1588,76 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                                         15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / len(extracted) / 2 / total_sheets),
                                         f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
                     
-                    # Search for the question text in all cells of the sheet
-                    write_row = find_question_in_sheet(ws, qtext)
-                    # If no match found in any cell, skip this question
-                    if write_row is None:
+                    write_row = resolve_row(ws, reported_row, qtext)
+                    
+                    min_data_row = 2
+                    if not write_row or write_row < min_data_row:
+                        print(f"WARN: Skipping answer for question '{qtext[:50]}...' because no valid data row (>= {min_data_row}) could be resolved.")
                         continue
                     
-                    # Get answer for the detected question
                     emb = get_embedding(qtext)
-                    
-                    # Search without RFP ID filter to get all matches for the client
                     matches = search_supabase(emb, client_id, None)
                         
-                    final_answer = "Not found any relevant question, needs review."
-                    review_status = ""
+                    final_answer = "Not found, needs review."
+                    review_status = "" # Empty for no specific review status by default
 
                     if matches:
-                        best = pick_best_match(matches)
-                        print(f"DEBUG: Best match similarity: {best.get('similarity', 0) if best else 0}")
-                        if best and best.get("similarity", 0) >= 0.95:
-                            final_answer = best["answer"]
-                            review_status = ""
+                        best_match = pick_best_match(matches)
+                        print(f"DEBUG: Best match similarity for '{qtext[:50]}...': {best_match.get('similarity', 0) if best_match else 0:.2f}")
+                        
+                        if best_match and best_match.get("similarity", 0) >= 0.9: # Similarity threshold from v1
+                            final_answer = best_match["answer"]
+                            review_status = "Approved" # If high similarity, mark as approved
                         else:
-                            # Filter matches with similarity >= 0.65 for AI generation
-                            filtered_matches = [m for m in matches if m.get("similarity", 0) >= 0.65]
-                            if filtered_matches:
-                                final_answer = generate_tailored_answer(qtext, filtered_matches)
-                                review_status = "Need Review"
-                            else:
-                                final_answer = "Not found, needs review."
-                                review_status = ""
+                            # If matches exist but are below 0.9, use tailored answer and mark for review
+                            final_answer = generate_tailored_answer(qtext, matches) # Pass all matches for context
+                            review_status = "Need review"
                     else:
-                        final_answer = "Not found, needs review."
-                        review_status = ""
+                        review_status = "Need review" # If no matches, needs review
                     
-                    # Apply cleaning to the final answer before writing to the sheet
                     final_answer = clean_markdown(final_answer)
 
                     ws.cell(row=write_row, column=ai_col, value=final_answer)
-                    ws.cell(row=write_row, column=review_col, value=review_status)
+                    if review_status: # Only write review status if it's not empty
+                        ws.cell(row=write_row, column=review_col, value=review_status)
                 
-                # Free up memory after processing each sheet
                 del df, sheet_text, extracted
                 gc.collect()
-                processed_sheets_count += 1
+                _processed_sheets_count += 1
                 
             except Exception as sheet_error:
                 print(f"ERROR: Failed to process sheet {sheet_name}: {sheet_error}")
-                # Continue to next sheet rather than failing entire workbook
+                traceback.print_exc()
                 continue
 
         update_job_progress(job_id, 90, "Saving processed Excel file...")
         
-        
-        # Adjust column widths for better text display - only AI Answer and Review Status columns
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            # Set column widths only for AI answer and review status columns
+            # Adjust column widths for new AI Answer and Review Status columns
             if ai_col and ai_col <= ws.max_column:
-                ws.column_dimensions[get_column_letter(ai_col)].width = 40
+                ws.column_dimensions[get_column_letter(ai_col)].width = 60
             if review_col and review_col <= ws.max_column:
                 ws.column_dimensions[get_column_letter(review_col)].width = 25
             
             # Enable text wrapping for the AI answer column
-            if ai_col and ai_col <= ws.max_column:
-                for row in range(1, ws.max_row + 1):
-                    cell = ws.cell(row=row, column=ai_col)
-                    cell.alignment = Alignment(wrap_text=True, vertical='top')
+            for col_to_wrap in [ai_col, review_col]:
+                if col_to_wrap and col_to_wrap <= ws.max_column:
+                    for row in range(2, ws.max_row + 1): # Start from row 2 for data cells
+                        cell = ws.cell(row=row, column=col_to_wrap)
+                        cell.alignment = Alignment(wrap_text=True, vertical='top')
         
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
         print(f"DEBUG: process_excel_file_obj completed for {filename} in {time.time() - start_time:.1f}s.")
-        return output
+        return output, _processed_sheets_count, _total_questions_processed
         
     except Exception as e:
         processing_time = time.time() - start_time
         error_msg = f"Excel processing failed after {processing_time:.1f}s: {str(e)}"
         print(f"ERROR: process_excel_file_obj error for {filename}: {error_msg}")
+        traceback.print_exc()
         raise Exception(error_msg)
 
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
@@ -1998,6 +1689,7 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
             return  # Success, exit retry loop
         except Exception as e:
             print(f"ERROR: Error updating job progress {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -2020,7 +1712,7 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
         
         file_obj = io.BytesIO(file_content)
         # Pass job_id to process_excel_file_obj for internal progress updates
-        processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
+        processed_output, processed_sheets_count, total_questions_processed = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
         
         processed_content = processed_output.getvalue()
         
@@ -2039,7 +1731,7 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
             "processed_file": processed_file_b64,  # Store as base64
             "original_file": original_file_b64,    # Store original for comparison
             "sheets_processed": processed_sheets_count,
-            "total_questions": total_questions_processed
+            "total_questions_processed": total_questions_processed
         }
         
         update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
@@ -2048,7 +1740,8 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
     except Exception as e:
         processing_time = time.time() - start_time
         error_msg = f"Processing failed after {processing_time:.1f}s: {str(e)}"
-        print(f"ERROR: RFP processing background error for job {job_id}: {error_msg}", exc_info=True)
+        print(f"ERROR: RFP processing background error for job {job_id}: {error_msg}")
+        traceback.print_exc()
         update_job_progress(job_id, -1, error_msg)
 
 def extract_qa_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
@@ -2180,10 +1873,10 @@ Q&A LIST:
                         response_local = gemini.generate_content(
                             prompt_local,
                             safety_settings={
-                                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-                                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARMS_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARMS_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARMS_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                                HarmCategory.HARMS_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
                             },
                         )
                         text_local = (response_local.text or "").strip()
@@ -2194,7 +1887,7 @@ Q&A LIST:
 
                         # Normalize output
                         raw_groups_local = data_local.get("groups") or []
-                        valid_ids_local = {str(q["id"]) for q in questions_local}
+                        valid_ids_local = {str(x["id"]) for x in questions_local}
                         groups_local = []
                         for g in raw_groups_local:
                             qids_local = [str(x) for x in (g.get("question_ids") or []) if str(x) in valid_ids_local]
@@ -2208,9 +1901,11 @@ Q&A LIST:
                         return {"groups": groups_local}
                     except Exception as e:
                         print(f"_build_ai_groups_for_job LLM error: {e}")
+                        traceback.print_exc()
                         return {"groups": [], "message": "AI grouping failed"}
                 except Exception as e:
                     print(f"_build_ai_groups_for_job error: {e}")
+                    traceback.print_exc()
                     return {"groups": [], "message": "AI grouping error"}
 
             ai_groups_result = _build_ai_groups_for_job(client_id, rfp_id)
@@ -2240,10 +1935,11 @@ Q&A LIST:
                         supabase.table("client_question_summary_mappings").insert(mappings).execute()
             except Exception as e:
                 print(f"WARN: Failed to persist pending summaries: {e}")
+                traceback.print_exc()
 
             result_data = {
-                "extracted_pairs_count": len(extracted_pairs), # Renamed for clarity
-                "created_pairs_count": created_count,          # Renamed for clarity
+                "extracted_pairs_count": len(extracted_pairs), 
+                "created_pairs_count": created_count,          
                 "total_sheets_processed": processed_sheets,
                 "ai_groups": ai_groups_result.get("groups", []),
                 "ai_groups_count": len(ai_groups_result.get("groups", [])),
@@ -2261,6 +1957,7 @@ Q&A LIST:
                     print(f"DEBUG: Could not delete temp file {tmp_path} - file may be in use")
                 except Exception as e:
                     print(f"DEBUG: Error cleaning up temp file: {e}")
+                    traceback.print_exc()
                 
     except Exception as e:
         import traceback
@@ -2303,6 +2000,7 @@ def find_or_create_folder(service, folder_name: str, parent_folder_id: str = Non
         
     except Exception as e:
         print(f"Error finding/creating folder: {e}")
+        traceback.print_exc()
         return None
 
 def upload_file_to_drive(service, file_content: bytes, filename: str, folder_id: str, mime_type: str = 'application/octet-stream') -> str:
@@ -2319,6 +2017,7 @@ def upload_file_to_drive(service, file_content: bytes, filename: str, folder_id:
         
     except Exception as e:
         print(f"Error uploading file to Drive: {e}")
+        traceback.print_exc()
         return None
 
 def setup_drive_folders(access_token: str, client_name: str) -> dict:
@@ -2343,6 +2042,7 @@ def setup_drive_folders(access_token: str, client_name: str) -> dict:
         
     except Exception as e:
         print(f"Error setting up Drive folders: {e}")
+        traceback.print_exc()
         return None
 
 def create_rfp_from_filename(client_id: str, filename: str) -> str:
@@ -2353,8 +2053,13 @@ def create_rfp_from_filename(client_id: str, filename: str) -> str:
     rfp_name = ' '.join(word.capitalize() for word in rfp_name.split())  # Title case
     
     # Check if RFP with similar name already exists
-    existing_rfps_res = supabase.table("client_rfps").select("id, name").eq("client_id", client_id).execute()
-    existing_rfps = existing_rfps_res.data or []
+    try:
+        existing_rfps_res = supabase.table("client_rfps").select("id, name").eq("client_id", client_id).execute()
+        existing_rfps = existing_rfps.data or []
+    except Exception as e:
+        print(f"Error checking for existing RFPs: {e}")
+        traceback.print_exc()
+        existing_rfps = [] # Continue without existing RFPs if DB call fails
     
     # Find exact match or similar name
     rfp_id = None
@@ -2372,9 +2077,14 @@ def create_rfp_from_filename(client_id: str, filename: str) -> str:
             "description": f"Auto-created from uploaded file: {filename}",
             "created_at": datetime.now().isoformat()
         }
-        rfp_result = supabase.table("client_rfps").insert(rfp_data).execute()
-        rfp_id = rfp_result.data[0]["id"]
-        print(f"DEBUG: Created new RFP '{rfp_name}' with ID: {rfp_id}")
+        try:
+            rfp_result = supabase.table("client_rfps").insert(rfp_data).execute()
+            rfp_id = rfp_result.data[0]["id"]
+            print(f"DEBUG: Created new RFP '{rfp_name}' with ID: {rfp_id}")
+        except Exception as e:
+            print(f"Error creating new RFP: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to auto-create RFP from filename: {str(e)}")
     
     return rfp_id
 
@@ -2407,9 +2117,11 @@ async def submit_job(
         print("Validation passed, proceeding with job creation...")
     except HTTPException as he:
         print(f"HTTPException in submit_job: {he.detail}")
+        traceback.print_exc()
         raise
     except Exception as e:
-        print(f"ERROR: Error in submit_job before background task: {e}", exc_info=True)
+        print(f"ERROR: Error in submit_job before background task: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
     # Auto-create RFP from filename
@@ -2458,9 +2170,14 @@ async def submit_job(
     }
     print(f"Job data created, file content encoded")
     
-    job_result = supabase.table("client_jobs").insert(job_data).execute()
-    job_id = job_result.data[0]["id"]
-    print(f"Created job with ID: {job_id}")
+    try:
+        job_result = supabase.table("client_jobs").insert(job_data).execute()
+        job_id = job_result.data[0]["id"]
+        print(f"Created job with ID: {job_id}")
+    except Exception as e:
+        print(f"Error inserting job data: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to create job record: {str(e)}")
     
     result = {
         "job_id": job_id, 
@@ -2490,11 +2207,13 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
             return {"jobs": jobs}
         except Exception as e:
             print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
             # Recreate supabase client on error
             try:
                 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             except Exception as reinit_err:
                 print(f"Supabase re-init failed in /jobs: {reinit_err}")
+                traceback.print_exc()
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -2523,6 +2242,7 @@ def setup_drive_folders_endpoint(
             raise HTTPException(status_code=500, detail="Failed to setup Drive folders")
     except Exception as e:
         print(f"Drive setup error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Drive setup failed: {str(e)}")
 
 @app.post("/drive/upload")
@@ -2573,6 +2293,7 @@ def upload_to_drive_endpoint(
             
     except Exception as e:
         print(f"Drive upload error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/jobs/{job_id}")
@@ -2610,10 +2331,12 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
             return job_data
         except Exception as e:
             print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
             try:
                 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             except Exception as reinit_err:
                 print(f"Supabase re-init failed in /jobs/{job_id}: {reinit_err}")
+                traceback.print_exc()
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -2645,6 +2368,7 @@ def get_job_status(job_id: str, x_client_key: str | None = Header(default=None, 
             raise HTTPException(status_code=404, detail="Job not found")
     except Exception as e:
         print(f"ERROR: Error fetching job status {job_id}: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 @app.delete("/jobs/{job_id}")
@@ -2652,13 +2376,23 @@ def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alia
     """Cancel a pending job"""
     client_id = get_client_id_from_key(x_client_key)
     # Check if job is pending or processing before cancelling
-    res = supabase.table("client_jobs").select("status").eq("id", job_id).eq("client_id", client_id).single().execute()
-    job_status = res.data.get("status") if res.data else None
+    try:
+        res = supabase.table("client_jobs").select("status").eq("id", job_id).eq("client_id", client_id).single().execute()
+        job_status = res.data.get("status") if res.data else None
+    except Exception as e:
+        print(f"Error fetching job status for cancellation {job_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch job status for cancellation")
 
     if job_status in ["pending", "processing"]:
-        supabase.table("client_jobs").update({"status": "cancelled", "current_step": "Job cancelled by user", "completed_at": datetime.now().isoformat()}).eq("id", job_id).eq("client_id", client_id).execute()
-        print(f"DEBUG: Job {job_id} cancelled by user.")
-        return {"ok": True, "message": f"Job {job_id} cancelled successfully."}
+        try:
+            supabase.table("client_jobs").update({"status": "cancelled", "current_step": "Job cancelled by user", "completed_at": datetime.now().isoformat()}).eq("id", job_id).eq("client_id", client_id).execute()
+            print(f"DEBUG: Job {job_id} cancelled by user.")
+            return {"ok": True, "message": f"Job {job_id} cancelled successfully."}
+        except Exception as e:
+            print(f"Error cancelling job {job_id}: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to cancel job {job_id}")
     else:
         print(f"WARN: Attempted to cancel job {job_id} which is in status: {job_status}. Only pending/processing jobs can be cancelled.")
         raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'. Only pending or processing jobs can be cancelled.")
@@ -2680,6 +2414,7 @@ def cleanup_old_jobs(x_client_key: str | None = Header(default=None, alias="X-Cl
         return {"ok": True, "deleted_count": deleted_count, "message": f"Cleaned up {deleted_count} old jobs"}
     except Exception as e:
         print(f"ERROR: Error cleaning up jobs for client {client_id}: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to cleanup jobs")
 
 @app.get("/jobs/stats")
@@ -2704,6 +2439,7 @@ def get_job_stats(x_client_key: str | None = Header(default=None, alias="X-Clien
         return stats
     except Exception as e:
         print(f"ERROR: Error getting job stats for client {client_id}: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to get job statistics")
 
 # Main entry point for Render deployment

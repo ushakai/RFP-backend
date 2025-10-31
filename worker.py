@@ -14,6 +14,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import traceback # Import traceback module
 
 # Add the parent directory to the path so we can import from app.py
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +54,7 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
             return  # Success, exit retry loop
         except Exception as e:
             print(f"ERROR: Error updating job progress {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
             if attempt < max_retries - 1:
                 time.sleep(1)  # Wait 1 second before retry
             else:
@@ -77,9 +79,9 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
         print(f"DEBUG: Processing file {file_name} ({file_size_mb:.1f}MB)")
         
         file_obj = io.BytesIO(file_content)
-        processed_output = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
+        processed_output_io, processed_sheets_count, total_questions_processed = process_excel_file_obj(file_obj, file_name, client_id, rfp_id, job_id=job_id)
         
-        processed_content = processed_output.getvalue()
+        processed_content = processed_output_io.getvalue()
         
         update_job_progress(job_id, 95, "Finalizing processed file...")
         
@@ -94,7 +96,9 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
             "processing_completed": True,
             "processing_time_seconds": int(time.time() - start_time),
             "processed_file": processed_file_b64,  # Store as base64
-            "original_file": original_file_b64     # Store original for comparison
+            "original_file": original_file_b64,    # Store original for comparison
+            "sheets_processed": processed_sheets_count,
+            "total_questions_processed": total_questions_processed
         }
         
         update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
@@ -104,6 +108,7 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
         processing_time = time.time() - start_time
         error_msg = f"Processing failed after {processing_time:.1f}s: {str(e)}"
         print(f"ERROR: RFP processing error for job {job_id}: {error_msg}")
+        traceback.print_exc()
         update_job_progress(job_id, -1, error_msg)
 
 def extract_qa_job(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
@@ -118,6 +123,7 @@ def extract_qa_job(job_id: str, file_content: bytes, file_name: str, client_id: 
     except Exception as e:
         error_msg = f"QA extraction failed: {str(e)}"
         print(f"ERROR: QA extraction error for job {job_id}: {error_msg}")
+        traceback.print_exc()
         update_job_progress(job_id, -1, error_msg)
 
 def get_pending_jobs():
@@ -127,6 +133,7 @@ def get_pending_jobs():
         return res.data or []
     except Exception as e:
         print(f"ERROR: Failed to get pending jobs: {e}")
+        traceback.print_exc()
         return []
 
 def reset_stuck_jobs():
@@ -152,6 +159,7 @@ def reset_stuck_jobs():
         return len(stuck_jobs)
     except Exception as e:
         print(f"ERROR: Failed to reset stuck jobs: {e}")
+        traceback.print_exc()
         return 0
 
 def main():
@@ -201,6 +209,7 @@ def main():
                     break
                 except Exception as e:
                     print(f"ERROR: Failed to update job status (attempt {attempt + 1}/{max_retries}): {e}")
+                    traceback.print_exc()
                     if attempt < max_retries - 1:
                         time.sleep(2)
                     else:
@@ -232,6 +241,7 @@ def main():
             break
         except Exception as e:
             print(f"ERROR: Worker error: {e}")
+            traceback.print_exc()
             time.sleep(5)  # Wait before retrying
 
 if __name__ == "__main__":
