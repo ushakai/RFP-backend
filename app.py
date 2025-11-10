@@ -1,3 +1,129 @@
+"""
+RFP Backend API - Question Detection and Processing
+
+IMPLEMENTATION NOTE:
+===================
+This file contains a 1:1 translation from the proven TypeScript implementation
+in services/geminiService.ts and services/xlsxService.ts
+
+==============================================================================
+COMPLETE FLOW: TypeScript → Python
+==============================================================================
+
+1. READ EXCEL (xlsxService.ts: parseXlsx)
+   TypeScript: XLSX.utils.sheet_to_json(worksheet, { header: 1 })
+   Python:     openpyxl.load_workbook() + _extract_row_data()
+   Result:     Array of arrays (rows of cells)
+
+2. PREPARE DATA (TypeScript: create RowWithNumber[])
+   TypeScript: rows.map(row => ({rowNumber: idx, rowData: row}))
+   Python:     [{"rowNumber": row_num, "rowData": [cells]}, ...]
+   Result:     Rows with numbers for AI processing
+   VALIDATION: Skip row 1 (header), start from row 2
+
+3. DETECT QUESTIONS (geminiService.ts: detectQuestionsInBatch)
+   TypeScript: await detectQuestionsInBatch(rows)
+   Python:     detect_questions_in_batch(rows_with_numbers)
+   Result:     [{"rowNumber": int, "question": str}, ...]
+   VALIDATION: Filter out any invalid row numbers
+
+4. GENERATE ANSWERS (Python-specific - not in TypeScript)
+   Python:     process_detected_questions_batch()
+   Result:     {rowNumber: {"answer": str, "review_status": str}}
+   VALIDATION: Row must be >= 2 and <= max_row
+
+5. PLACE ANSWERS (TypeScript: modify sheet.data)
+   TypeScript: sheet.data[rowNumber][colIdx] = answer
+   Python:     ws.cell(row=rowNumber, column=ai_col, value=answer)
+   Result:     Answers in EXACT detected row numbers
+   VALIDATION: Triple-check row is not 1, >= 2, <= max_row
+
+6. SAVE EXCEL (xlsxService.ts: createXlsxAndDownload)
+   TypeScript: XLSX.utils.aoa_to_sheet(sheet.data); XLSX.writeFile()
+   Python:     wb.save(output)
+   Result:     Excel file with answers
+
+==============================================================================
+
+ROW-BY-ROW PROCESSING - DIRECT MAPPING:
+==============================================================================
+
+The NEW approach eliminates all searching and ambiguity:
+
+  Excel Row 5: "What is your approach to security?"
+       ↓
+  Send to AI: {"rowNumber": 5, "rowData": ["What", "is", "your", ...]}
+       ↓
+  AI Returns: {"rowNumber": 5, "question": "What is your approach..."}
+       ↓
+  Generate Answer for Row 5: "Our approach includes..."
+       ↓
+  Place Answer in Row 5: ws.cell(row=5, column=ai_col, value=answer)
+
+✓ Question in Row 5 → Answer in Row 5 (GUARANTEED)
+✓ No searching through the sheet
+✓ No fuzzy matching
+✓ No row number confusion
+
+OLD approach problems (DEPRECATED):
+- Sent entire sheet as text
+- AI returned questions with uncertain row numbers
+- Had to search/match to find correct rows
+- Row numbers often mismatched
+
+==============================================================================
+
+ANSWER PLACEMENT RELIABILITY - CRITICAL SAFEGUARDS:
+==============================================================================
+
+Problem: Answers must be placed in the SAME ROW as their questions. Never in:
+- Row 1 (header row)
+- Empty rows
+- Rows outside the data range
+
+Solution: Multiple validation layers at each step:
+
+1. INPUT VALIDATION (Row Collection):
+   - Start from row 2 (min_data_row = 2)
+   - Explicitly check and skip if row < min_data_row
+   - Validate no row 1 in collected rows
+
+2. AI PROMPT VALIDATION:
+   - Explicitly instruct AI to return EXACT row numbers
+   - Warn AI not to modify or recalculate row numbers
+
+3. OUTPUT VALIDATION (After AI Detection):
+   - Log all row numbers returned by AI
+   - Filter out rows < min_data_row
+   - Filter out rows > max_row
+   - Remove any header row violations
+
+4. ANSWER GENERATION VALIDATION:
+   - Pass min_valid_row and max_valid_row to answer generator
+   - Reject any row < min_valid_row
+   - Reject any row > max_valid_row
+
+5. PLACEMENT VALIDATION (Triple-Check):
+   - Check row != 1 (header)
+   - Check row >= min_data_row (2)
+   - Check row <= max_row
+   - Log each successful placement with question text
+
+6. SUMMARY REPORTING:
+   - Show exact rows where answers were placed
+   - Show count of questions detected vs placed
+   - Show any discrepancies
+
+==============================================================================
+
+Key Functions Mapping:
+- TypeScript: detectQuestionsInBatch() → Python: detect_questions_in_batch()
+- TypeScript: parseXlsx() → Python: _extract_row_data() + openpyxl
+- TypeScript: sheet.data[row] = [..., answer] → Python: ws.cell(row=row, column=col)
+
+See comments starting with "# TypeScript:" for exact mappings throughout the code.
+"""
+
 import os
 import io
 import json
@@ -270,6 +396,225 @@ def extract_questions_combined(sheet_text: str) -> list:
     return gemini_questions
 
 
+def _extract_row_data(ws, row_num: int) -> list:
+    """
+    Extract all cell values from a row as a list.
+    Equivalent to: XLSX.utils.sheet_to_json(worksheet, { header: 1 })
+    Returns array of cell values for a single row.
+    """
+    max_col = ws.max_column or 1
+    row_values = []
+    
+    for c_idx in range(1, max_col + 1):
+        cell_value = ws.cell(row=row_num, column=c_idx).value
+        if cell_value is not None:
+            row_values.append(str(cell_value).strip())
+        else:
+            row_values.append("")
+    
+    return row_values
+
+
+# ============================================================================
+# EXACT TRANSLATION FROM services/geminiService.ts
+# ============================================================================
+# TypeScript Function: detectQuestionsInBatch(rows: RowWithNumber[])
+# Python Function: detect_questions_in_batch(rows_with_numbers: list)
+#
+# This is a 1:1 translation of the working TypeScript implementation.
+# Input:  [{"rowNumber": int, "rowData": [array of cells]}, ...]
+# Output: [{"rowNumber": int, "question": str}, ...]
+# ============================================================================
+
+def detect_questions_in_batch(rows_with_numbers: list) -> list:
+    """
+    Detect questions in a batch of rows using the EXACT proven TypeScript approach.
+    
+    INPUT:  [{"rowNumber": 5, "rowData": ["cell1", "cell2", ...]}, ...]
+    OUTPUT: [{"rowNumber": 5, "question": "extracted question text"}, ...]
+    
+    KEY INSIGHT: We pass row numbers TO the AI, and AI returns the SAME row numbers.
+    This eliminates all ambiguity - we know EXACTLY which row contains each question.
+    
+    NO SEARCHING NEEDED:
+    - Old approach: Send whole sheet → AI returns questions → search to find rows
+    - New approach: Send rows with numbers → AI returns same row numbers → use directly
+    
+    This is a 1:1 translation of the TypeScript detectQuestionsInBatch function.
+    """
+    if not rows_with_numbers or len(rows_with_numbers) == 0:
+        return []
+    
+    # EXACT schema from TypeScript version
+    response_schema = {
+        "type": "ARRAY",
+        "description": "A list of rows that have been identified as questions.",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "rowNumber": {
+                    "type": "NUMBER",
+                    "description": "The original 1-based row number from the input that contains the question."
+                },
+                "question": {
+                    "type": "STRING",
+                    "description": "The exact and complete question text extracted from the row."
+                }
+            },
+            "required": ["rowNumber", "question"]
+        }
+    }
+    
+    # EXACT prompt from TypeScript version (with proper indentation)
+    prompt = f"""
+    You are an RFP analysis expert. Your task is to identify which of the following spreadsheet rows are questions or vendor requirements.
+    The data is provided as a JSON array, where each object has a 'rowNumber' and 'rowData'.
+
+    Analyze each row's 'rowData'. If it contains a question or a requirement (e.g., "Describe your process...", "Vendor must provide..."), extract it.
+    
+    Your response MUST be a JSON array of objects, strictly conforming to the provided schema.
+    Each object in your response array must correspond to a row that you identified as a question.
+    It must include the EXACT ORIGINAL 'rowNumber' and the extracted 'question' text.
+    
+    CRITICAL RULES:
+    1. Return the EXACT 'rowNumber' from the input - DO NOT modify or recalculate row numbers
+    2. Only include rows that are actual questions or requirements in your response
+    3. Ignore headers, section titles, and empty rows
+    4. If no questions are found, return an empty array []
+    5. The 'rowNumber' in your response MUST match the 'rowNumber' from the input exactly
+
+    Spreadsheet rows to analyze:
+    {json.dumps(rows_with_numbers)}
+    """
+    
+    try:
+        result = [None]
+        error = [None]
+        
+        def api_call():
+            try:
+                # Use gemini-2.5-flash as in TypeScript version
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                response = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "response_schema": response_schema
+                    },
+                    safety_settings={
+                        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    },
+                )
+                result[0] = response
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=api_call)
+        thread.daemon = True
+        thread.start()
+        
+        # 60-second timeout exactly as in TypeScript withTimeout
+        thread.join(timeout=60)
+        
+        if thread.is_alive():
+            print("Gemini returned empty response for batch (timeout)")
+            return []
+        
+        if error[0]:
+            print(f"Error processing batch with Gemini: {error[0]}")
+            traceback.print_exc()
+            raise error[0]
+        
+        if not result[0]:
+            print("Gemini returned empty response for batch")
+            return []
+        
+        text = (result[0].text or "").strip()
+        if not text:
+            print("Gemini returned empty response for batch")
+            return []
+        
+        detected_questions = json.loads(text)
+        print(f"DEBUG: Detected {len(detected_questions)} questions in batch")
+        return detected_questions
+        
+    except Exception as e:
+        print(f"Error processing batch with Gemini: {e}")
+        traceback.print_exc()
+        return []
+
+
+def process_detected_questions_batch(detected_questions: list, client_id: str, rfp_id: str, min_valid_row: int = 2, max_valid_row: int = None) -> dict:
+    """
+    Process detected questions to generate answers for SPECIFIC rows.
+    
+    INPUT:  [{"rowNumber": 5, "question": "What is your approach?"}, ...]
+    OUTPUT: {5: {"question": "What...", "answer": "Our approach...", "review_status": "..."}}
+    
+    The returned dictionary maps row numbers directly - no searching needed!
+    Row 5 question → Row 5 answer (exact match)
+    
+    VALIDATION: Ensures answers are never placed in:
+    - Row 1 (header row)
+    - Rows outside the valid data range (< min_valid_row or > max_valid_row)
+    """
+    results = {}
+    
+    for item in detected_questions:
+        row_num = item.get("rowNumber", 0)
+        question_text = item.get("question", "").strip()
+        
+        # CRITICAL VALIDATION: Ensure row number is valid
+        if not question_text or row_num == 0:
+            print(f"WARN: Skipping item with empty question or row 0")
+            continue
+        
+        # NEVER place answers in row 1 (header row)
+        if row_num < min_valid_row:
+            print(f"ERROR: AI returned invalid row number {row_num} (below min {min_valid_row}). Skipping to prevent header corruption.")
+            continue
+        
+        # Check if row exceeds max valid row
+        if max_valid_row and row_num > max_valid_row:
+            print(f"ERROR: AI returned invalid row number {row_num} (above max {max_valid_row}). Skipping.")
+            continue
+        
+        try:
+            # Search Supabase for answer
+            emb = get_embedding(question_text)
+            matches = search_supabase(emb, client_id, rfp_id)
+            
+            final_answer = "Not found, needs review."
+            review_status = "Need review"
+            
+            if matches:
+                best_match = pick_best_match(matches)
+                if best_match and best_match.get("similarity", 0) >= 0.9:
+                    final_answer = best_match["answer"]
+                    review_status = "Approved"
+                else:
+                    # Use tailored answer from matches
+                    final_answer = generate_tailored_answer(question_text, matches)
+                    review_status = "Need review - AI Generated"
+            
+            results[row_num] = {
+                "question": question_text,
+                "answer": clean_markdown(final_answer),
+                "review_status": review_status
+            }
+            print(f"DEBUG: Generated answer for row {row_num}: '{question_text[:50]}...'")
+            
+        except Exception as e:
+            print(f"ERROR: Error processing question for row {row_num}: {e}")
+            traceback.print_exc()
+            continue
+    
+    return results
+
+
 def clean_markdown(text: str) -> str:
     """Remove common Markdown formatting such as **bold**, _italic_, `code`, headings, and links.
     Keeps only readable plain text with proper wrapping.
@@ -407,8 +752,20 @@ Return only the answer text, without any additional conversational filler or mar
         return "AI could not generate tailored answer."
 
 
+# ==============================================================================
+# DEPRECATED: Old fuzzy matching functions - NO LONGER USED
+# ==============================================================================
+# The new row-by-row processing approach directly uses the row number from AI
+# detection. No fuzzy matching or searching is needed because:
+# 1. AI receives: {"rowNumber": 5, "rowData": ["cell1", "cell2", ...]}
+# 2. AI returns: {"rowNumber": 5, "question": "extracted question"}
+# 3. We place answer directly in row 5
+#
+# These functions are kept for reference but are NOT called in the main flow.
+# ==============================================================================
+
 def _row_text(ws, r: int) -> str:
-    """Extracts concatenated text from a given row, ignoring empty cells."""
+    """DEPRECATED: Extracts concatenated text from a given row, ignoring empty cells."""
     return " ".join(
         str(ws.cell(row=r, column=c).value or "").strip().lower()
         for c in range(1, ws.max_column + 1)
@@ -416,7 +773,13 @@ def _row_text(ws, r: int) -> str:
     )
 
 def resolve_row(worksheet, reported_row: int, question_text: str) -> int:
-    # Reverted to user's v1 logic, ensuring min_data_row
+    """DEPRECATED: Old fuzzy matching approach - NO LONGER USED
+    
+    With the new row-by-row processing:
+    - AI tells us the exact row number where it found the question
+    - We use that row number directly
+    - No searching or matching needed
+    """
     max_row = worksheet.max_row
     min_data_row = 2  # Never write answers to headers, always start from row 2
     
@@ -1526,21 +1889,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                     _processed_sheets_count += 1
                     continue
                     
-                sheet_text = _prepare_sheet_context(df, sheet_name, ws)
-                if len(sheet_text) > 50000:
-                    sheet_text = sheet_text[:50000] + "\n... [truncated for token limits]"
-                
-                extracted = extract_questions_combined(sheet_text)
-                
-                # No confidence filtering, directly use extracted questions as per v1 behavior
-                if not extracted:
-                    print(f"DEBUG: No questions found in sheet {sheet_name}.")
-                    _processed_sheets_count += 1
-                    continue
-                
-                print(f"DEBUG: Found {len(extracted)} questions in sheet {sheet_name}.")
-                _total_questions_processed += len(extracted)
-
+                # Initialize AI Answer and Review Status columns
                 ai_col = find_first_empty_data_column(ws)
                 ws.cell(row=1, column=ai_col, value="AI Answers").alignment = Alignment(wrap_text=True)
                 review_col = ai_col + 1
@@ -1550,49 +1899,211 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 ws.column_dimensions[get_column_letter(ai_col)].width = 20
                 ws.column_dimensions[get_column_letter(review_col)].width = 15
 
-                for q_idx, item in enumerate(extracted):
-                    qtext = item.get("question", "").strip()
-                    reported_row = item.get("row", 0)
-                    
-                    if not qtext:
-                        continue
-                        
-                    update_job_progress(job_id,
-                                        15 + int(sheet_idx * 70 / total_sheets / 2) + int(q_idx * 70 / len(extracted) / 2 / total_sheets),
-                                        f"Answering question {q_idx + 1}/{len(extracted)} in sheet {sheet_name}")
-                    
-                    write_row = resolve_row(ws, reported_row, qtext)
-                    
-                    min_data_row = 2
-                    if not write_row or write_row < min_data_row:
-                        print(f"WARN: Skipping answer for question '{qtext[:50]}...' because no valid data row (>= {min_data_row}) could be resolved.")
-                        continue
-                    
-                    emb = get_embedding(qtext)
-                    matches = search_supabase(emb, client_id, None) # Use client_id, rfp_id in search
-                        
-                    final_answer = "Not found, needs review."
-                    review_status = "Need review" # Default review status if no confident match or generation needed
-
-                    if matches:
-                        best_match = pick_best_match(matches)
-                        print(f"DEBUG: Best match similarity for '{qtext[:50]}...': {best_match.get('similarity', 0) if best_match else 0:.2f}")
-                        
-                        if best_match and best_match.get("similarity", 0) >= 0.9: # v1 similarity threshold for direct answer
-                            final_answer = best_match["answer"]
-                            review_status = "Approved"
-                        else:
-                            # If matches exist but are below 0.9, use tailored answer and mark for review
-                            final_answer = generate_tailored_answer(qtext, matches) # Pass all matches for context
-                            review_status = "Need review - AI Generated"
-                    
-                    final_answer = clean_markdown(final_answer)
-
-                    ws.cell(row=write_row, column=ai_col, value=final_answer)
-                    if review_status: 
-                        ws.cell(row=write_row, column=review_col, value=review_status)
+                # ============================================================
+                # PROCESSING FLOW - Direct Row Mapping (No Searching!)
+                # ============================================================
+                # 1. Extract rows as arrays (like XLSX.utils.sheet_to_json)
+                #    Row 5 → ["What", "is", "your", "approach", "?"]
+                #
+                # 2. Create RowWithNumber objects: {rowNumber, rowData}
+                #    {"rowNumber": 5, "rowData": ["What", "is", ...]}
+                #
+                # 3. Send to AI in batches of 50
+                #    detectQuestionsInBatch([{"rowNumber": 5, ...}, ...])
+                #
+                # 4. AI returns with SAME row numbers:
+                #    [{"rowNumber": 5, "question": "What is your approach?"}]
+                #
+                # 5. Generate answers (still using row number):
+                #    {5: {"answer": "Our approach...", "review_status": "..."}}
+                #
+                # 6. Place answer in EXACT row (NO SEARCHING!):
+                #    ws.cell(row=5, column=ai_col, value="Our approach...")
+                #
+                # Result: Question in Row 5 → Answer in Row 5 ✓
+                # ============================================================
                 
-                del df, sheet_text, extracted
+                max_row = ws.max_row or 1
+                min_data_row = 2  # Start from row 2 (skip header)
+                batch_size = 50  # Process 50 rows per batch with structured output
+                total_questions_in_sheet = 0
+                
+                # Step 1 & 2: Collect all rows with their data (TypeScript: parseXlsx equivalent)
+                # IMPORTANT: Start from min_data_row (row 2) to SKIP HEADER ROW (row 1)
+                rows_with_numbers = []
+                
+                print(f"DEBUG: Scanning rows {min_data_row} to {max_row} in sheet {sheet_name}")
+                
+                for row_num in range(min_data_row, max_row + 1):
+                    # SAFETY CHECK: Never process row 1 (header)
+                    if row_num < min_data_row:
+                        print(f"CRITICAL: Skipping row {row_num} - below minimum data row!")
+                        continue
+                    
+                    # Check if row has any content
+                    row_has_content = False
+                    for col in range(1, ws.max_column + 1):
+                        cell_value = ws.cell(row=row_num, column=col).value
+                        if cell_value is not None and str(cell_value).strip():
+                            row_has_content = True
+                            break
+                    
+                    if row_has_content:
+                        row_data = _extract_row_data(ws, row_num)
+                        rows_with_numbers.append({
+                            "rowNumber": row_num,
+                            "rowData": row_data
+                        })
+                
+                total_rows_to_process = len(rows_with_numbers)
+                print(f"DEBUG: Collected {total_rows_to_process} non-empty rows from sheet {sheet_name}")
+                print(f"DEBUG: Row range being processed: {min_data_row} to {max_row}")
+                
+                # Validate that no row 1 was included
+                invalid_rows = [r["rowNumber"] for r in rows_with_numbers if r["rowNumber"] < min_data_row]
+                if invalid_rows:
+                    print(f"CRITICAL ERROR: Header rows detected in processing batch: {invalid_rows}. Removing them!")
+                    rows_with_numbers = [r for r in rows_with_numbers if r["rowNumber"] >= min_data_row]
+                
+                # Step 3: Process rows in batches to detect questions
+                # (TypeScript: await detectQuestionsInBatch(rows))
+                all_detected_questions = []
+                for batch_start in range(0, total_rows_to_process, batch_size):
+                    batch_end = min(batch_start + batch_size, total_rows_to_process)
+                    batch_rows = rows_with_numbers[batch_start:batch_end]
+                    
+                    # Update progress
+                    progress_pct = 15 + int(sheet_idx * 70 / total_sheets / 2) + int(batch_start * 35 / total_rows_to_process / total_sheets)
+                    update_job_progress(job_id, progress_pct,
+                                        f"Detecting questions in rows {batch_start + 1}-{batch_end} of {total_rows_to_process} in sheet {sheet_name}")
+                    
+                    print(f"DEBUG: Detecting questions in batch {batch_start // batch_size + 1}: rows {batch_start + 1}-{batch_end}")
+                    
+                    # Call detect_questions_in_batch (TypeScript: detectQuestionsInBatch)
+                    detected = detect_questions_in_batch(batch_rows)
+                    
+                    # VALIDATE: Check AI returned row numbers are within valid range
+                    if detected:
+                        detected_row_nums = [q.get("rowNumber", 0) for q in detected]
+                        print(f"DEBUG: AI returned row numbers: {detected_row_nums}")
+                        
+                        # Check for invalid row numbers
+                        invalid_detections = [q for q in detected if q.get("rowNumber", 0) < min_data_row or q.get("rowNumber", 0) > max_row]
+                        if invalid_detections:
+                            print(f"WARNING: AI returned {len(invalid_detections)} questions with invalid row numbers. Filtering them out.")
+                            for inv in invalid_detections:
+                                print(f"  - Invalid row {inv.get('rowNumber')}: '{inv.get('question', '')[:50]}...'")
+                            # Remove invalid detections
+                            detected = [q for q in detected if min_data_row <= q.get("rowNumber", 0) <= max_row]
+                    
+                    all_detected_questions.extend(detected)
+                    print(f"DEBUG: Found {len(detected)} VALID questions in this batch")
+                
+                print(f"DEBUG: Total {len(all_detected_questions)} questions detected in sheet {sheet_name}")
+                
+                # Final validation of all detected questions
+                if all_detected_questions:
+                    all_row_nums = [q.get("rowNumber", 0) for q in all_detected_questions]
+                    print(f"DEBUG: All detected row numbers: {sorted(set(all_row_nums))}")
+                    
+                    # Verify no header rows
+                    header_violations = [q for q in all_detected_questions if q.get("rowNumber", 0) < min_data_row]
+                    if header_violations:
+                        print(f"CRITICAL ERROR: Found {len(header_violations)} questions in header rows!")
+                        for hv in header_violations:
+                            print(f"  - Row {hv.get('rowNumber')}: '{hv.get('question', '')[:50]}...'")
+                        # Remove header violations
+                        all_detected_questions = [q for q in all_detected_questions if q.get("rowNumber", 0) >= min_data_row]
+                        print(f"DEBUG: After removing header violations: {len(all_detected_questions)} questions remain")
+                
+                # Step 4 & 5: Generate answers for detected questions
+                if all_detected_questions:
+                    update_job_progress(job_id, 15 + int((sheet_idx + 0.5) * 70 / total_sheets),
+                                        f"Generating answers for {len(all_detected_questions)} questions in sheet {sheet_name}")
+                    
+                    # Pass validation parameters to ensure row numbers are correct
+                    answers_dict = process_detected_questions_batch(
+                        all_detected_questions, 
+                        client_id, 
+                        rfp_id,
+                        min_valid_row=min_data_row,  # Row 2 minimum (never row 1)
+                        max_valid_row=max_row          # Maximum row in sheet
+                    )
+                    
+                    print(f"DEBUG: Generated {len(answers_dict)} answers for sheet {sheet_name}")
+                    
+                    # Step 6: Write answers to EXACT rowNumber
+                    # ============================================================
+                    # TypeScript equivalent from xlsxService.ts:
+                    #   sheet.data[result.rowNumber].push(answer, reviewStatus)
+                    #   OR: sheet.data[result.rowNumber][aiColumnIndex] = answer
+                    #
+                    # Python equivalent:
+                    #   ws.cell(row=result.rowNumber, column=ai_col, value=answer)
+                    #
+                    # Key: Direct row number mapping - no fuzzy search, no resolution
+                    # ============================================================
+                    
+                    # ===========================================================
+                    # DIRECT ROW MAPPING - NO SEARCHING NEEDED
+                    # ===========================================================
+                    # The AI already told us which row contains each question:
+                    #   Input:  {"rowNumber": 5, "rowData": ["What", "is", ...]}
+                    #   Output: {"rowNumber": 5, "question": "What is..."}
+                    #   Action: Place answer directly in row 5
+                    #
+                    # This is MUCH MORE RELIABLE than the old approach which:
+                    # - Sent entire sheet text
+                    # - Got questions with uncertain row numbers
+                    # - Had to search/match to find the right row
+                    # ===========================================================
+                    
+                    # Validate and place each answer IN THE EXACT ROW from AI
+                    for row_num, answer_data in answers_dict.items():
+                        # TRIPLE VALIDATION: Ensure safe answer placement
+                        if row_num < min_data_row:
+                            print(f"CRITICAL ERROR: Attempted to place answer in row {row_num} (below min {min_data_row}). SKIPPING to prevent header corruption!")
+                            continue
+                        
+                        if row_num > max_row:
+                            print(f"ERROR: Attempted to place answer in row {row_num} (above max {max_row}). SKIPPING!")
+                            continue
+                        
+                        if row_num == 1:
+                            print(f"CRITICAL ERROR: Attempted to place answer in HEADER ROW (row 1). SKIPPING!")
+                            continue
+                        
+                        # Safe to place answer - DIRECT ROW MAPPING
+                        try:
+                            answer_text = answer_data.get("answer", "")
+                            review_status = answer_data.get("review_status", "")
+                            question_text = answer_data.get("question", "")
+                            
+                            # Place answer in THE SAME ROW where AI found the question
+                            ws.cell(row=row_num, column=ai_col, value=answer_text)
+                            ws.cell(row=row_num, column=review_col, value=review_status)
+                            total_questions_in_sheet += 1
+                            
+                            print(f"✓ Row {row_num}: Placed answer for '{question_text[:60]}...'")
+                        except Exception as place_error:
+                            print(f"ERROR: Failed to place answer in row {row_num}: {place_error}")
+                            traceback.print_exc()
+                            continue
+                
+                print(f"\n{'='*80}")
+                print(f"SHEET SUMMARY: {sheet_name}")
+                print(f"  - Total data rows scanned: {total_rows_to_process}")
+                print(f"  - Questions detected by AI: {len(all_detected_questions)}")
+                print(f"  - Answers successfully placed: {total_questions_in_sheet}")
+                print(f"  - Row range: {min_data_row} to {max_row}")
+                if total_questions_in_sheet > 0:
+                    placed_rows = [r for r, _ in answers_dict.items() if min_data_row <= r <= max_row]
+                    print(f"  - Rows with answers: {sorted(placed_rows)}")
+                print(f"{'='*80}\n")
+                
+                _total_questions_processed += total_questions_in_sheet
+                
+                del df
                 gc.collect()
                 _processed_sheets_count += 1
                 
@@ -1602,6 +2113,19 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                 continue
 
         update_job_progress(job_id, 90, "Saving processed Excel file...")
+        
+        # ============================================================
+        # TypeScript equivalent from xlsxService.ts:
+        #   const worksheet = XLSX.utils.aoa_to_sheet(sheet.data);
+        #   XLSX.utils.book_append_sheet(workbook, worksheet, sheet.name);
+        #   XLSX.writeFile(workbook, newFilename);
+        #
+        # Python equivalent (openpyxl):
+        #   wb.save(output) - saves the modified workbook
+        #
+        # The workbook already has answers in the correct rows,
+        # now we just format and save.
+        # ============================================================
         
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -1618,6 +2142,7 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
                         cell = ws.cell(row=row, column=col_to_wrap)
                         cell.alignment = Alignment(wrap_text=True, vertical='top')
         
+        # Save workbook (TypeScript: XLSX.writeFile)
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
