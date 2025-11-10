@@ -63,7 +63,6 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
 def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Process RFP job - this will be imported from app.py"""
     try:
-        # Import the processing function from app.py
         from app import process_excel_file_obj
         
         print(f"DEBUG: Starting RFP processing for job {job_id}")
@@ -71,9 +70,8 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
         
         update_job_progress(job_id, 10, "Starting RFP processing: Loading file...")
         
-        # Check file size to prevent memory issues
         file_size_mb = len(file_content) / (1024 * 1024)
-        if file_size_mb > 50:  # 50MB limit
+        if file_size_mb > 50:
             raise Exception(f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
         
         print(f"DEBUG: Processing file {file_name} ({file_size_mb:.1f}MB)")
@@ -85,7 +83,6 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
         
         update_job_progress(job_id, 95, "Finalizing processed file...")
         
-        # Store both original and processed files for comparison
         import base64
         processed_file_b64 = base64.b64encode(processed_content).decode('utf-8')
         original_file_b64 = base64.b64encode(file_content).decode('utf-8')
@@ -95,8 +92,8 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
             "file_size": len(processed_content),
             "processing_completed": True,
             "processing_time_seconds": int(time.time() - start_time),
-            "processed_file": processed_file_b64,  # Store as base64
-            "original_file": original_file_b64,    # Store original for comparison
+            "processed_file": processed_file_b64,
+            "original_file": original_file_b64,
             "sheets_processed": processed_sheets_count,
             "total_questions_processed": total_questions_processed
         }
@@ -114,7 +111,6 @@ def process_rfp_job(job_id: str, file_content: bytes, file_name: str, client_id:
 def extract_qa_job(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
     """Extract QA job - this will be imported from app.py"""
     try:
-        # Import the processing function from app.py
         from app import extract_qa_background
         
         print(f"DEBUG: Starting QA extraction for job {job_id}")
@@ -141,7 +137,6 @@ def reset_stuck_jobs():
     try:
         cutoff_time = (datetime.now() - timedelta(minutes=30)).isoformat()
         
-        # Find jobs stuck in processing
         res = supabase.table("client_jobs").select("*").eq("status", "processing").lt("last_updated", cutoff_time).execute()
         stuck_jobs = res.data or []
         
@@ -167,19 +162,16 @@ def main():
     print("Starting RFP Background Worker...")
     print(f"Worker PID: {os.getpid()}")
     
-    # Counter to track when we should check for stuck jobs
     check_counter = 0
     
     while True:
         try:
-            # Every 6 iterations (60 seconds), check for and reset stuck jobs
             if check_counter % 6 == 0:
                 stuck_count = reset_stuck_jobs()
                 if stuck_count > 0:
                     print(f"Reset {stuck_count} stuck jobs")
             check_counter += 1
             
-            # Get pending jobs
             pending_jobs = get_pending_jobs()
             
             if not pending_jobs:
@@ -187,7 +179,6 @@ def main():
                 time.sleep(10)
                 continue
             
-            # Process the oldest pending job
             job = pending_jobs[0]
             job_id = job["id"]
             job_type = job["job_type"]
@@ -197,7 +188,6 @@ def main():
             
             print(f"Processing job {job_id} of type {job_type}")
             
-            # Update job status to processing with retry logic
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -216,7 +206,6 @@ def main():
                         print(f"CRITICAL: Could not update job {job_id} to processing, skipping...")
                         continue
             
-            # Get file content from job data
             job_data = job.get("job_data", {})
             file_content = job_data.get("file_content")
             
@@ -224,11 +213,9 @@ def main():
                 update_job_progress(job_id, -1, "No file content found in job data")
                 continue
             
-            # Decode base64 file content
             import base64
             file_bytes = base64.b64decode(file_content)
             
-            # Process based on job type
             if job_type == "process_rfp":
                 process_rfp_job(job_id, file_bytes, file_name, client_id, rfp_id)
             elif job_type == "extract_qa":
@@ -242,7 +229,7 @@ def main():
         except Exception as e:
             print(f"ERROR: Worker error: {e}")
             traceback.print_exc()
-            time.sleep(5)  # Wait before retrying
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
