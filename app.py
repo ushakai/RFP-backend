@@ -583,33 +583,62 @@ def process_detected_questions_batch(detected_questions: list, client_id: str, r
             continue
         
         try:
-            # Search Supabase for answer
+            print(f"\n--- Processing Row {row_num} ---")
+            print(f"Question: '{question_text[:80]}...'")
+            
+            # Generate embedding for the question
             emb = get_embedding(question_text)
+            if not emb:
+                print(f"ERROR: Failed to generate embedding for row {row_num}")
+                results[row_num] = {
+                    "question": question_text,
+                    "answer": "Error: Could not generate embedding",
+                    "review_status": "Need review"
+                }
+                continue
+            
+            # Search Supabase for matching answers
             matches = search_supabase(emb, client_id, rfp_id)
             
             final_answer = "Not found, needs review."
             review_status = "Need review"
             
-            if matches:
+            if matches and len(matches) > 0:
+                print(f"Found {len(matches)} matches in knowledge base")
                 best_match = pick_best_match(matches)
-                if best_match and best_match.get("similarity", 0) >= 0.9:
-                    final_answer = best_match["answer"]
-                    review_status = "Approved"
+                
+                if best_match:
+                    similarity = best_match.get("similarity", 0)
+                    print(f"Best match similarity: {similarity:.3f}")
+                    
+                    if similarity >= 0.9:
+                        print(f"HIGH CONFIDENCE: Using exact match (similarity >= 0.9)")
+                        final_answer = best_match["answer"]
+                        review_status = "Approved"
+                    else:
+                        print(f"LOW CONFIDENCE: Generating tailored answer from {len(matches)} matches")
+                        final_answer = generate_tailored_answer(question_text, matches)
+                        review_status = "Need review - AI Generated"
                 else:
-                    # Use tailored answer from matches
-                    final_answer = generate_tailored_answer(question_text, matches)
-                    review_status = "Need review - AI Generated"
+                    print(f"WARN: Matches found but pick_best_match returned None")
+            else:
+                print(f"No matches found in knowledge base for this question")
             
             results[row_num] = {
                 "question": question_text,
                 "answer": clean_markdown(final_answer),
                 "review_status": review_status
             }
-            print(f"DEBUG: Generated answer for row {row_num}: '{question_text[:50]}...'")
+            print(f"Result: {review_status}")
             
         except Exception as e:
-            print(f"ERROR: Error processing question for row {row_num}: {e}")
+            print(f"ERROR: Exception processing question for row {row_num}: {e}")
             traceback.print_exc()
+            results[row_num] = {
+                "question": question_text,
+                "answer": "Error processing question",
+                "review_status": "Need review"
+            }
             continue
     
     return results
@@ -648,40 +677,141 @@ def clean_markdown(text: str) -> str:
 
 
 def get_embedding(text: str) -> list:
+    """Generate embedding for text using Google's embedding-001 model"""
     if not text:
         print("DEBUG: Empty text provided to get_embedding")
         return []
+    
+    # Clean and prepare text
+    text = text.strip()
+    if len(text) < 3:
+        print(f"DEBUG: Text too short for embedding: '{text}'")
+        return []
+    
     try:
-        res = genai.embed_content(model="models/embedding-001",
-                                  content=text,
-                                  task_type="retrieval_query")
+        res = genai.embed_content(
+            model="models/embedding-001",
+            content=text,
+            task_type="retrieval_query"
+        )
         embedding = res["embedding"]
+        
+        # Validate embedding
+        if not embedding or not isinstance(embedding, list):
+            print(f"ERROR: Invalid embedding returned for text: {text[:100]}...")
+            return []
+        
+        if len(embedding) == 0:
+            print(f"ERROR: Empty embedding returned for text: {text[:100]}...")
+            return []
+        
+        print(f"DEBUG: Generated embedding (length {len(embedding)}) for: '{text[:60]}...'")
         return embedding
+        
     except Exception as e:
-        print(f"Embedding error: {e} for text: {text[:100]}...")
+        print(f"ERROR: Embedding generation failed: {e}")
+        print(f"       Text: {text[:100]}...")
         traceback.print_exc()
         return []
 
 
 def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None) -> list:
+    """Search for matching questions in Supabase using embeddings
+    
+    Strategy:
+    1. Try RFP-specific search first (if rfp_id provided)
+    2. Fallback to client-wide search if no results
+    3. Run diagnostics if still no results
+    """
     if not question_embedding:
-        print("DEBUG: No embedding provided to search_supabase")
+        print("ERROR: No embedding provided to search_supabase")
         return []
+    
+    if not isinstance(question_embedding, list) or len(question_embedding) == 0:
+        print(f"ERROR: Invalid embedding format: {type(question_embedding)}, length: {len(question_embedding) if isinstance(question_embedding, list) else 'N/A'}")
+        return []
+    
     try:
-        print(f"DEBUG: Searching Supabase with client_id={client_id}, rfp_id={rfp_id}")
-        # Using 'client_match_questions' RPC as it's designed for the current multi-client setup
+        print(f"DEBUG: Searching Supabase - client_id={client_id}, rfp_id={rfp_id}, embedding_length={len(question_embedding)}")
+        
+        # STRATEGY 1: Try RFP-specific search first (if rfp_id provided)
+        if rfp_id:
+            try:
+                print(f"DEBUG: Attempting RFP-specific search (rfp_id={rfp_id})...")
+                res = supabase.rpc(
+                    "client_match_questions", {
+                        "query_embedding": question_embedding,
+                        "match_threshold": 0.0,
+                        "match_count": 5,
+                        "p_client_id": client_id,
+                        "p_rfp_id": rfp_id
+                    }).execute()
+                
+                if res.data and len(res.data) > 0:
+                    print(f"SUCCESS: Found {len(res.data)} matches for RFP {rfp_id}")
+                    for match in res.data[:2]:
+                        print(f"  - Similarity: {match.get('similarity', 0):.3f} | Q: {match.get('question', '')[:50]}...")
+                    return res.data
+                else:
+                    print(f"DEBUG: No matches for RFP {rfp_id}, trying client-wide search...")
+            except Exception as rfp_error:
+                print(f"WARN: RFP-specific search failed: {rfp_error}")
+                traceback.print_exc()
+        
+        # STRATEGY 2: Fallback to client-wide search (no RFP restriction)
+        print(f"DEBUG: Attempting client-wide search (all questions for client)...")
         res = supabase.rpc(
             "client_match_questions", {
                 "query_embedding": question_embedding,
-                "match_threshold": 0.0, # Keep 0.0 here for broader search, filter later by 0.9 for best match
+                "match_threshold": 0.0,
                 "match_count": 5,
                 "p_client_id": client_id,
-                "p_rfp_id": rfp_id
+                "p_rfp_id": None  # Search across all RFPs for this client
             }).execute()
-        print(f"DEBUG: Supabase RPC response: {res.data if res.data else 'None'}")
-        return res.data if res.data else []
+        
+        if res.data and len(res.data) > 0:
+            print(f"SUCCESS: Found {len(res.data)} matches (client-wide search)")
+            for match in res.data[:2]:
+                print(f"  - Similarity: {match.get('similarity', 0):.3f} | Q: {match.get('question', '')[:50]}...")
+            return res.data
+        
+        # STRATEGY 3: No matches found - run diagnostics
+        print(f"WARN: No matches found. Running diagnostics...")
+        
+        # Check if questions exist for this client
+        try:
+            q_check = supabase.table("client_questions").select("id, original_text, embedding, rfp_id").eq("client_id", client_id).limit(10).execute()
+            if q_check.data:
+                print(f"DEBUG: Found {len(q_check.data)} total questions for client")
+                
+                # Check embeddings
+                with_emb = [q for q in q_check.data if q.get("embedding")]
+                print(f"DEBUG: {len(with_emb)}/{len(q_check.data)} questions have embeddings")
+                
+                # Check RFP association
+                if rfp_id:
+                    rfp_qs = [q for q in q_check.data if q.get("rfp_id") == rfp_id]
+                    print(f"DEBUG: {len(rfp_qs)} questions associated with RFP {rfp_id}")
+                
+                # Check answer mappings (RPC might require this)
+                q_ids = [q["id"] for q in q_check.data[:5]]
+                map_check = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute()
+                if map_check.data:
+                    print(f"DEBUG: {len(map_check.data)}/{len(q_ids)} sample questions have answer mappings")
+                else:
+                    print(f"ERROR: Questions have NO answer mappings! This may cause RPC to return nothing.")
+                    print(f"       Solution: Ensure questions in knowledge base have answers mapped to them.")
+            else:
+                print(f"ERROR: No questions found in database for client {client_id}")
+                print(f"       Solution: Add questions to knowledge base first via /org/qa or /org/qa/extract")
+        except Exception as diag_error:
+            print(f"ERROR: Diagnostic check failed: {diag_error}")
+            traceback.print_exc()
+        
+        return []
+        
     except Exception as e:
-        print(f"Supabase search error: {e}")
+        print(f"ERROR: Supabase search failed: {e}")
         traceback.print_exc()
         return []
 
