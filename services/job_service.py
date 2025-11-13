@@ -1,0 +1,322 @@
+"""
+Job Service - Background job processing
+"""
+import io
+import os
+import time
+import traceback
+import tempfile
+import pandas as pd
+from datetime import datetime
+from config.settings import get_supabase_client
+from services.excel_service import process_excel_file_obj, estimate_minutes_from_chars
+from services.gemini_service import extract_qa_pairs_from_sheet
+from services.supabase_service import insert_qa_pair
+
+
+def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
+    """Update job progress in database with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            updates = {
+                "progress_percent": progress,
+                "current_step": current_step,
+                "last_updated": datetime.now().isoformat()
+            }
+            if result_data:
+                updates["result_data"] = result_data
+            if progress == 100:
+                updates["status"] = "completed"
+                updates["completed_at"] = datetime.now().isoformat()
+            elif progress == -1: # Use -1 for explicit failure
+                updates["status"] = "failed"
+                updates["completed_at"] = datetime.now().isoformat()
+            
+            print(f"DEBUG: Updating job {job_id} - Progress: {progress}%, Step: {current_step}")
+            
+            supabase = get_supabase_client()
+            supabase.table("client_jobs").update(updates).eq("id", job_id).execute()
+            return  # Success, exit retry loop
+        except Exception as e:
+            print(f"ERROR: Error updating job progress {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            traceback.print_exc()
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait 1 second before retry
+            else:
+                print(f"CRITICAL ERROR: Failed to update job progress for {job_id} after {max_retries} attempts.")
+
+
+def process_rfp_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
+    """Background RFP processing function using the working code"""
+    print(f"DEBUG: Background RFP processing started for job {job_id}")
+    start_time = time.time()
+    
+    try:
+        update_job_progress(job_id, 10, "Starting RFP processing: Loading file...")
+        
+        # Check file size to prevent memory issues
+        file_size_mb = len(file_content) / (1024 * 1024)
+        if file_size_mb > 50:  # 50MB limit
+            raise Exception(f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
+        
+        print(f"DEBUG: Processing file {file_name} ({file_size_mb:.1f}MB)")
+        
+        file_obj = io.BytesIO(file_content)
+        processed_output, processed_sheets_count, total_questions_processed = process_excel_file_obj(
+            file_obj, file_name, client_id, rfp_id, job_id=job_id, 
+            update_progress_callback=update_job_progress
+        )
+        
+        processed_content = processed_output.getvalue()
+        
+        update_job_progress(job_id, 95, "Finalizing and storing processed file...")
+        
+        # Store both original and processed files for comparison
+        import base64
+        processed_file_b64 = base64.b64encode(processed_content).decode('utf-8')
+        original_file_b64 = base64.b64encode(file_content).decode('utf-8')
+        
+        result_data = {
+            "file_name": f"processed_{file_name}",
+            "file_size": len(processed_content),
+            "processing_completed": True,
+            "processing_time_seconds": int(time.time() - start_time),
+            "processed_file": processed_file_b64,  # Store as base64
+            "original_file": original_file_b64,    # Store original for comparison
+            "sheets_processed": processed_sheets_count,
+            "total_questions_processed": total_questions_processed
+        }
+        
+        update_job_progress(job_id, 100, "RFP processing completed successfully!", result_data)
+        print(f"DEBUG: Background RFP processing completed successfully for job {job_id} in {time.time() - start_time:.1f}s")
+                
+    except Exception as e:
+        processing_time = time.time() - start_time
+        error_msg = f"Processing failed after {processing_time:.1f}s: {str(e)}"
+        print(f"ERROR: RFP processing background error for job {job_id}: {error_msg}")
+        traceback.print_exc()
+        update_job_progress(job_id, -1, error_msg)
+
+
+def extract_qa_background(job_id: str, file_content: bytes, file_name: str, client_id: str, rfp_id: str):
+    """Background QA extraction function"""
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    from config.settings import GEMINI_MODEL
+    
+    print(f"DEBUG: Background QA extraction started for job {job_id}")
+    try:
+        update_job_progress(job_id, 10, "Starting QA extraction: Loading file...")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_path = tmp_file.name
+        
+        try:
+            update_job_progress(job_id, 20, "Loading Excel file for QA extraction...")
+            xls = pd.ExcelFile(tmp_path)
+            
+            total_sheets = len(xls.sheet_names)
+            processed_sheets = 0
+            extracted_pairs = []
+            
+            for sheet_idx, sheet in enumerate(xls.sheet_names):
+                progress_start_sheet = 20 + (sheet_idx * 70 // total_sheets)
+                
+                update_job_progress(job_id, progress_start_sheet, f"Extracting from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
+                
+                df = pd.read_excel(tmp_path, sheet_name=sheet, header=None)
+                if df.empty:
+                    print(f"DEBUG: Sheet {sheet} is empty, skipping for QA extraction.")
+                    processed_sheets += 1
+                    continue
+                
+                sheet_csv = df.to_csv(index=False, header=False)
+                pairs = extract_qa_pairs_from_sheet(sheet_csv)
+                # Retry up to 2 additional times if no pairs extracted
+                retry_attempt = 0
+                while (not pairs or len(pairs) == 0) and retry_attempt < 2:
+                    retry_attempt += 1
+                    print(f"DEBUG: No Q&A pairs extracted from sheet {sheet}. Retrying attempt {retry_attempt}/2...")
+                    pairs = extract_qa_pairs_from_sheet(sheet_csv)
+                
+                for p in pairs:
+                    extracted_pairs.append({
+                        "question": p.get("question", ""),
+                        "answer": p.get("answer", ""),
+                        "category": p.get("category", "Other"),
+                        "sheet": sheet
+                    })
+                
+                processed_sheets += 1
+            
+            update_job_progress(job_id, 90, f"Saving {len(extracted_pairs)} extracted Q&A pairs to database...")
+            print(f"DEBUG: Saving {len(extracted_pairs)} extracted Q&A pairs to database for job {job_id}.")
+            
+            created_count = 0
+            for p in extracted_pairs:
+                q = p.get("question", "").strip()
+                a = p.get("answer", "").strip()
+                c = p.get("category", "Other").strip() or "Other"
+                if q and a and insert_qa_pair(client_id, q, a, c, rfp_id):
+                    created_count += 1
+            
+            # Build AI groups after extraction
+            ai_groups_result = _build_ai_groups_for_job(client_id, rfp_id)
+
+            # Save pending summaries
+            try:
+                supabase = get_supabase_client()
+                for grp in ai_groups_result.get("groups", []):
+                    cq = (grp.get("consolidated_question") or "").strip()
+                    ca = (grp.get("consolidated_answer") or "").strip()
+                    qids = grp.get("question_ids") or []
+                    if not cq or not ca or not qids:
+                        continue
+                    s_ins = supabase.table("client_summaries").insert({
+                        "summary_text": ca,
+                        "summary_type": "Consolidated",
+                        "character_count": len(ca),
+                        "quality_score": None,
+                        "approved": False,
+                        "client_id": client_id,
+                        "rfp_id": rfp_id,
+                    }).execute()
+                    s_id = (s_ins.data or [{}])[0].get("id")
+                    if s_id:
+                        mappings = [{"question_id": qid, "summary_id": s_id} for qid in qids]
+                        supabase.table("client_question_summary_mappings").insert(mappings).execute()
+            except Exception as e:
+                print(f"WARN: Failed to persist pending summaries: {e}")
+                traceback.print_exc()
+
+            result_data = {
+                "extracted_pairs_count": len(extracted_pairs), 
+                "created_pairs_count": created_count,          
+                "total_sheets_processed": processed_sheets,
+                "ai_groups": ai_groups_result.get("groups", []),
+                "ai_groups_count": len(ai_groups_result.get("groups", [])),
+            }
+            
+            update_job_progress(job_id, 100, "QA extraction completed successfully!", result_data)
+            print(f"DEBUG: Background QA extraction completed successfully for job {job_id}")
+            
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                    print(f"DEBUG: Cleaned up temporary file: {tmp_path}")
+                except PermissionError:
+                    print(f"DEBUG: Could not delete temp file {tmp_path} - file may be in use")
+                except Exception as e:
+                    print(f"DEBUG: Error cleaning up temp file: {e}")
+                    traceback.print_exc()
+                
+    except Exception as e:
+        print(f"ERROR: QA extraction background error for job {job_id}: {e}")
+        traceback.print_exc()
+        update_job_progress(job_id, -1, f"Extraction failed: {str(e)}")
+
+
+def _build_ai_groups_for_job(client_id: str, rfp_id: str | None):
+    """Build AI-driven Q&A groups for a job"""
+    import json
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    from config.settings import GEMINI_MODEL
+    
+    try:
+        supabase = get_supabase_client()
+        q_query = supabase.table("client_questions").select("id, original_text, rfp_id").eq("client_id", client_id)
+        if rfp_id:
+            q_query = q_query.eq("rfp_id", rfp_id)
+        questions_local = q_query.order("created_at", desc=True).execute().data or []
+
+        if not questions_local:
+            return {"groups": [], "message": "No questions found"}
+
+        q_ids_local = [q["id"] for q in questions_local]
+        m_rows_local = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids_local).execute().data or []
+        q_to_a_local = {m["question_id"]: m["answer_id"] for m in m_rows_local}
+
+        a_ids_local = list({aid for aid in q_to_a_local.values() if aid})
+        a_rows_local = []
+        if a_ids_local:
+            a_rows_local = supabase.table("client_answers").select("id, answer_text").in_("id", a_ids_local).execute().data or []
+        a_map_local = {a["id"]: a.get("answer_text", "") for a in a_rows_local}
+
+        qa_lines_local = []
+        for q in questions_local:
+            qid = q["id"]
+            qtext = (q.get("original_text") or "").strip()
+            atext = (a_map_local.get(q_to_a_local.get(qid)) or "").strip()
+            if not qtext:
+                continue
+            qa_lines_local.append({"id": qid, "q": qtext, "a": atext})
+
+        if not qa_lines_local:
+            return {"groups": [], "message": "No Q&A pairs available"}
+
+        qa_text_local = "\n".join([f"ID:{row['id']}\nQ:{row['q']}\nA:{row['a']}" for row in qa_lines_local])
+        prompt_local = f"""
+You will receive a list of Q&A pairs for a single client (and optionally a specific RFP). Group semantically similar questions together and produce a consolidated Q&A for each group.
+
+Return ONLY strict JSON with this structure:
+{{
+  "groups": [
+    {{
+      "question_ids": ["<id>", "<id>", ...],
+      "consolidated_question": "string",
+      "consolidated_answer": "string"
+    }}
+  ]
+}}
+
+Rules:
+1) "question_ids" must be the exact IDs provided.
+2) Every ID used must exist in the input. Do not invent IDs.
+3) Do not include any text before or after the JSON.
+
+Q&A LIST:
+{qa_text_local}
+"""
+        try:
+            gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+            response_local = gemini_model.generate_content(
+                prompt_local,
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                },
+            )
+            text_local = (response_local.text or "").strip()
+            s_local, e_local = text_local.find("{"), text_local.rfind("}")
+            if s_local == -1 or e_local == -1:
+                return {"groups": [], "message": "LLM returned no JSON"}
+            data_local = json.loads(text_local[s_local:e_local+1])
+
+            raw_groups_local = data_local.get("groups") or []
+            valid_ids_local = {str(x["id"]) for x in questions_local}
+            groups_local = []
+            for g in raw_groups_local:
+                qids_local = [str(x) for x in (g.get("question_ids") or []) if str(x) in valid_ids_local]
+                if not qids_local:
+                    continue
+                groups_local.append({
+                    "question_ids": qids_local,
+                    "consolidated_question": (g.get("consolidated_question") or "").strip(),
+                    "consolidated_answer": (g.get("consolidated_answer") or "").strip(),
+                })
+            return {"groups": groups_local}
+        except Exception as e:
+            print(f"_build_ai_groups_for_job LLM error: {e}")
+            traceback.print_exc()
+            return {"groups": [], "message": "AI grouping failed"}
+    except Exception as e:
+        print(f"_build_ai_groups_for_job error: {e}")
+        traceback.print_exc()
+        return {"groups": [], "message": "AI grouping error"}
+

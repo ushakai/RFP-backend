@@ -9,6 +9,13 @@ create table if not exists public.clients (
   created_at timestamptz default now()
 );
 
+-- Tender ingestion log (tracks daily ingestions)
+create table if not exists public.tender_ingestion_log (
+  id uuid primary key default gen_random_uuid(),
+  ingested_at timestamptz default now(),
+  ingested_date date unique
+);
+
 -- RFPs per client
 create table if not exists public.client_rfps (
   id uuid primary key default gen_random_uuid(),
@@ -157,3 +164,98 @@ begin
   );
 end;
 $$;
+
+-- ============================================================================
+-- TENDER MONITORING SYSTEM TABLES
+-- ============================================================================
+
+-- Tenders table - stores all tender opportunities from various APIs
+create table if not exists public.tenders (
+  id uuid primary key default gen_random_uuid(),
+  source text not null, -- 'TED', 'FindATender', 'ContractsFinder', 'PCS', 'Sell2Wales', 'SAM', 'AusTender'
+  external_id text not null, -- ID from the source API
+  title text not null,
+  description text,
+  summary text, -- anonymised summary for notifications
+  full_data jsonb not null, -- complete tender data from API
+  metadata jsonb, -- generated metadata (categories, tags, etc.)
+  deadline timestamptz,
+  published_date timestamptz,
+  value_amount numeric,
+  value_currency text,
+  location text,
+  category text,
+  sector text,
+  is_duplicate boolean default false,
+  duplicate_of uuid references public.tenders(id),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique(source, external_id)
+);
+
+-- User tender keywords - criteria for matching tenders
+create table if not exists public.user_tender_keywords (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  keywords text[] not null, -- array of keywords to match
+  match_type text default 'any', -- 'any' (OR) or 'all' (AND)
+  categories text[], -- optional category filters
+  sectors text[], -- optional sector filters
+  min_value numeric, -- optional minimum value filter
+  max_value numeric, -- optional maximum value filter
+  locations text[], -- optional location filters
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Tender matches - links tenders to users based on keyword matching
+create table if not exists public.tender_matches (
+  id uuid primary key default gen_random_uuid(),
+  tender_id uuid references public.tenders(id) on delete cascade,
+  client_id uuid references public.clients(id) on delete cascade,
+  keyword_set_id uuid references public.user_tender_keywords(id) on delete cascade,
+  match_score float, -- relevance score (0-1)
+  matched_keywords text[], -- which keywords matched
+  created_at timestamptz default now(),
+  unique(tender_id, client_id, keyword_set_id)
+);
+
+-- Tender notifications - tracks email notifications sent to users
+create table if not exists public.tender_notifications (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  tender_id uuid references public.tenders(id) on delete cascade,
+  match_id uuid references public.tender_matches(id) on delete cascade,
+  notification_type text default 'daily_digest', -- 'daily_digest', 'individual'
+  email_sent boolean default false,
+  email_sent_at timestamptz,
+  email_subject text,
+  created_at timestamptz default now()
+);
+
+-- Tender access - tracks which users have paid for full access to tenders
+create table if not exists public.tender_access (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  tender_id uuid references public.tenders(id) on delete cascade,
+  payment_status text default 'pending', -- 'pending', 'completed', 'failed'
+  payment_amount numeric default 5.00, -- £5 per tender
+  payment_reference text,
+  payment_date timestamptz,
+  access_granted_at timestamptz,
+  created_at timestamptz default now(),
+  unique(client_id, tender_id)
+);
+
+-- Indexes for performance
+create index if not exists idx_tenders_source on public.tenders(source);
+create index if not exists idx_tenders_published_date on public.tenders(published_date);
+create index if not exists idx_tenders_deadline on public.tenders(deadline);
+create index if not exists idx_tenders_category on public.tenders(category);
+create index if not exists idx_tender_matches_client on public.tender_matches(client_id);
+create index if not exists idx_tender_matches_tender on public.tender_matches(tender_id);
+create index if not exists idx_tender_notifications_client on public.tender_notifications(client_id);
+create index if not exists idx_tender_access_client on public.tender_access(client_id);
+create index if not exists idx_tender_access_tender on public.tender_access(tender_id);
+create index if not exists idx_user_tender_keywords_client on public.user_tender_keywords(client_id);

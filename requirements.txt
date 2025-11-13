@@ -11,6 +11,8 @@ google-auth-oauthlib==1.1.0
 google-auth-httplib2==0.1.1
 google-api-python-client==2.108.0
 gunicorn==21.2.0
-numpy>=1.24.0,<2.0.0
+numpy>=2.1.1,<3.0.0
 httpx>=0.25.0
 postgrest>=0.13.0
+sse-starlette==2.1.0
+websockets>=12.0
