@@ -9,6 +9,7 @@ This should be run as a scheduled job (e.g., daily via cron or scheduled task).
 
 import os
 import json
+import time
 import requests
 from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Optional
@@ -40,6 +41,7 @@ SAM_GOV_API_KEY = os.getenv("SAM_GOV_API_KEY", "").strip().strip('"').strip("'")
 ANON_SUMMARY_MODE = os.getenv("ANON_SUMMARY_MODE", "matched").strip().lower()
 if ANON_SUMMARY_MODE not in {"none", "matched", "all"}:
     ANON_SUMMARY_MODE = "matched"
+FIND_TENDER_STAGES = os.getenv("FIND_TENDER_STAGES", "tender").strip()
 
 # Lightweight CPV section descriptors (first two digits) for anonymised summaries
 CPV_SECTIONS = {
@@ -912,27 +914,118 @@ def ingest_find_a_tender() -> List[Dict[str, Any]]:
     """
     tenders: List[Dict[str, Any]] = []
     try:
-        # OCDS search endpoint for Find a Tender
-        # Example params: publishedFrom, publishedTo in ISO8601, pageSize
-        base_url = "https://www.find-tender.service.gov.uk/Published/Notices/OCDS/Search"
-        published_to = datetime.now(timezone.utc)
-        published_from = published_to - timedelta(days=7)
-        params = {
-            "publishedFrom": published_from.strftime("%Y-%m-%dT00:00:00Z"),
-            "publishedTo": published_to.strftime("%Y-%m-%dT23:59:59Z"),
-            "pageSize": 100,
-            "order": "desc",
-        }
-        url = f"{base_url}?{urlencode(params)}"
-        resp = requests.get(url, timeout=30, headers={
+        base_url = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
+        headers = {
             "Accept": "application/json",
-            "User-Agent": "BidWell/1.0 (+contact@bidwell.app)"
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        releases = data.get("releases") or []
-        for rel in releases:
-            tenders.append({"source": "FindATender", **_parse_ocds_release("FindATender", rel)})
+            "User-Agent": "BidWell/1.0 (+contact@bidwell.app)",
+        }
+        now = datetime.now(timezone.utc)
+
+        def _daily_windows(days: int) -> List[tuple[datetime, datetime]]:
+            windows: List[tuple[datetime, datetime]] = []
+            for offset in range(days):
+                target_day = (now - timedelta(days=offset)).date()
+                start_dt = datetime(
+                    target_day.year,
+                    target_day.month,
+                    target_day.day,
+                    0,
+                    0,
+                    0,
+                    tzinfo=timezone.utc,
+                )
+                end_dt = datetime(
+                    target_day.year,
+                    target_day.month,
+                    target_day.day,
+                    23,
+                    59,
+                    59,
+                    tzinfo=timezone.utc,
+                )
+                if target_day == now.date():
+                    end_dt = now
+                windows.append((start_dt, end_dt))
+            windows.sort(key=lambda win: win[0])
+            return windows
+
+        stages = [stage.strip() for stage in FIND_TENDER_STAGES.split(",") if stage.strip()]
+
+        for start_dt, end_dt in _daily_windows(max(LOOKBACK_DAYS, 1)):
+            cursor = None
+            day_total = 0
+            while True:
+                params = {
+                    "updatedFrom": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "updatedTo": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "limit": 100,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                if stages:
+                    params["stages"] = ",".join(stages)
+
+                resp = requests.get(base_url, params=params, headers=headers, timeout=60)
+                if resp.status_code == 429:
+                    retry_after_header = resp.headers.get("Retry-After")
+                    try:
+                        wait_seconds = int(retry_after_header) if retry_after_header else 30
+                    except ValueError:
+                        wait_seconds = 30
+                    wait_seconds = max(5, min(wait_seconds, 300))
+                    print(f"Find a Tender API rate limit hit, waiting {wait_seconds}s before retry...")
+                    time.sleep(wait_seconds)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                releases: List[Dict[str, Any]] = []
+                data_dict = data if isinstance(data, dict) else {}
+                release_packages = data_dict.get("releasePackages")
+                if isinstance(release_packages, list):
+                    for package in release_packages:
+                        releases.extend(package.get("releases") or [])
+                elif isinstance(data, list):
+                    for package in data:
+                        if isinstance(package, dict):
+                            releases.extend(package.get("releases") or [])
+                else:
+                    releases.extend(data_dict.get("releases") or [])
+
+                if not releases:
+                    # No data for this window/page
+                    pass
+                else:
+                    for rel in releases:
+                        try:
+                            parsed = _parse_ocds_release("FindATender", rel)
+                            tenders.append({"source": "FindATender", **parsed})
+                        except Exception as parse_err:
+                            print(f"Failed parsing Find a Tender release: {parse_err}")
+                            continue
+                    day_total += len(releases)
+
+                pagination_block = data_dict.get("pagination") if isinstance(data_dict.get("pagination"), dict) else {}
+                next_cursor = (
+                    data_dict.get("nextCursor")
+                    or data_dict.get("next_cursor")
+                    or data_dict.get("cursor")
+                    or pagination_block.get("nextCursor")
+                )
+
+                if not next_cursor:
+                    break
+
+                cursor = next_cursor
+                # Gentle pause between paginated requests
+                time.sleep(0.2)
+
+            if day_total:
+                print(
+                    f"Find a Tender ingestion: fetched {day_total} releases between "
+                    f"{start_dt.strftime('%Y-%m-%d %H:%M:%S')} and {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
     except Exception as e:
         print(f"Error ingesting Find a Tender: {e}")
         traceback.print_exc()

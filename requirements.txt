@@ -16,3 +16,4 @@ httpx>=0.25.0
 postgrest>=0.13.0
 sse-starlette==2.1.0
 websockets>=12.0
+fpdf2>=2.7.0,<3.0.0
