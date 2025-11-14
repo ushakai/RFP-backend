@@ -43,22 +43,33 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
     header = f"""
     <h2 style="font-family: Arial, sans-serif;">Daily Tender Digest — {uk_date.strftime('%d %B %Y')}</h2>
     <p style="font-family: Arial, sans-serif; color:#555;">Hello {client_name or 'there'}, here are the new tenders that matched your keywords in the last 24 hours.</p>
+    <p style="font-family: Arial, sans-serif; color:#666; font-size:14px; margin-top:8px;">Click on any tender to view full details and purchase access for £5.</p>
     """
 
     body_sections = []
     for entry in entries:
+        location_info = f"<li>Location: <strong>{entry.get('location', 'Not specified')}</strong></li>" if entry.get('location') else ""
+        category_info = f"<li>Category: <strong>{entry.get('category', 'Not specified')}</strong></li>" if entry.get('category') else ""
+        match_score_info = f"<li>Match Score: <strong>{entry.get('match_score', 'N/A')}</strong></li>" if entry.get('match_score') else ""
+        
         section = f"""
-        <div style="margin-bottom:18px; padding:16px; border:1px solid #eee; border-radius:8px;">
-            <h3 style="margin:0 0 8px 0; font-family: Arial, sans-serif;">
+        <div style="margin-bottom:24px; padding:20px; border:1px solid #ddd; border-radius:8px; background-color:#fafafa;">
+            <h3 style="margin:0 0 12px 0; font-family: Arial, sans-serif; font-size:18px; line-height:1.4;">
                 <a href="{entry['link']}" style="color:#2563eb; text-decoration:none;" target="_blank">{entry['title']}</a>
             </h3>
-            <p style="margin:0 0 12px 0; color:#444; font-family: Arial, sans-serif;">{entry['summary']}</p>
-            <ul style="margin:0; padding-left:18px; color:#555; font-family: Arial, sans-serif; font-size:14px;">
+            <p style="margin:0 0 16px 0; color:#444; font-family: Arial, sans-serif; line-height:1.6; font-size:15px;">{entry['summary']}</p>
+            <ul style="margin:0; padding-left:20px; color:#555; font-family: Arial, sans-serif; font-size:14px; line-height:1.8;">
                 <li>Source: <strong>{entry['source']}</strong></li>
+                {location_info}
+                {category_info}
                 <li>Deadline: <strong>{entry['deadline']}</strong></li>
                 <li>Value: <strong>{entry['value']}</strong></li>
-                <li>Matching keywords: <strong>{entry['keywords']}</strong></li>
+                <li>Matching keywords: <strong style="color:#059669;">{entry['keywords']}</strong></li>
+                {match_score_info}
             </ul>
+            <div style="margin-top:16px; padding-top:16px; border-top:1px solid #eee;">
+                <a href="{entry['link']}" style="display:inline-block; padding:10px 20px; background-color:#2563eb; color:#fff; text-decoration:none; border-radius:6px; font-weight:600; font-size:14px;" target="_blank">View Full Details & Purchase (£5)</a>
+            </div>
         </div>
         """
         body_sections.append(section)
@@ -89,6 +100,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
     supabase = get_supabase_client()
 
     uk_now = datetime.now(UK_TIMEZONE)
+    now_utc = datetime.now(timezone.utc)
     if since_utc is None:
         start_of_day_uk = datetime.combine(uk_now.date(), dt_time.min, tzinfo=UK_TIMEZONE)
         since_utc = start_of_day_uk.astimezone(timezone.utc)
@@ -98,17 +110,24 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
 
     keyword_resp = (
         supabase.table("user_tender_keywords")
-        .select("client_id, keywords, is_active")
+        .select("client_id, keywords, is_active, created_at, updated_at")
         .eq("is_active", True)
         .execute()
     )
     eligible_clients: set[str] = set()
+    new_keyword_clients: set[str] = set()  # Clients who added keywords recently (last 7 days)
     for row in keyword_resp.data or []:
         client_id = row.get("client_id")
         keywords = row.get("keywords")
         if client_id and isinstance(keywords, list):
             if any(isinstance(kw, str) and kw.strip() for kw in keywords):
                 eligible_clients.add(client_id)
+                # Check if keywords were added/updated recently (within last 7 days)
+                keyword_created = _parse_datetime(row.get("created_at") or row.get("updated_at"))
+                if keyword_created:
+                    days_ago = (now_utc - keyword_created).days
+                    if days_ago <= 7:
+                        new_keyword_clients.add(client_id)
 
     if not eligible_clients:
         return {"payloads": payloads, "prepared_at": uk_now, "since_utc": since_utc}
@@ -127,56 +146,104 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
         if not client_id or not email:
             continue
 
+        # Get matches where either:
+        # 1. The match was created recently (new match for existing tender), OR
+        # 2. The tender was created recently (new tender that matches existing keywords)
+        # We use OR logic: match.created_at >= since_utc OR tender.created_at >= since_utc
         matches_resp = (
             supabase.table("tender_matches")
             .select(
                 "match_score, matched_keywords, created_at, "
-                "tenders(id, title, summary, source, deadline, value_amount, value_currency, created_at)"
+                "tenders(id, title, summary, description, source, deadline, value_amount, value_currency, created_at, location, category, metadata)"
             )
             .eq("client_id", client_id)
-            .gte("created_at", since_iso)
             .order("match_score", desc=True)
-            .limit(50)
+            .limit(100)
             .execute()
         )
 
         matches = matches_resp.data or []
         entries: List[Dict[str, str]] = []
+        
         for match in matches:
             tender = match.get("tenders")
             if not isinstance(tender, dict):
                 continue
 
-            tender_created = _parse_datetime(tender.get("created_at"))
-            if tender_created and tender_created < since_utc:
-                continue
+            # Check if this match/tender should be included:
+            # - For new keyword clients (added keywords in last 7 days): include all matches
+            # - For existing clients: include if match was created recently OR tender was created recently
+            if client_id not in new_keyword_clients:
+                match_created = _parse_datetime(match.get("created_at"))
+                tender_created = _parse_datetime(tender.get("created_at"))
+                
+                match_is_recent = match_created and match_created >= since_utc
+                tender_is_recent = tender_created and tender_created >= since_utc
+                
+                if not match_is_recent and not tender_is_recent:
+                    continue
 
-            title = (tender.get("title") or "").strip()
+            # Get enriched title from metadata or use title
+            metadata = tender.get("metadata") or {}
+            if isinstance(metadata, dict):
+                # Try to get enriched title from metadata (processed title)
+                enriched_title = metadata.get("processed_details", {}).get("title") if isinstance(metadata.get("processed_details"), dict) else None
+                if not enriched_title:
+                    # Fallback to title in database (which may have been enriched during ingestion)
+                    enriched_title = tender.get("title")
+            else:
+                enriched_title = tender.get("title")
+            
+            title = (enriched_title or tender.get("title") or "").strip()
             if not title:
                 continue
 
+            # Get location and category from metadata or direct fields
+            location_name = metadata.get("location_name") if isinstance(metadata, dict) else None
+            if not location_name:
+                location_name = tender.get("location")
+            
+            category_label = metadata.get("category_label") if isinstance(metadata, dict) else None
+            if not category_label:
+                category_label = tender.get("category")
+
             summary_text = (tender.get("summary") or "").strip()
             if not summary_text:
-                continue
+                # Fallback to description if no summary
+                summary_text = (tender.get("description") or "").strip()[:300]
+                if summary_text:
+                    summary_text = summary_text + "..." if len(summary_text) == 300 else summary_text
 
             deadline = _parse_datetime(tender.get("deadline"))
             # Skip tenders with passed deadlines
             if deadline:
-                now_utc = datetime.now(timezone.utc)
                 if deadline < now_utc:
                     continue
                 deadline_text = deadline.astimezone(UK_TIMEZONE).strftime("%d %b %Y")
             else:
                 deadline_text = "Not specified"
 
+            # Format match score as percentage
+            match_score = match.get("match_score")
+            match_score_text = ""
+            if match_score is not None:
+                try:
+                    score_pct = float(match_score) * 100
+                    match_score_text = f"{score_pct:.0f}%"
+                except (TypeError, ValueError):
+                    pass
+
             entries.append(
                 {
                     "title": title,
                     "summary": summary_text,
                     "source": tender.get("source") or "Unknown",
+                    "location": location_name or "Not specified",
+                    "category": category_label or "Not specified",
                     "deadline": deadline_text,
                     "value": _format_currency(tender.get("value_amount"), tender.get("value_currency")),
                     "keywords": ", ".join(match.get("matched_keywords") or []) or "Not specified",
+                    "match_score": match_score_text,
                     "link": f"{FRONTEND_BASE}/tenders/{tender.get('id')}",
                 }
             )

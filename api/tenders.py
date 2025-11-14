@@ -16,7 +16,7 @@ from postgrest.exceptions import APIError
 import httpx
 import httpcore
 from utils.auth import get_client_id_from_key
-from config.settings import get_supabase_client, reinitialize_supabase
+from config.settings import get_supabase_client, reinitialize_supabase, ENABLE_PAYMENT
 from services.tender_service import rematch_for_client
 from services.gemini_service import summarize_tender_for_paid_view
 
@@ -76,22 +76,64 @@ def _fetch_client_keyword_set(supabase, client_id: str):
 
 
 def _with_supabase_retry(operation, attempts: int = 5, delay: float = 0.2):
+    """
+    Retry Supabase operations with exponential backoff.
+    Handles Windows socket errors (WinError 10035) with longer delays.
+    """
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
             return operation()
-        except (httpx.HTTPError, httpcore.ReadError, APIError) as exc:
-            last_exc = exc
-            print(f"WARNING: Supabase operation failed (attempt {attempt + 1}/{attempts}): {exc}")
-            traceback.print_exc()
-            reinitialize_supabase()
-            time.sleep(delay * (attempt + 1))
         except Exception as exc:
             last_exc = exc
-            if attempt < attempts - 1:
-                time.sleep(delay * (attempt + 1))
+            error_msg = str(exc)
+            error_type = type(exc).__name__
+            
+            # Check if this is a network/connection error that should be retried
+            is_retryable = (
+                isinstance(exc, (httpx.HTTPError, httpx.ReadError, httpx.ConnectError, httpx.TimeoutException,
+                                APIError, ConnectionError, OSError)) or
+                "ReadError" in error_type or
+                "ConnectError" in error_type or
+                "WinError 10035" in error_msg or
+                "non-blocking socket" in error_msg.lower() or
+                "connection" in error_msg.lower()
+            )
+            
+            # Windows socket error - use longer delay
+            is_windows_socket_error = "WinError 10035" in error_msg or "non-blocking socket" in error_msg.lower()
+            
+            if is_retryable and attempt < attempts - 1:
+                # Longer delay for Windows socket errors
+                base_delay = delay * (attempt + 1)
+                wait_time = base_delay * (3.0 if is_windows_socket_error else 1.0)
+                
+                if is_windows_socket_error:
+                    print(f"WARNING: Windows socket error detected (attempt {attempt + 1}/{attempts}), retrying in {wait_time:.2f}s...")
+                else:
+                    print(f"WARNING: Supabase operation failed (attempt {attempt + 1}/{attempts}): {error_type}")
+                
+                time.sleep(wait_time)
+                
+                # Reinitialize Supabase connection on retry (but not on first retry to avoid overhead)
+                if attempt >= 1:
+                    try:
+                        reinitialize_supabase()
+                    except Exception:
+                        pass  # Ignore reinit errors
                 continue
-            break
+            elif not is_retryable:
+                # Non-retryable error - raise immediately
+                raise exc
+            else:
+                # Last attempt failed
+                if is_windows_socket_error:
+                    print(f"ERROR: Supabase operation failed after {attempts} attempts due to Windows socket error")
+                else:
+                    print(f"ERROR: Supabase operation failed after {attempts} attempts: {error_type}")
+                    traceback.print_exc()
+                break
+    
     if last_exc:
         raise last_exc
 
@@ -144,6 +186,102 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
         print(f"Error getting tender keywords: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to get tender keywords")
+
+
+def _extract_original_url(full_data: Any, source: str, external_id: str) -> str | None:
+    """
+    Extract the original tender URL from the full_data based on source.
+    """
+    if not isinstance(full_data, dict):
+        return None
+    
+    # Handle OCDS format (ContractsFinder, Find a Tender)
+    if "tender" in full_data or "releases" in full_data or "ocid" in full_data:
+        # Try to get URL from OCDS release
+        ocid = full_data.get("ocid")
+        if ocid:
+            if source == "FindATender":
+                # Find a Tender URL format: https://www.find-tender.service.gov.uk/Notice/Details/{ocid}
+                return f"https://www.find-tender.service.gov.uk/Notice/Details/{ocid}"
+            elif source == "ContractsFinder":
+                # ContractsFinder URL format: https://www.contractsfinder.service.gov.uk/Notice/{ocid}
+                return f"https://www.contractsfinder.service.gov.uk/Notice/{ocid}"
+        
+        # Try to get URL from tender documents
+        tender = full_data.get("tender") or {}
+        documents = tender.get("documents") or []
+        if documents and isinstance(documents, list):
+            for doc in documents:
+                if isinstance(doc, dict):
+                    url = doc.get("url") or doc.get("uri")
+                    if url and isinstance(url, str) and url.startswith("http"):
+                        return url
+    
+    # Handle TED eForms format
+    elif full_data.get("format") == "ted_eforms" or "notice_number" in full_data:
+        notice_number = full_data.get("notice_number") or full_data.get("publication_id")
+        if notice_number:
+            # TED URL format: https://ted.europa.eu/udl?uri=TED:NOTICE:{notice_number}:TEXT:EN:HTML
+            return f"https://ted.europa.eu/udl?uri=TED:NOTICE:{notice_number}:TEXT:EN:HTML"
+        
+        # Try documents
+        tender_info = full_data.get("tender") or {}
+        documents = tender_info.get("documents") or []
+        if documents and isinstance(documents, list):
+            for doc in documents:
+                if isinstance(doc, dict):
+                    url = doc.get("url") or doc.get("uri")
+                    if url and isinstance(url, str) and url.startswith("http"):
+                        return url
+    
+    # Handle legacy TED format
+    elif "Form_Section" in full_data:
+        form_section = full_data.get("Form_Section", {})
+        for key in form_section.keys():
+            if key.startswith("F"):
+                ted_data = form_section[key]
+                if isinstance(ted_data, dict):
+                    # Try to get URL from documents
+                    object_contract = ted_data.get("Object_Contract", {})
+                    if isinstance(object_contract, list):
+                        object_contract = object_contract[0] if object_contract else {}
+                    
+                    doc_fields = ["Document_Full", "URL_Document", "URL_Participation"]
+                    for field_name in doc_fields:
+                        doc_ref = object_contract.get(field_name) or {}
+                        if isinstance(doc_ref, dict):
+                            url = doc_ref.get("URL") or doc_ref.get("Value")
+                            if url and isinstance(url, str) and url.startswith("http"):
+                                return url
+                        elif isinstance(doc_ref, str) and doc_ref.startswith("http"):
+                            return doc_ref
+    
+    # Handle SAM.gov format
+    elif "noticeId" in full_data or "solicitationNumber" in full_data:
+        notice_id = full_data.get("noticeId") or full_data.get("solicitationNumber")
+        if notice_id:
+            return f"https://sam.gov/opp/{notice_id}/view"
+    
+    # Try to find any URL in the data structure
+    def find_url_recursive(obj, depth=0):
+        if depth > 5:  # Limit recursion depth
+            return None
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(key, str) and ("url" in key.lower() or "uri" in key.lower() or "link" in key.lower()):
+                    if isinstance(value, str) and value.startswith("http"):
+                        return value
+                result = find_url_recursive(value, depth + 1)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = find_url_recursive(item, depth + 1)
+                if result:
+                    return result
+        return None
+    
+    return find_url_recursive(full_data)
 
 
 def _normalize_full_data_for_display(full_data: Any, source: str) -> dict:
@@ -786,16 +924,17 @@ def get_tender_details(
     
     try:
         supabase = get_supabase_client()
-        # Check if user has access
-        access_res = supabase.table("tender_access").select("*")\
-            .eq("client_id", client_id)\
-            .eq("tender_id", tender_id)\
-            .eq("payment_status", "completed")\
-            .limit(1)\
-            .execute()
-        access_data = (access_res.data or [])
-        if not access_data:
-            raise HTTPException(status_code=403, detail="Access denied. Please purchase access to view this tender.")
+        # Check if user has access (only if payment is enabled)
+        if ENABLE_PAYMENT:
+            access_res = supabase.table("tender_access").select("*")\
+                .eq("client_id", client_id)\
+                .eq("tender_id", tender_id)\
+                .eq("payment_status", "completed")\
+                .limit(1)\
+                .execute()
+            access_data = (access_res.data or [])
+            if not access_data:
+                raise HTTPException(status_code=403, detail="Access denied. Please purchase access to view this tender.")
         
         # Get tender details
         tender_res = supabase.table("tenders").select("*").eq("id", tender_id).limit(1).execute()
@@ -806,6 +945,10 @@ def get_tender_details(
 
         full_payload = tender_row.get("full_data")
         source = tender_row.get("source", "")
+        external_id = tender_row.get("external_id", "")
+        
+        # Extract original URL
+        original_url = _extract_original_url(full_payload, source, external_id)
         
         # Normalize full_data structure for consistent frontend access
         normalized_full_data = _normalize_full_data_for_display(full_payload, source)
@@ -872,6 +1015,7 @@ def get_tender_details(
             "category": tender_row["category"],
             "category_label": category_label,
             "sector": tender_row["sector"],
+            "original_url": original_url,
             "full_data": normalized_full_data,
             "processed_details": processed_details,
             "metadata": metadata,
