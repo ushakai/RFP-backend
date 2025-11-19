@@ -482,15 +482,30 @@ def _normalize_keyword_payload(client_id: str, payload: dict) -> dict:
         keywords = [k.strip() for k in keywords.split(",") if k.strip()]
     if not isinstance(keywords, list):
         raise HTTPException(status_code=400, detail="Invalid keywords payload")
+    
+    # Normalize locations
+    locations = payload.get("locations") or []
+    if isinstance(locations, str):
+        locations = [l.strip() for l in locations.split(",") if l.strip()]
+    if not isinstance(locations, list):
+        locations = []
+    
+    # Normalize industries (using sectors field)
+    industries = payload.get("industries") or payload.get("sectors") or []
+    if isinstance(industries, str):
+        industries = [i.strip() for i in industries.split(",") if i.strip()]
+    if not isinstance(industries, list):
+        industries = []
+    
     return {
         "client_id": client_id,
         "keywords": keywords,
         "match_type": "any",  # legacy column retained but unused
         "categories": payload.get("categories") or None,
-        "sectors": payload.get("sectors") or None,
+        "sectors": industries if industries else None,  # Using sectors field for industries
         "min_value": payload.get("min_value"),
         "max_value": payload.get("max_value"),
-        "locations": payload.get("locations") or None,
+        "locations": locations if locations else None,
         "is_active": True,
     }
     
@@ -504,6 +519,92 @@ def _enrich_title(title: str | None, category_label: str | None, category: str |
     return f"{descriptor.capitalize()} opportunity in {geo}"
 
 
+def _format_compact_currency(amount: Any, currency: str | None) -> str | None:
+    try:
+        if amount is None:
+            return None
+        value = float(amount)
+    except (TypeError, ValueError):
+        return None
+    iso_currency = (currency or "GBP").upper()
+    if value >= 1_000_000:
+        number = f"{value / 1_000_000:.1f}M"
+    elif value >= 1_000:
+        number = f"{value / 1_000:.1f}K"
+    else:
+        number = f"{value:,.0f}"
+    number = number.rstrip("0").rstrip(".") if "." in number else number
+    return f"{iso_currency} {number}"
+
+
+def _truncate_text(text: str | None, limit: int = 320) -> str:
+    if not text:
+        return ""
+    clean = text.strip()
+    if len(clean) <= limit:
+        return clean
+    truncated = clean[:limit].rsplit(" ", 1)[0]
+    return truncated.rstrip(",.; ") + "..."
+
+
+def _derive_summary_preview(tender_row: dict) -> str:
+    if not tender_row:
+        return ""
+    metadata = tender_row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    base_summary = (tender_row.get("summary") or "").strip()
+    detail_sources = [
+        tender_row.get("description"),
+        metadata.get("processed_details", {}).get("executive_summary")
+        if isinstance(metadata.get("processed_details"), dict)
+        else None,
+    ]
+    detail_text = ""
+    for candidate in detail_sources:
+        if isinstance(candidate, str) and candidate.strip():
+            detail_text = _truncate_text(candidate, 360)
+            break
+
+    if base_summary:
+        intro = base_summary
+    else:
+        location_name = metadata.get("location_name") or tender_row.get("location")
+        category_label = metadata.get("category_label") or tender_row.get("category")
+        clauses: list[str] = []
+        if category_label and location_name:
+            clauses.append(f"{category_label} opportunity in {location_name}")
+        elif category_label:
+            clauses.append(f"{category_label} opportunity")
+        elif location_name:
+            clauses.append(f"Public sector opportunity in {location_name}")
+        else:
+            clauses.append("Public sector opportunity")
+
+        deadline_text = None
+        deadline_value = tender_row.get("deadline")
+        if deadline_value:
+            try:
+                parsed = datetime.fromisoformat(str(deadline_value).replace("Z", "+00:00"))
+                deadline_text = parsed.strftime("%d %b %Y")
+            except Exception:
+                deadline_text = str(deadline_value)
+        if deadline_text:
+            clauses.append(f"Deadline {deadline_text}")
+
+        value_text = _format_compact_currency(tender_row.get("value_amount"), tender_row.get("value_currency"))
+        if value_text:
+            clauses.append(f"Value approx {value_text}")
+
+        intro = ". ".join(clauses).strip()
+        if intro and not intro.endswith("."):
+            intro += "."
+
+    if detail_text:
+        return f"{intro} {detail_text}".strip()
+    return intro.strip()
+
+
 @router.post("/tenders/keywords")
 def upsert_tender_keyword(
     payload: dict = Body(...),
@@ -513,8 +614,13 @@ def upsert_tender_keyword(
     client_id = get_client_id_from_key(x_client_key)
     keyword_data = _normalize_keyword_payload(client_id, payload)
 
-    if not keyword_data["keywords"]:
-        raise HTTPException(status_code=400, detail="At least one keyword is required")
+    # Require at least one of: keywords, locations, or industries
+    has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
+    has_locations = keyword_data.get("locations") and len(keyword_data["locations"]) > 0
+    has_industries = keyword_data.get("sectors") and len(keyword_data["sectors"]) > 0
+    
+    if not (has_keywords or has_locations or has_industries):
+        raise HTTPException(status_code=400, detail="At least one keyword, location, or industry is required")
     
     try:
         existing = _with_supabase_retry(
@@ -633,7 +739,7 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         def fetch_tenders():
             supabase = get_supabase_client()
             query = supabase.table("tenders").select(
-                "id, title, summary, source, deadline, published_date, value_amount, value_currency, location, category"
+                "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata"
             ).gte("published_date", lookback).order("published_date", desc=True)
             query = query.or_(f"deadline.is.null,deadline.gte.{now_iso}")
             return query.execute()
@@ -672,6 +778,8 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
             if not tender_id:
                 continue
             metadata = tender.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             location_name = metadata.get("location_name") or tender.get("location")
             category_label = metadata.get("category_label") or tender.get("category")
             title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
@@ -691,11 +799,17 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
                     matched_keywords = mk
                 match_id = match.get("id")
 
+            summary_preview = _derive_summary_preview({
+                **tender,
+                "metadata": metadata,
+            })
+
             results.append({
                 "id": tender_id,
                 "match_id": match_id,
                 "title": title,
                 "summary": tender.get("summary", ""),
+                "summary_preview": summary_preview,
                 "description": tender.get("description", ""),
                 "source": tender.get("source", ""),
                 "deadline": tender.get("deadline"),
@@ -779,6 +893,8 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
             if not tender_id:
                 continue
             metadata = tender.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             location_name = metadata.get("location_name") or tender.get("location")
             category_label = metadata.get("category_label") or tender.get("category")
             title = _enrich_title(
@@ -800,11 +916,17 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
                 match_score = 0.0
                 matched_keywords = []
 
+            summary_preview = _derive_summary_preview({
+                **tender,
+                "metadata": metadata,
+            })
+
             results.append(
                 {
                     "id": tender_id,
                     "title": title,
                     "summary": tender.get("summary", ""),
+                    "summary_preview": summary_preview,
                     "description": tender.get("description", ""),
                     "source": tender.get("source", ""),
                     "deadline": tender.get("deadline"),
@@ -866,6 +988,8 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
             if not tender:
                 continue
             metadata = tender.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             location_name = metadata.get("location_name") or tender.get("location")
             category_label = metadata.get("category_label") or tender.get("category")
             title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
@@ -882,11 +1006,17 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
                     # If we can't parse the deadline, include it anyway
                     pass
             
+            summary_preview = _derive_summary_preview({
+                **tender,
+                "metadata": metadata,
+            })
+
             result.append({
                 "id": match["id"],
                 "tender_id": match["tender_id"],
                 "title": title,
                 "summary": tender.get("summary", ""),
+                "summary_preview": summary_preview,
                  "description": tender.get("description", ""),
                 "source": tender.get("source", ""),
                 "deadline": tender.get("deadline"),

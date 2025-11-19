@@ -1667,67 +1667,12 @@ def store_tender(tender_data: Dict[str, Any]) -> str | None:
 def match_tender_against_keywords(tender_data: Dict[str, Any], keyword_set: Dict[str, Any]) -> tuple[bool, float, list]:
     """
     Match a tender against a keyword set.
+    Matching logic: (one location OR) AND (one industry OR) AND (one keyword OR)
     Returns: (is_match, match_score, matched_keywords)
     """
-    title = str(tender_data.get("title") or "").lower()
-    description = str(tender_data.get("description") or "").lower()
-    summary = str(tender_data.get("summary") or "").lower()
-    category = str(tender_data.get("category") or "").lower()
-    sector = str(tender_data.get("sector") or "").lower()
-    location_text = str(tender_data.get("location") or "").lower()
-
-    searchable_text = " ".join(filter(None, [title, description, summary, category, sector, location_text]))
-
-    keywords = _normalize_str_list(keyword_set.get("keywords"))
-    match_type = str(keyword_set.get("match_type") or "any").strip().lower()
-    if match_type not in {"any", "all"}:
-        match_type = "any"
-
-    matched_keywords = [kw for kw in keywords if kw and kw in searchable_text]
-    # preserve order but ensure uniqueness
-    seen = set()
-    matched_keywords = [kw for kw in matched_keywords if not (kw in seen or seen.add(kw))]
-
-    if not keywords:
-        is_match = False
-    elif match_type == "all":
-        is_match = len(matched_keywords) == len(keywords)
-    else:
-        is_match = len(matched_keywords) > 0
-    
-    match_score = len(matched_keywords) / len(keywords) if keywords else 0.0
-    
-    if is_match:
-        keyword_cats = _normalize_str_list(keyword_set.get("categories"))
-        if keyword_cats:
-            tender_cats = _normalize_str_list(tender_data.get("category"))
-            if not set(keyword_cats).intersection(tender_cats):
-                is_match = False
-        
-        keyword_sectors = _normalize_str_list(keyword_set.get("sectors"))
-        if is_match and keyword_sectors:
-            tender_sectors = _normalize_str_list(tender_data.get("sector"))
-            if not set(keyword_sectors).intersection(tender_sectors):
-                is_match = False
-        
-        keyword_locations = _normalize_str_list(keyword_set.get("locations"))
-        if is_match and keyword_locations:
-            if not location_text or not any(loc in location_text for loc in keyword_locations):
-                is_match = False
-        
-        value_amount = _coerce_float(tender_data.get("value_amount"))
-        min_v = _coerce_float(keyword_set.get("min_value"))
-        max_v = _coerce_float(keyword_set.get("max_value"))
-
-        if min_v is not None and (value_amount is None or value_amount < min_v):
-                is_match = False
-        if max_v is not None and (value_amount is None or value_amount > max_v):
-                is_match = False
-    
-    if not is_match:
-        match_score = 0.0
-    
-    return is_match, match_score, matched_keywords
+    # Import from services to avoid duplication
+    from services.tender_service import match_tender_against_keywords as service_match
+    return service_match(tender_data, keyword_set)
 
 
 def process_tender_matches(tender_id: str, tender_data: Dict[str, Any]):

@@ -52,16 +52,22 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
         category_info = f"<li>Category: <strong>{entry.get('category', 'Not specified')}</strong></li>" if entry.get('category') else ""
         match_score_info = f"<li>Match Score: <strong>{entry.get('match_score', 'N/A')}</strong></li>" if entry.get('match_score') else ""
         
+        # Status badge styling
+        status = entry.get('status', 'New')
+        status_color = "#10b981" if status == "New" else "#f59e0b"
+        status_badge = f'<span style="display:inline-block; padding:4px 10px; background-color:{status_color}; color:#fff; font-size:12px; font-weight:600; border-radius:4px; margin-left:8px;">{status}</span>'
+        
         section = f"""
         <div style="margin-bottom:24px; padding:20px; border:1px solid #ddd; border-radius:8px; background-color:#fafafa;">
             <h3 style="margin:0 0 12px 0; font-family: Arial, sans-serif; font-size:18px; line-height:1.4;">
                 <a href="{entry['link']}" style="color:#2563eb; text-decoration:none;" target="_blank">{entry['title']}</a>
+                {status_badge}
             </h3>
-            <p style="margin:0 0 16px 0; color:#444; font-family: Arial, sans-serif; line-height:1.6; font-size:15px;">{entry['summary']}</p>
             <ul style="margin:0; padding-left:20px; color:#555; font-family: Arial, sans-serif; font-size:14px; line-height:1.8;">
                 <li>Source: <strong>{entry['source']}</strong></li>
                 {location_info}
                 {category_info}
+                <li>Published: <strong>{entry.get('published_date', 'Not specified')}</strong></li>
                 <li>Deadline: <strong>{entry['deadline']}</strong></li>
                 <li>Value: <strong>{entry['value']}</strong></li>
                 <li>Matching keywords: <strong style="color:#059669;">{entry['keywords']}</strong></li>
@@ -79,11 +85,6 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
         You are receiving this email because you subscribed to daily tender updates.
     </p>
     """
-
-    if not body_sections:
-        body_sections.append(
-            "<p style='font-family: Arial, sans-serif; color:#555;'>No new tenders matched your criteria today.</p>"
-        )
 
     return header + "".join(body_sections) + footer
 
@@ -163,7 +164,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
         )
 
         matches = matches_resp.data or []
-        entries: List[Dict[str, str]] = []
+        entries: List[Dict[str, Any]] = []
         
         for match in matches:
             tender = match.get("tenders")
@@ -223,35 +224,58 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             else:
                 deadline_text = "Not specified"
 
+            # Format published date
+            published_date = _parse_datetime(tender.get("published_date"))
+            if published_date:
+                published_text = published_date.astimezone(UK_TIMEZONE).strftime("%d %b %Y")
+            else:
+                published_text = "Not specified"
+
+            # Determine if this is a new tender or updated match
+            match_created = _parse_datetime(match.get("created_at"))
+            tender_created = _parse_datetime(tender.get("created_at"))
+            is_new_tender = tender_created and tender_created >= since_utc
+            status_label = "New" if is_new_tender else "Updated Match"
+
             # Format match score as percentage
             match_score = match.get("match_score")
             match_score_text = ""
+            numeric_score: float = 0.0
             if match_score is not None:
                 try:
-                    score_pct = float(match_score) * 100
+                    numeric_score = float(match_score)
+                    score_pct = numeric_score * 100
                     match_score_text = f"{score_pct:.0f}%"
                 except (TypeError, ValueError):
-                    pass
+                    numeric_score = 0.0
 
-            entries.append(
-                {
-                    "title": title,
-                    "summary": summary_text,
-                    "source": tender.get("source") or "Unknown",
-                    "location": location_name or "Not specified",
-                    "category": category_label or "Not specified",
-                    "deadline": deadline_text,
-                    "value": _format_currency(tender.get("value_amount"), tender.get("value_currency")),
-                    "keywords": ", ".join(match.get("matched_keywords") or []) or "Not specified",
-                    "match_score": match_score_text,
-                    "link": f"{FRONTEND_BASE}/tenders/{tender.get('id')}",
-                }
-            )
-            if len(entries) >= 10:
-                break
+            entry_payload = {
+                "title": title,
+                "summary": summary_text,
+                "source": tender.get("source") or "Unknown",
+                "location": location_name or "Not specified",
+                "category": category_label or "Not specified",
+                "deadline": deadline_text,
+                "published_date": published_text,
+                "status": status_label,
+                "value": _format_currency(tender.get("value_amount"), tender.get("value_currency")),
+                "keywords": ", ".join(match.get("matched_keywords") or []) or "Not specified",
+                "match_score": match_score_text,
+                "link": f"{FRONTEND_BASE}/tenders/{tender.get('id')}",
+                "_score": numeric_score,
+            }
+            entries.append(entry_payload)
 
         if not entries:
             continue
+
+        # Keep only the top 10 entries by match score
+        entries.sort(key=lambda item: item.get("_score", 0.0), reverse=True)
+        top_entries = []
+        for entry in entries[:10]:
+            entry = dict(entry)
+            entry.pop("_score", None)
+            top_entries.append(entry)
 
         payloads.append(
             {
@@ -259,7 +283,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
                 "client_name": client.get("name") or "",
                 "email": email,
                 "subject": f"Daily Tender Digest — {uk_now.strftime('%d %b %Y')}",
-                "entries": entries,
+                "entries": top_entries,
             }
         )
 
