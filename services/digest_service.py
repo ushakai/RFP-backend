@@ -63,13 +63,13 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
                 <a href="{entry['link']}" style="color:#2563eb; text-decoration:none;" target="_blank">{entry['title']}</a>
                 {status_badge}
             </h3>
-            <ul style="margin:0; padding-left:20px; color:#555; font-family: Arial, sans-serif; font-size:14px; line-height:1.8;">
+            <div style="margin:0 0 16px 0; padding:12px; background-color:#fff; border-left:3px solid #2563eb; border-radius:4px;">
+                <p style="margin:0; color:#444; font-family: Arial, sans-serif; line-height:1.6; font-size:14px;">{entry['summary']}</p>
+            </div>
+            <ul style="margin:0; padding-left:20px; color:#555; font-family: Arial, sans-serif; font-size:13px; line-height:1.8;">
                 <li>Source: <strong>{entry['source']}</strong></li>
-                {location_info}
-                {category_info}
                 <li>Published: <strong>{entry.get('published_date', 'Not specified')}</strong></li>
                 <li>Deadline: <strong>{entry['deadline']}</strong></li>
-                <li>Value: <strong>{entry['value']}</strong></li>
                 <li>Matching keywords: <strong style="color:#059669;">{entry['keywords']}</strong></li>
                 {match_score_info}
             </ul>
@@ -155,7 +155,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             supabase.table("tender_matches")
             .select(
                 "match_score, matched_keywords, created_at, "
-                "tenders(id, title, summary, description, source, deadline, value_amount, value_currency, created_at, location, category, metadata)"
+                "tenders(id, title, summary, description, source, deadline, value_amount, value_currency, created_at, location, category, metadata, full_data)"
             )
             .eq("client_id", client_id)
             .order("match_score", desc=True)
@@ -208,12 +208,58 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             if not category_label:
                 category_label = tender.get("category")
 
-            summary_text = (tender.get("summary") or "").strip()
-            if not summary_text:
-                # Fallback to description if no summary
-                summary_text = (tender.get("description") or "").strip()[:300]
-                if summary_text:
-                    summary_text = summary_text + "..." if len(summary_text) == 300 else summary_text
+            # Build a rich summary for email (4-5 lines with key details)
+            summary_parts = []
+            
+            # Start with existing summary/description
+            base_summary = (tender.get("summary") or "").strip()
+            if not base_summary:
+                base_summary = (tender.get("description") or "").strip()
+            
+            if base_summary:
+                # Limit to first 200 chars for base summary
+                if len(base_summary) > 200:
+                    base_summary = base_summary[:200].rsplit(' ', 1)[0] + "..."
+                summary_parts.append(base_summary)
+            
+            # Add scope/requirements if available from full_data
+            full_data = tender.get("full_data") or {}
+            if isinstance(full_data, dict):
+                # Try to extract items/deliverables
+                tender_info = full_data.get("tender") or {}
+                items = tender_info.get("items") or []
+                if items and isinstance(items, list) and len(items) > 0:
+                    item_descriptions = []
+                    for item in items[:3]:  # Max 3 items
+                        if isinstance(item, dict):
+                            desc = item.get("description") or ""
+                            if desc and len(desc) < 80:
+                                item_descriptions.append(desc)
+                    if item_descriptions:
+                        summary_parts.append("Scope includes: " + "; ".join(item_descriptions))
+            
+            # Add key metadata context
+            context_parts = []
+            if category_label and category_label != "Not specified":
+                context_parts.append(f"Category: {category_label}")
+            if location_name and location_name != "Not specified":
+                context_parts.append(f"Location: {location_name}")
+            
+            value_amount_raw = tender.get("value_amount")
+            if value_amount_raw:
+                try:
+                    value_formatted = _format_currency(value_amount_raw, tender.get("value_currency"))
+                    context_parts.append(f"Est. Value: {value_formatted}")
+                except:
+                    pass
+            
+            if context_parts:
+                summary_parts.append(" | ".join(context_parts))
+            
+            # Add call-to-action hint
+            summary_parts.append("View full tender details including documents, requirements, and buyer information.")
+            
+            summary_text = " ".join(summary_parts)
 
             deadline = _parse_datetime(tender.get("deadline"))
             # Skip tenders with passed deadlines
