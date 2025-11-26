@@ -8,8 +8,11 @@ from typing import Any, Dict, List
 
 from fpdf import FPDF
 
-from config.settings import FRONTEND_ORIGIN, UK_TIMEZONE, get_supabase_client
+import json
+import google.generativeai as genai
+from config.settings import FRONTEND_ORIGIN, UK_TIMEZONE, get_supabase_client, GEMINI_MODEL, FILTER_UK_ONLY
 from services.email_service import send_email
+from services.tender_service import is_uk_tender, is_uk_specific_source
 
 FRONTEND_BASE = FRONTEND_ORIGIN.rstrip("/")
 _LAST_INGESTION_UTC: datetime | None = None
@@ -39,51 +42,197 @@ def _format_currency(amount, currency) -> str:
     return f"{symbol}{amount:,.0f} {code if symbol == '' else ''}".strip()
 
 
+def _generate_compelling_email_summary(tender_data: Dict[str, Any], full_data: Dict[str, Any] | None) -> str:
+    """
+    Generate a compelling 4-5 line summary for email digest using AI.
+    This summary should be unique and not repeat information from title/bullets.
+    """
+    try:
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Prepare context for AI
+        title = tender_data.get("title", "")
+        description = tender_data.get("description", "") or tender_data.get("summary", "")
+        category = tender_data.get("category_label") or tender_data.get("category", "")
+        location = tender_data.get("location_name") or tender_data.get("location", "")
+        value = tender_data.get("value_amount")
+        deadline = tender_data.get("deadline", "")
+        
+        # Extract key info from full_data if available
+        scope_info = ""
+        deliverables = []
+        if isinstance(full_data, dict):
+            tender_info = full_data.get("tender") or {}
+            items = tender_info.get("items") or []
+            if items and isinstance(items, list):
+                for item in items[:5]:
+                    if isinstance(item, dict):
+                        desc = item.get("description") or ""
+                        if desc:
+                            deliverables.append(desc[:100])
+        
+        prompt = f"""Generate a compelling 4-5 line summary for a tender opportunity email. The summary should:
+1. Be unique and NOT repeat information from the title or basic metadata (category, location, value, deadline)
+2. Focus on WHAT the opportunity entails, WHY it matters, and WHAT the buyer needs
+3. Be persuasive and make the reader want to learn more
+4. Be concise (4-5 sentences, approximately 300-400 characters total)
+5. Highlight key requirements, scope, or unique aspects that aren't obvious from the title
+
+Tender Information:
+Title: {title}
+Description: {description[:500] if description else "No description available"}
+Category: {category}
+Location: {location}
+Value: {value if value else "Not disclosed"}
+Deadline: {deadline}
+Scope/Deliverables: {"; ".join(deliverables[:3]) if deliverables else "Not specified"}
+
+Generate ONLY the summary text (no labels, no formatting, just the compelling narrative):"""
+
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.7,
+                "max_output_tokens": 500,
+            }
+        )
+        
+        summary = response.text.strip()
+        # Clean up any markdown or extra formatting
+        summary = summary.replace("**", "").replace("*", "").strip()
+        
+        # Ensure it's reasonable length (300-500 chars for 4-5 lines)
+        if len(summary) > 500:
+            # Truncate at sentence boundary
+            sentences = summary.split('. ')
+            summary = '. '.join(sentences[:4])
+            if not summary.endswith('.'):
+                summary += '.'
+        
+        return summary if summary else "This opportunity requires detailed review. View full tender details for complete information."
+    except Exception as e:
+        print(f"Error generating AI summary: {e}")
+        import traceback
+        traceback.print_exc()
+        return "This opportunity requires detailed review. View full tender details for complete information."
+
+
 def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: datetime) -> str:
+    # Modern email template with gradient header and card design
     header = f"""
-    <h2 style="font-family: Arial, sans-serif;">Daily Tender Digest — {uk_date.strftime('%d %B %Y')}</h2>
-    <p style="font-family: Arial, sans-serif; color:#555;">Hello {client_name or 'there'}, here are the new tenders that matched your keywords in the last 24 hours.</p>
-    <p style="font-family: Arial, sans-serif; color:#666; font-size:14px; margin-top:8px;">Click on any tender to view full details and purchase access for £5.</p>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin:0; padding:0; background-color:#f5f7fa; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f5f7fa; padding:40px 20px;">
+            <tr>
+                <td align="center">
+                    <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px; background-color:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 4px 6px rgba(0,0,0,0.1);">
+                        <!-- Header with gradient -->
+                        <tr>
+                            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding:40px 30px; text-align:center;">
+                                <h1 style="margin:0; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:-0.5px;">Daily Tender Digest</h1>
+                                <p style="margin:12px 0 0 0; color:#ffffff; font-size:16px; opacity:0.95;">{uk_date.strftime('%d %B %Y')}</p>
+                            </td>
+                        </tr>
+                        <!-- Greeting -->
+                        <tr>
+                            <td style="padding:30px 30px 20px 30px;">
+                                <p style="margin:0; color:#1a202c; font-size:16px; line-height:1.6;">Hello <strong>{client_name or 'there'}</strong>,</p>
+                                <p style="margin:12px 0 0 0; color:#4a5568; font-size:15px; line-height:1.6;">Here are the top opportunities that matched your keywords today.</p>
+                            </td>
+                        </tr>
     """
 
     body_sections = []
-    for entry in entries:
-        location_info = f"<li>Location: <strong>{entry.get('location', 'Not specified')}</strong></li>" if entry.get('location') else ""
-        category_info = f"<li>Category: <strong>{entry.get('category', 'Not specified')}</strong></li>" if entry.get('category') else ""
-        match_score_info = f"<li>Match Score: <strong>{entry.get('match_score', 'N/A')}</strong></li>" if entry.get('match_score') else ""
-        
+    for idx, entry in enumerate(entries, 1):
         # Status badge styling
         status = entry.get('status', 'New')
         status_color = "#10b981" if status == "New" else "#f59e0b"
-        status_badge = f'<span style="display:inline-block; padding:4px 10px; background-color:{status_color}; color:#fff; font-size:12px; font-weight:600; border-radius:4px; margin-left:8px;">{status}</span>'
+        status_bg = "#d1fae5" if status == "New" else "#fef3c7"
         
         section = f"""
-        <div style="margin-bottom:24px; padding:20px; border:1px solid #ddd; border-radius:8px; background-color:#fafafa;">
-            <h3 style="margin:0 0 12px 0; font-family: Arial, sans-serif; font-size:18px; line-height:1.4;">
-                <a href="{entry['link']}" style="color:#2563eb; text-decoration:none;" target="_blank">{entry['title']}</a>
-                {status_badge}
-            </h3>
-            <div style="margin:0 0 16px 0; padding:12px; background-color:#fff; border-left:3px solid #2563eb; border-radius:4px;">
-                <p style="margin:0; color:#444; font-family: Arial, sans-serif; line-height:1.6; font-size:14px;">{entry['summary']}</p>
-            </div>
-            <ul style="margin:0; padding-left:20px; color:#555; font-family: Arial, sans-serif; font-size:13px; line-height:1.8;">
-                <li>Source: <strong>{entry['source']}</strong></li>
-                <li>Published: <strong>{entry.get('published_date', 'Not specified')}</strong></li>
-                <li>Deadline: <strong>{entry['deadline']}</strong></li>
-                <li>Matching keywords: <strong style="color:#059669;">{entry['keywords']}</strong></li>
-                {match_score_info}
-            </ul>
-            <div style="margin-top:16px; padding-top:16px; border-top:1px solid #eee;">
-                <a href="{entry['link']}" style="display:inline-block; padding:10px 20px; background-color:#2563eb; color:#fff; text-decoration:none; border-radius:6px; font-weight:600; font-size:14px;" target="_blank">View Full Details & Purchase (£5)</a>
+                        <!-- Tender Card {idx} -->
+                        <tr>
+                            <td style="padding:0 30px 30px 30px;">
+                                <div style="background-color:#ffffff; border:1px solid #e2e8f0; border-radius:10px; overflow:hidden; transition:all 0.3s;">
+                                    <!-- Card Header -->
+                                    <div style="background:linear-gradient(to right, #f8fafc 0%, #ffffff 100%); padding:20px 24px; border-bottom:1px solid #e2e8f0;">
+                                        <div style="display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+                                            <div style="flex:1; min-width:200px;">
+                                                <h2 style="margin:0 0 8px 0; color:#1a202c; font-size:20px; font-weight:600; line-height:1.3;">
+                                                    <a href="{entry['link']}" style="color:#2563eb; text-decoration:none; transition:color 0.2s;" target="_blank">{entry['title']}</a>
+                                                </h2>
+                                                <span style="display:inline-block; padding:4px 12px; background-color:{status_bg}; color:{status_color}; font-size:11px; font-weight:600; border-radius:12px; text-transform:uppercase; letter-spacing:0.5px;">{status}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- Summary Section -->
+                                    <div style="padding:24px;">
+                                        <p style="margin:0; color:#2d3748; font-size:15px; line-height:1.7; font-weight:400;">{entry['summary']}</p>
+                                    </div>
+                                    
+                                    <!-- Metadata Grid -->
+                                    <div style="padding:0 24px 20px 24px;">
+                                        <table width="100%" cellpadding="0" cellspacing="0">
+                                            <tr>
+                                                <td style="padding:8px 0; color:#718096; font-size:13px; width:50%;">
+                                                    <strong style="color:#4a5568;">Published:</strong><br>
+                                                    <span style="color:#2d3748;">{entry.get('published_date', 'Not specified')}</span>
+                                                </td>
+                                                <td style="padding:8px 0; color:#718096; font-size:13px; width:50%;">
+                                                    <strong style="color:#4a5568;">Deadline:</strong><br>
+                                                    <span style="color:#2d3748;">{entry['deadline']}</span>
+                                                </td>
+                                            </tr>
+                                            <tr>
+                                                <td colspan="2" style="padding:8px 0; color:#718096; font-size:13px;">
+                                                    <strong style="color:#4a5568;">Source:</strong> {entry['source']}
+                                                </td>
+                                            </tr>
+                                            <tr>
+                                                <td colspan="2" style="padding:12px 0 0 0; border-top:1px solid #e2e8f0;">
+                                                    <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                                                        <span style="color:#718096; font-size:12px; font-weight:600;">Keywords:</span>
+                                                        <div style="display:flex; flex-wrap:wrap; gap:6px;">
+                                                            {''.join([f'<span style="display:inline-block; padding:4px 10px; background-color:#edf2f7; color:#2d3748; font-size:12px; border-radius:6px; font-weight:500;">{kw.strip()}</span>' for kw in entry['keywords'].split(',')[:5] if kw.strip()])}
+                                                        </div>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </div>
+                                    
+                                    <!-- CTA Button -->
+                                    <div style="padding:0 24px 24px 24px;">
+                                        <a href="{entry['link']}" style="display:inline-block; width:100%; padding:14px 24px; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:#ffffff; text-decoration:none; border-radius:8px; font-weight:600; font-size:15px; text-align:center; transition:opacity 0.2s; box-shadow:0 2px 4px rgba(102, 126, 234, 0.3);" target="_blank">View Full Details & Purchase (£5)</a>
             </div>
         </div>
+                            </td>
+                        </tr>
         """
         body_sections.append(section)
 
-    footer = """
-    <p style="font-family: Arial, sans-serif; color:#888; font-size:12px;">
-        You are receiving this email because you subscribed to daily tender updates.
-    </p>
+    footer = f"""
+                        <!-- Footer -->
+                        <tr>
+                            <td style="padding:30px; background-color:#f8fafc; border-top:1px solid #e2e8f0; text-align:center;">
+                                <p style="margin:0; color:#718096; font-size:13px; line-height:1.6;">
+                                    You are receiving this email because you subscribed to daily tender updates.<br>
+                                    <a href="#" style="color:#667eea; text-decoration:none;">Manage preferences</a> | <a href="#" style="color:#667eea; text-decoration:none;">Unsubscribe</a>
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+    </body>
+    </html>
     """
 
     return header + "".join(body_sections) + footer
@@ -171,6 +320,15 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             if not isinstance(tender, dict):
                 continue
 
+            # Filter UK-only tenders if flag is enabled
+            # UK-specific sources always pass (ContractsFinder, Sell2Wales, PCS Scotland, FindATender)
+            if FILTER_UK_ONLY:
+                source = tender.get("source") or ""
+                if not is_uk_specific_source(source):
+                    # For other sources (TED, etc.), check if UK-based
+                    if not is_uk_tender(tender):
+                        continue
+
             # Check if this match/tender should be included:
             # - For new keyword clients (added keywords in last 7 days): include all matches
             # - For existing clients: include if match was created recently OR tender was created recently
@@ -208,58 +366,42 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             if not category_label:
                 category_label = tender.get("category")
 
-            # Build a rich summary for email (4-5 lines with key details)
-            summary_parts = []
+            # Check if we have a good email summary already generated
+            tender_id = tender.get("id")
+            email_summary = None
+            if isinstance(metadata, dict):
+                email_summary = metadata.get("email_summary")
             
-            # Start with existing summary/description
-            base_summary = (tender.get("summary") or "").strip()
-            if not base_summary:
-                base_summary = (tender.get("description") or "").strip()
-            
-            if base_summary:
-                # Limit to first 200 chars for base summary
-                if len(base_summary) > 200:
-                    base_summary = base_summary[:200].rsplit(' ', 1)[0] + "..."
-                summary_parts.append(base_summary)
-            
-            # Add scope/requirements if available from full_data
+            # If no email summary exists or it's too short, generate one with AI
             full_data = tender.get("full_data") or {}
-            if isinstance(full_data, dict):
-                # Try to extract items/deliverables
-                tender_info = full_data.get("tender") or {}
-                items = tender_info.get("items") or []
-                if items and isinstance(items, list) and len(items) > 0:
-                    item_descriptions = []
-                    for item in items[:3]:  # Max 3 items
-                        if isinstance(item, dict):
-                            desc = item.get("description") or ""
-                            if desc and len(desc) < 80:
-                                item_descriptions.append(desc)
-                    if item_descriptions:
-                        summary_parts.append("Scope includes: " + "; ".join(item_descriptions))
+            if not email_summary or len(email_summary.strip()) < 100:
+                print(f"Generating AI email summary for tender {tender_id}")
+                tender_data_for_ai = {
+                    "title": title,
+                    "description": tender.get("description") or tender.get("summary") or "",
+                    "category": category_label,
+                    "category_label": category_label,
+                    "location": location_name,
+                    "location_name": location_name,
+                    "value_amount": tender.get("value_amount"),
+                    "value_currency": tender.get("value_currency"),
+                    "deadline": tender.get("deadline"),
+                    "source": tender.get("source"),
+                }
+                email_summary = _generate_compelling_email_summary(tender_data_for_ai, full_data)
+                
+                # Save the generated summary to Supabase metadata
+                if tender_id and email_summary:
+                    try:
+                        current_metadata = metadata.copy() if isinstance(metadata, dict) else {}
+                        current_metadata["email_summary"] = email_summary
+                        current_metadata["email_summary_generated_at"] = datetime.now(timezone.utc).isoformat()
+                        supabase.table("tenders").update({"metadata": current_metadata}).eq("id", tender_id).execute()
+                        print(f"Saved AI-generated email summary for tender {tender_id}")
+                    except Exception as e:
+                        print(f"Warning: Failed to save email summary to database: {e}")
             
-            # Add key metadata context
-            context_parts = []
-            if category_label and category_label != "Not specified":
-                context_parts.append(f"Category: {category_label}")
-            if location_name and location_name != "Not specified":
-                context_parts.append(f"Location: {location_name}")
-            
-            value_amount_raw = tender.get("value_amount")
-            if value_amount_raw:
-                try:
-                    value_formatted = _format_currency(value_amount_raw, tender.get("value_currency"))
-                    context_parts.append(f"Est. Value: {value_formatted}")
-                except:
-                    pass
-            
-            if context_parts:
-                summary_parts.append(" | ".join(context_parts))
-            
-            # Add call-to-action hint
-            summary_parts.append("View full tender details including documents, requirements, and buyer information.")
-            
-            summary_text = " ".join(summary_parts)
+            summary_text = email_summary or "This opportunity requires detailed review. View full tender details for complete information."
 
             deadline = _parse_datetime(tender.get("deadline"))
             # Skip tenders with passed deadlines
@@ -271,7 +413,18 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
                 deadline_text = "Not specified"
 
             # Format published date
+            # For TED tenders, use ingested_at or created_at if no published_date
             published_date = _parse_datetime(tender.get("published_date"))
+            if not published_date:
+                # Check metadata for ingested_at (TED extraction date)
+                if isinstance(metadata, dict):
+                    ingested_at = metadata.get("ingested_at")
+                    if ingested_at:
+                        published_date = _parse_datetime(ingested_at)
+                # Fallback to tender created_at
+                if not published_date:
+                    published_date = _parse_datetime(tender.get("created_at"))
+            
             if published_date:
                 published_text = published_date.astimezone(UK_TIMEZONE).strftime("%d %b %Y")
             else:
@@ -283,33 +436,26 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             is_new_tender = tender_created and tender_created >= since_utc
             status_label = "New" if is_new_tender else "Updated Match"
 
-            # Format match score as percentage
+            # Get match score for sorting (but don't include in email)
             match_score = match.get("match_score")
-            match_score_text = ""
             numeric_score: float = 0.0
             if match_score is not None:
                 try:
                     numeric_score = float(match_score)
-                    score_pct = numeric_score * 100
-                    match_score_text = f"{score_pct:.0f}%"
                 except (TypeError, ValueError):
                     numeric_score = 0.0
 
             entry_payload = {
-                "title": title,
-                "summary": summary_text,
-                "source": tender.get("source") or "Unknown",
-                "location": location_name or "Not specified",
-                "category": category_label or "Not specified",
-                "deadline": deadline_text,
+                    "title": title,
+                    "summary": summary_text,
+                    "source": tender.get("source") or "Unknown",
+                    "deadline": deadline_text,
                 "published_date": published_text,
                 "status": status_label,
-                "value": _format_currency(tender.get("value_amount"), tender.get("value_currency")),
-                "keywords": ", ".join(match.get("matched_keywords") or []) or "Not specified",
-                "match_score": match_score_text,
-                "link": f"{FRONTEND_BASE}/tenders/{tender.get('id')}",
+                    "keywords": ", ".join(match.get("matched_keywords") or []) or "Not specified",
+                    "link": f"{FRONTEND_BASE}/tenders/{tender.get('id')}",
                 "_score": numeric_score,
-            }
+                }
             entries.append(entry_payload)
 
         if not entries:

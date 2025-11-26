@@ -2,8 +2,126 @@
 Supabase Service - Database operations
 """
 import traceback
-from config.settings import get_supabase_client
+import time
+from typing import Any, Callable, List
+
+import httpcore
+import httpx
+
+from config.settings import get_supabase_client, reinitialize_supabase
 from services.gemini_service import get_embedding
+
+
+def execute_with_retry(
+    operation_factory: Callable[[], Any],
+    retries: int = 3,
+    backoff_seconds: float = 0.3,
+    on_retry: Callable[[], None] | None = None,
+):
+    """Execute a Supabase/PostgREST operation with retries on socket read errors."""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return operation_factory()
+        except (
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpcore.ReadError,
+            httpcore.RemoteProtocolError,
+        ) as err:
+            last_error = err
+            print(f"Supabase read error (attempt {attempt}/{retries}): {err}")
+            traceback.print_exc()
+            try:
+                reinitialize_supabase()
+            except Exception as reinit_err:
+                print(f"Supabase reinit failed during retry: {reinit_err}")
+                traceback.print_exc()
+            if on_retry:
+                try:
+                    on_retry()
+                except Exception as cb_err:
+                    print(f"Retry callback failed: {cb_err}")
+                    traceback.print_exc()
+            if attempt == retries:
+                break
+            time.sleep(backoff_seconds * attempt)
+        except Exception as err:
+            # Non-network errors bubble up immediately
+            raise err
+    if last_error:
+        raise last_error
+
+
+def fetch_paginated_rows(
+    query_factory: Callable[[], Any],
+    page_size: int = 500,
+    max_rows: int | None = None,
+):
+    """Fetch rows in chunks using PostgREST range pagination."""
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+
+    results: list = []
+    offset = 0
+
+    while True:
+        def _run_page():
+            builder = query_factory()
+            return builder.range(offset, offset + page_size - 1).execute()
+
+        response = execute_with_retry(_run_page)
+        page = (response.data or []) if response else []
+        results.extend(page)
+
+        if len(page) < page_size:
+            break
+
+        offset += page_size
+        if max_rows and len(results) >= max_rows:
+            break
+
+    if max_rows and len(results) > max_rows:
+        return results[:max_rows]
+    return results
+
+
+def fetch_question_answer_mappings(
+    question_ids: List[str] | None,
+    chunk_size: int = 100,
+):
+    """Fetch mapping rows for question IDs without hitting URL limits."""
+    if not question_ids:
+        return []
+
+    mappings = []
+
+    for idx in range(0, len(question_ids), chunk_size):
+        chunk = [qid for qid in question_ids[idx : idx + chunk_size] if qid]
+        if not chunk:
+            continue
+        def _run_chunk():
+            supabase = get_supabase_client()
+            return (
+                supabase.table("client_question_answer_mappings")
+                .select("question_id, answer_id")
+                .in_("question_id", chunk)
+                .execute()
+            )
+
+        try:
+            res = execute_with_retry(_run_chunk)
+        except Exception as e:
+            print(f"fetch_question_answer_mappings chunk error: {e}")
+            traceback.print_exc()
+            continue
+
+        if res and res.data:
+            mappings.extend(res.data)
+
+    return mappings
 
 def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None) -> list:
     """Search for matching questions in Supabase using embeddings
@@ -86,9 +204,9 @@ def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None
                 
                 # Check answer mappings (RPC might require this)
                 q_ids = [q["id"] for q in q_check.data[:5]]
-                map_check = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute()
-                if map_check.data:
-                    print(f"DEBUG: {len(map_check.data)}/{len(q_ids)} sample questions have answer mappings")
+                map_check = fetch_question_answer_mappings(q_ids)
+                if map_check:
+                    print(f"DEBUG: {len(map_check)}/{len(q_ids)} sample questions have answer mappings")
                 else:
                     print(f"ERROR: Questions have NO answer mappings! This may cause RPC to return nothing.")
                     print(f"       Solution: Ensure questions in knowledge base have answers mapped to them.")

@@ -10,6 +10,7 @@ from utils.auth import get_client_id_from_key
 from utils.helpers import create_rfp_from_filename
 from config.settings import get_supabase_client, reinitialize_supabase
 from services.excel_service import estimate_minutes_from_chars
+from services.supabase_service import fetch_paginated_rows
 
 router = APIRouter()
 
@@ -110,32 +111,29 @@ async def submit_job(
 
 @router.get("/jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """List all jobs for a client with retry logic"""
+    """List all jobs for a client with built-in pagination and retry handling"""
     print(f"=== /jobs ENDPOINT CALLED ===")
     print("Jobs endpoint called")
     client_id = get_client_id_from_key(x_client_key)
-    max_retries = 3
-    for attempt in range(max_retries):
+
+    def _build_jobs_query():
+        query = get_supabase_client().table("client_jobs").select("*").eq("client_id", client_id)
+        return query.order("created_at", desc=True)
+
+    try:
+        jobs = fetch_paginated_rows(_build_jobs_query, page_size=200, max_rows=500)
+        for job in jobs[:2]:
+            print(f"DEBUG: Job {job.get('id', 'unknown')} - status: {job.get('status')} progress: {job.get('progress_percent')}")
+        return {"jobs": jobs}
+    except Exception as e:
+        print(f"ERROR: Error fetching jobs: {e}")
+        traceback.print_exc()
         try:
-            supabase = get_supabase_client()
-            res = supabase.table("client_jobs").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
-            jobs = res.data or []
-            for job in jobs[:2]:
-                print(f"DEBUG: Job {job.get('id', 'unknown')} - status: {job.get('status')} progress: {job.get('progress_percent')}")
-            return {"jobs": jobs}
-        except Exception as e:
-            print(f"ERROR: Error fetching jobs (attempt {attempt + 1}/{max_retries}): {e}")
+            reinitialize_supabase()
+        except Exception as reinit_err:
+            print(f"Supabase re-init failed in /jobs: {reinit_err}")
             traceback.print_exc()
-            try:
-                reinitialize_supabase()
-            except Exception as reinit_err:
-                print(f"Supabase re-init failed in /jobs: {reinit_err}")
-                traceback.print_exc()
-            if attempt < max_retries - 1:
-                time.sleep(1)
-            else:
-                print(f"Failed to fetch jobs after {max_retries} attempts")
-                return {"jobs": [], "error": "Database connection failed"}
+        return {"jobs": [], "error": "Database connection failed"}
 
 
 @router.get("/jobs/{job_id}")

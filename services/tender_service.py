@@ -4,12 +4,174 @@ Tender Service - Tender monitoring and matching
 import traceback
 import time
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Any, Dict
+from datetime import datetime, timezone
 
 import httpx
 from postgrest.exceptions import APIError
 
 from config.settings import get_supabase_client, reinitialize_supabase
+
+
+def is_uk_specific_source(source: str) -> bool:
+    """
+    Check if the source is a UK-specific source that always passes UK filter.
+    Returns True for: ContractsFinder, Sell2Wales, PCS Scotland, FindATender
+    """
+    source_lower = (source or "").lower()
+    uk_specific_sources = ["contractsfinder", "sell2wales", "pcs scotland", "find a tender", "findatender"]
+    return any(uk_source in source_lower for uk_source in uk_specific_sources)
+
+
+def is_uk_tender(tender_data: Dict[str, Any]) -> bool:
+    """
+    Check if a tender is from the UK.
+    Returns True if the tender is from UK, False otherwise.
+    This is a shared utility function used across the application.
+    """
+    source = (tender_data.get("source") or "").lower()
+    
+    # UK-specific sources are automatically UK
+    uk_sources = [
+        "contractsfinder",
+        "find a tender",
+        "findatender",
+        "pcs scotland",
+        "sell2wales",
+    ]
+    if any(uk_source in source for uk_source in uk_sources):
+        return True
+    
+    # Non-UK sources are automatically not UK
+    non_uk_sources = [
+        "sam.gov",
+        "austender",
+    ]
+    if any(non_uk_source in source for non_uk_source in non_uk_sources):
+        return False
+    
+    # Check metadata for country and NUTS code (from TED parsing)
+    metadata = tender_data.get("metadata") or {}
+    nuts_code = None
+    country = None
+    if isinstance(metadata, dict):
+        nuts_code = metadata.get("nuts_code")
+        country = metadata.get("country")
+    
+    # Check if NUTS code indicates UK (starts with "UK")
+    if nuts_code:
+        nuts_str = str(nuts_code).upper()
+        if nuts_str.startswith("UK"):
+            return True
+    
+    # Check country from metadata
+    if country:
+        country_lower = str(country).lower()
+        uk_country_names = ["united kingdom", "uk", "gb", "great britain"]
+        if any(uk_name in country_lower for uk_name in uk_country_names):
+            return True
+    
+    # Also check in full_data for TED format if country not found in metadata
+    if not country:
+        full_data = tender_data.get("full_data")
+        if isinstance(full_data, dict):
+            # Check Form_Section for TED format
+            form_section = full_data.get("Form_Section") or {}
+            for key in form_section.keys():
+                if key.startswith("F"):
+                    ted_data = form_section[key]
+                    if isinstance(ted_data, dict):
+                        contracting_body = ted_data.get("Contracting_Body") or {}
+                        address_cb = contracting_body.get("Address_Contracting_Body") or {}
+                        country_dict = address_cb.get("Country") or {}
+                        if isinstance(country_dict, dict):
+                            country = country_dict.get("Value") or country_dict.get("Code") or country_dict.get("P")
+                        elif isinstance(country_dict, str):
+                            country = country_dict
+                        if country:
+                            country_lower = str(country).lower()
+                            uk_country_names = ["united kingdom", "uk", "gb", "great britain"]
+                            if any(uk_name in country_lower for uk_name in uk_country_names):
+                                return True
+                        break
+    
+    # For TED and other sources, check location fields
+    location = (tender_data.get("location") or "").lower()
+    location_name = ""
+    if isinstance(metadata, dict):
+        location_name = (metadata.get("location_name") or "").lower()
+    
+    # Check full_data for country information (OCDS format)
+    full_data = tender_data.get("full_data")
+    country_indicators = []
+    if country:
+        country_indicators.append(str(country).lower())
+    
+    if isinstance(full_data, dict):
+        # Check buyer address (OCDS format)
+        buyer = full_data.get("buyer") or {}
+        if isinstance(buyer, dict):
+            address = buyer.get("address") or {}
+            if isinstance(address, dict):
+                ocds_country = (address.get("countryName") or address.get("country") or "").lower()
+                if ocds_country:
+                    country_indicators.append(ocds_country)
+        
+        # Check tender items delivery locations
+        tender_info = full_data.get("tender") or {}
+        items = tender_info.get("items") or []
+        if isinstance(items, list):
+            for item in items[:3]:  # Check first 3 items
+                if isinstance(item, dict):
+                    delivery = item.get("deliveryLocation") or {}
+                    if isinstance(delivery, dict):
+                        item_country = (delivery.get("address", {}).get("countryName") or "").lower()
+                        if item_country:
+                            country_indicators.append(item_country)
+    
+    # UK country indicators
+    uk_indicators = [
+        "united kingdom",
+        "uk",
+        "gb",
+        "great britain",
+        "england",
+        "scotland",
+        "wales",
+        "northern ireland",
+        "gb-eng",
+        "gb-sct",
+        "gb-wls",
+        "gb-nir",
+    ]
+    
+    # UK city/region indicators (common UK locations that might appear without country)
+    uk_cities_regions = [
+        "london", "manchester", "birmingham", "glasgow", "edinburgh", "cardiff", "belfast",
+        "liverpool", "leeds", "sheffield", "bristol", "newcastle", "nottingham", "southampton",
+        "yorkshire", "lancashire", "kent", "essex", "surrey", "hertfordshire", "devon",
+        "cornwall", "norfolk", "suffolk", "cumbria", "northumberland", "dorset", "somerset",
+    ]
+    
+    # Check all location fields
+    all_location_text = f"{location} {location_name} {' '.join(country_indicators)}".lower()
+    
+    # Check if any UK indicator is present
+    for indicator in uk_indicators:
+        if indicator in all_location_text:
+            return True
+    
+    # For TED tenders, also check for UK cities/regions as a fallback
+    if "ted" in source:
+        # Check for UK cities/regions in location text
+        for uk_city in uk_cities_regions:
+            if uk_city in all_location_text:
+                return True
+        # If no UK indicators found at all, exclude
+        return False
+    
+    # Default: if we can't determine, return False (safer to exclude)
+    return False
 
 
 def _coerce_float(value):
@@ -146,7 +308,16 @@ def _rematch_for_client_once(client_id: str) -> int:
 
     supabase.table("tender_matches").delete().eq("client_id", client_id).execute()
 
-    tenders_res = supabase.table("tenders").select("*").execute()
+    # Only fetch active tenders (not past deadline) to improve performance
+    now_utc = datetime.now(timezone.utc).isoformat()
+    tenders_res = (
+        supabase.table("tenders")
+        .select("id, title, description, summary, category, sector, location, value_amount")
+        .or_(f"deadline.is.null,deadline.gte.{now_utc}")
+        .order("published_date", desc=True)
+        .limit(10000)  # Reasonable limit to prevent excessive processing
+        .execute()
+    )
     tenders = tenders_res.data or []
 
     to_insert = []

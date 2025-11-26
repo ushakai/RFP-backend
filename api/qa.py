@@ -14,7 +14,11 @@ from fastapi import APIRouter, UploadFile, Header, HTTPException, Body, File
 from utils.auth import get_client_id_from_key
 from config.settings import get_supabase_client, GEMINI_MODEL
 from services.gemini_service import get_embedding, extract_qa_pairs_from_sheet
-from services.supabase_service import insert_qa_pair
+from services.supabase_service import (
+    insert_qa_pair,
+    fetch_question_answer_mappings,
+    fetch_paginated_rows,
+)
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
@@ -68,22 +72,26 @@ def list_org_qa(
     """List all Q&A pairs for the organization"""
     try:
         client_id = get_client_id_from_key(x_client_key)
-        supabase = get_supabase_client()
         
-        qs_query = supabase.table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
-        ans_query = supabase.table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
+        def _build_questions_query():
+            query = get_supabase_client().table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
+            if rfp_id:
+                query = query.eq("rfp_id", rfp_id)
+            return query.order("created_at", desc=True)
 
-        if rfp_id:
-            qs_query = qs_query.eq("rfp_id", rfp_id)
-            ans_query = ans_query.eq("rfp_id", rfp_id)
+        def _build_answers_query():
+            query = get_supabase_client().table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
+            if rfp_id:
+                query = query.eq("rfp_id", rfp_id)
+            return query.order("last_updated", desc=True)
 
-        qs = qs_query.order("created_at", desc=True).execute().data or []
-        ans = ans_query.order("last_updated", desc=True).execute().data or []
+        qs = fetch_paginated_rows(_build_questions_query, page_size=400)
+        ans = fetch_paginated_rows(_build_answers_query, page_size=400)
 
         q_ids = [q.get("id") for q in qs] if qs else []
         mappings = []
         if q_ids:
-            mappings = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
+            mappings = fetch_question_answer_mappings(q_ids)
 
         return {"questions": qs, "answers": ans, "mappings": mappings}
     except HTTPException:
@@ -207,8 +215,7 @@ def analyze_qa_similarities(
         
         # Get answer mappings
         q_ids = [q["id"] for q in questions]
-        mappings_res = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute()
-        mappings = mappings_res.data or []
+        mappings = fetch_question_answer_mappings(q_ids)
         mapping_dict = {m["question_id"]: m["answer_id"] for m in mappings}
         
         # Get answers
@@ -349,7 +356,7 @@ def ai_group_qa(
 
         # Fetch mappings for answers
         q_ids = [q["id"] for q in questions]
-        m_rows = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids).execute().data or []
+        m_rows = fetch_question_answer_mappings(q_ids)
         q_to_a = {m["question_id"]: m["answer_id"] for m in m_rows}
 
         # Fetch answers

@@ -48,6 +48,7 @@ DISABLE_TENDER_INGESTION_LOOP = os.getenv("DISABLE_TENDER_INGESTION_LOOP", "0") 
 # Feature flags
 ENABLE_TENDER_INGESTION = os.getenv("ENABLE_TENDER_INGESTION", "1").lower() not in {"0", "false", "off", "no"}
 ENABLE_PAYMENT = os.getenv("ENABLE_PAYMENT", "0").lower() not in {"0", "false", "off", "no"}
+FILTER_UK_ONLY = os.getenv("FILTER_UK_ONLY", "1").lower() not in {"0", "false", "off", "no"}
 
 # Scheduling
 UK_TIMEZONE = ZoneInfo(os.getenv("UK_TIMEZONE", "Europe/London"))

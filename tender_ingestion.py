@@ -24,7 +24,7 @@ from io import BytesIO
 import gzip
 import tarfile
 from postgrest.exceptions import APIError as PostgrestAPIError
-from config.settings import UK_TIMEZONE, ENABLE_TENDER_INGESTION
+from config.settings import UK_TIMEZONE, ENABLE_TENDER_INGESTION, FILTER_UK_ONLY
 
 load_dotenv()
 
@@ -394,9 +394,32 @@ def _parse_ted_notice(source: str, notice: Dict[str, Any]) -> Dict[str, Any]:
     if address_cb.get("Postal_Code"):
         location_parts.append(address_cb["Postal_Code"])
     nuts = address_cb.get("Nuts") or {}
-    if nuts.get("Code"):
-        location_parts.append(nuts["Code"])
+    nuts_code = None
+    if isinstance(nuts, dict):
+        nuts_code = nuts.get("Code")
+        if nuts_code:
+            location_parts.append(nuts_code)
+    elif isinstance(nuts, str):
+        nuts_code = nuts
+        location_parts.append(nuts_code)
+    
+    # Extract country from address
+    country = None
+    country_dict = address_cb.get("Country") or {}
+    if isinstance(country_dict, dict):
+        country = country_dict.get("Value") or country_dict.get("Code") or country_dict.get("P")
+    elif isinstance(country_dict, str):
+        country = country_dict
+    
+    # Add country to location if available
+    if country:
+        location_parts.append(country)
+    
     location = ", ".join(location_parts) if location_parts else None
+    
+    # Store country and NUTS code in raw_data for UK detection
+    raw_data_country = country
+    raw_data_nuts = nuts_code
     
     # Extract title and description
     title = object_contract.get("Title") or ""
@@ -471,6 +494,8 @@ def _parse_ted_notice(source: str, notice: Dict[str, Any]) -> Dict[str, Any]:
         "full_data": notice,
         "api_version": "ted",
         "form_type": form_type,
+        "country": raw_data_country,  # Store country for UK detection
+        "nuts_code": raw_data_nuts,  # Store NUTS code for UK detection
     }
 
 
@@ -1398,6 +1423,11 @@ def normalize_tender_data(raw_data: Dict[str, Any], source: str) -> Dict[str, An
         normalized["metadata"]["language"] = raw_data.get("language") or raw_data.get("description_language")
     if raw_data.get("cpv_codes"):
         normalized["metadata"]["cpv_codes"] = raw_data.get("cpv_codes")
+    # Store country and NUTS code for UK detection (from TED parsing)
+    if raw_data.get("country"):
+        normalized["metadata"]["country"] = raw_data.get("country")
+    if raw_data.get("nuts_code"):
+        normalized["metadata"]["nuts_code"] = raw_data.get("nuts_code")
 
     # Additional friendly fields for summaries/display
     location_name = raw_data.get("location_name")
@@ -1637,6 +1667,96 @@ def _find_duplicate_tender(tender_data: Dict[str, Any]) -> str | None:
         return None
 
 
+def _is_uk_tender(tender_data: Dict[str, Any]) -> bool:
+    """
+    Check if a tender is from the UK.
+    Returns True if the tender is from UK, False otherwise.
+    """
+    source = tender_data.get("source", "").lower()
+    
+    # UK-specific sources are automatically UK
+    uk_sources = [
+        "contractsfinder",
+        "find a tender",
+        "findatender",
+        "pcs scotland",
+        "sell2wales",
+    ]
+    if any(uk_source in source for uk_source in uk_sources):
+        return True
+    
+    # Non-UK sources are automatically not UK
+    non_uk_sources = [
+        "sam.gov",
+        "austender",
+    ]
+    if any(non_uk_source in source for non_uk_source in non_uk_sources):
+        return False
+    
+    # For TED and other sources, check location fields
+    location = (tender_data.get("location") or "").lower()
+    location_name = ""
+    metadata = tender_data.get("metadata") or {}
+    if isinstance(metadata, dict):
+        location_name = (metadata.get("location_name") or "").lower()
+    
+    # Check full_data for country information
+    full_data = tender_data.get("full_data")
+    country_indicators = []
+    if isinstance(full_data, dict):
+        # Check buyer address
+        buyer = full_data.get("buyer") or {}
+        if isinstance(buyer, dict):
+            address = buyer.get("address") or {}
+            if isinstance(address, dict):
+                country = (address.get("countryName") or address.get("country") or "").lower()
+                if country:
+                    country_indicators.append(country)
+        
+        # Check tender items delivery locations
+        tender_info = full_data.get("tender") or {}
+        items = tender_info.get("items") or []
+        if isinstance(items, list):
+            for item in items[:3]:  # Check first 3 items
+                if isinstance(item, dict):
+                    delivery = item.get("deliveryLocation") or {}
+                    if isinstance(delivery, dict):
+                        country = (delivery.get("address", {}).get("countryName") or "").lower()
+                        if country:
+                            country_indicators.append(country)
+    
+    # UK country indicators
+    uk_indicators = [
+        "united kingdom",
+        "uk",
+        "gb",
+        "great britain",
+        "england",
+        "scotland",
+        "wales",
+        "northern ireland",
+        "gb-eng",
+        "gb-sct",
+        "gb-wls",
+        "gb-nir",
+    ]
+    
+    # Check all location fields
+    all_location_text = f"{location} {location_name} {' '.join(country_indicators)}".lower()
+    
+    # Check if any UK indicator is present
+    for indicator in uk_indicators:
+        if indicator in all_location_text:
+            return True
+    
+    # If source is TED and no UK indicator found, it's not UK
+    if "ted" in source:
+        return False
+    
+    # Default: if we can't determine, return False (safer to exclude)
+    return False
+
+
 def store_tender(tender_data: Dict[str, Any]) -> str | None:
     """
     Store a tender in the database.
@@ -1739,8 +1859,11 @@ def ingest_all_tenders(force: bool = False):
     all_tenders = []
     
     # Ingest from all sources (bulk fetch)
-    print("Ingesting from TED...")
-    all_tenders.extend(ingest_ted_tenders())
+    if not FILTER_UK_ONLY:
+        print("Ingesting from TED...")
+        all_tenders.extend(ingest_ted_tenders())
+    else:
+        print("Skipping TED ingestion because FILTER_UK_ONLY=1")
     
     print("Ingesting from Find a Tender...")
     all_tenders.extend(ingest_find_a_tender())
@@ -1791,6 +1914,12 @@ def ingest_all_tenders(force: bool = False):
         # Expired tenders will be filtered in the API endpoint, not during ingestion
         if published_parsed and published_parsed < cutoff:
             continue
+
+        # Optional filter to drop TED tenders completely when enabled
+        if FILTER_UK_ONLY:
+            source_name = (normalized.get("source") or "").lower()
+            if "ted" in source_name:
+                continue
 
         # Store tender (checks for duplicates automatically)
         tender_id = store_tender(normalized)

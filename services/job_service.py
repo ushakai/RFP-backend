@@ -11,7 +11,7 @@ from datetime import datetime
 from config.settings import get_supabase_client
 from services.excel_service import process_excel_file_obj, estimate_minutes_from_chars
 from services.gemini_service import extract_qa_pairs_from_sheet
-from services.supabase_service import insert_qa_pair
+from services.supabase_service import insert_qa_pair, fetch_question_answer_mappings
 
 
 def update_job_progress(job_id: str, progress: int, current_step: str, result_data: dict = None):
@@ -237,7 +237,7 @@ def _build_ai_groups_for_job(client_id: str, rfp_id: str | None):
             return {"groups": [], "message": "No questions found"}
 
         q_ids_local = [q["id"] for q in questions_local]
-        m_rows_local = supabase.table("client_question_answer_mappings").select("question_id, answer_id").in_("question_id", q_ids_local).execute().data or []
+        m_rows_local = fetch_question_answer_mappings(q_ids_local)
         q_to_a_local = {m["question_id"]: m["answer_id"] for m in m_rows_local}
 
         a_ids_local = list({aid for aid in q_to_a_local.values() if aid})

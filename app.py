@@ -26,7 +26,7 @@ from config.settings import (
 )
 
 # Import API routers
-from api import health, rfps, qa, jobs, drive, tenders, admin
+from api import health, rfps, qa, jobs, drive, tenders, admin, auth
 
 # Import notification function for background tasks
 from api.tenders import notify_client as _notify_client
@@ -68,6 +68,7 @@ app.add_middleware(
 )
 
 # Register API routers
+app.include_router(auth.router, tags=["Auth"])
 app.include_router(health.router, tags=["Health"])
 app.include_router(rfps.router, tags=["RFPs"])
 app.include_router(qa.router, tags=["Q&A"])
