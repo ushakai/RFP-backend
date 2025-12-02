@@ -9,8 +9,7 @@ from typing import Any, Dict, List
 from fpdf import FPDF
 
 import json
-import google.generativeai as genai
-from config.settings import FRONTEND_ORIGIN, UK_TIMEZONE, get_supabase_client, GEMINI_MODEL, FILTER_UK_ONLY
+from config.settings import FRONTEND_ORIGIN, UK_TIMEZONE, get_supabase_client, FILTER_UK_ONLY
 from services.email_service import send_email
 from services.tender_service import is_uk_tender, is_uk_specific_source
 
@@ -49,77 +48,37 @@ def _format_currency(amount, currency) -> str:
 
 def _generate_compelling_email_summary(tender_data: Dict[str, Any], full_data: Dict[str, Any] | None) -> str:
     """
-    Generate a compelling 4-5 line summary for email digest using AI.
-    This summary should be unique and not repeat information from title/bullets.
+    Generate a summary for email digest from tender data.
+    Uses the description and metadata - no AI calls.
     """
-    try:
-        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-        
-        # Prepare context for AI
-        title = tender_data.get("title", "")
-        description = tender_data.get("description", "") or tender_data.get("summary", "")
-        category = tender_data.get("category_label") or tender_data.get("category", "")
-        location = tender_data.get("location_name") or tender_data.get("location", "")
-        value = tender_data.get("value_amount")
-        deadline = tender_data.get("deadline", "")
-        
-        # Extract key info from full_data if available
-        scope_info = ""
-        deliverables = []
-        if isinstance(full_data, dict):
-            tender_info = full_data.get("tender") or {}
-            items = tender_info.get("items") or []
-            if items and isinstance(items, list):
-                for item in items[:5]:
-                    if isinstance(item, dict):
-                        desc = item.get("description") or ""
-                        if desc:
-                            deliverables.append(desc[:100])
-        
-        prompt = f"""Generate a compelling 4-5 line summary for a tender opportunity email. The summary should:
-1. Be unique and NOT repeat information from the title or basic metadata (category, location, value, deadline)
-2. Focus on WHAT the opportunity entails, WHY it matters, and WHAT the buyer needs
-3. Be persuasive and make the reader want to learn more
-4. Be concise (4-5 sentences, approximately 300-400 characters total)
-5. Highlight key requirements, scope, or unique aspects that aren't obvious from the title
-
-Tender Information:
-Title: {title}
-Description: {description[:500] if description else "No description available"}
-Category: {category}
-Location: {location}
-Value: {value if value else "Not disclosed"}
-Deadline: {deadline}
-Scope/Deliverables: {"; ".join(deliverables[:3]) if deliverables else "Not specified"}
-
-Generate ONLY the summary text (no labels, no formatting, just the compelling narrative):"""
-
-        response = gemini_model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.7,
-                "max_output_tokens": 500,
-            }
-        )
-        
-        summary = response.text.strip()
-        # Clean up any markdown or extra formatting
-        summary = summary.replace("**", "").replace("*", "").strip()
-        
-        # Ensure it's reasonable length (300-500 chars for 4-5 lines)
-        if len(summary) > 500:
-            # Truncate at sentence boundary
-            sentences = summary.split('. ')
-            summary = '. '.join(sentences[:4])
-            if not summary.endswith('.'):
-                summary += '.'
-        
-        return summary if summary else "This opportunity requires detailed review. View full tender details for complete information."
-    except Exception as e:
-        print(f"Error generating AI summary: {e}")
-        import traceback
-        traceback.print_exc()
-        return "This opportunity requires detailed review. View full tender details for complete information."
+    description = tender_data.get("description", "") or tender_data.get("summary", "")
+    category = tender_data.get("category_label") or tender_data.get("category", "")
+    location = tender_data.get("location_name") or tender_data.get("location", "")
+    
+    # Build a summary from available data
+    parts = []
+    
+    if description:
+        # Take first 300 chars of description for email summary
+        desc_short = description[:300].strip()
+        if len(description) > 300:
+            # Truncate at last space
+            last_space = desc_short.rfind(' ')
+            if last_space > 150:
+                desc_short = desc_short[:last_space] + "..."
+        parts.append(desc_short)
+    
+    if category and location:
+        parts.append(f"This {category.lower()} opportunity is based in {location}.")
+    elif category:
+        parts.append(f"This is a {category.lower()} procurement opportunity.")
+    elif location:
+        parts.append(f"This opportunity is based in {location}.")
+    
+    if parts:
+        return " ".join(parts)
+    
+    return "This opportunity requires detailed review. View full tender details for complete information."
 
 
 def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: datetime) -> str:
@@ -241,6 +200,85 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
     """
 
     return header + "".join(body_sections) + footer
+
+
+def _build_no_matches_email_html(client_name: str, keywords: List[str], uk_date: datetime) -> str:
+    """Build an email for users whose keywords matched no tenders."""
+    keywords_html = ""
+    if keywords:
+        keywords_html = "".join([
+            f'<span style="display:inline-block; padding:6px 14px; background-color:#fee2e2; color:#991b1b; font-size:13px; border-radius:8px; font-weight:500; margin:4px;">{kw}</span>'
+            for kw in keywords[:10]
+        ])
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin:0; padding:0; background-color:#f5f7fa; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f5f7fa; padding:40px 20px;">
+            <tr>
+                <td align="center">
+                    <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px; background-color:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 4px 6px rgba(0,0,0,0.1);">
+                        <!-- Header with gradient -->
+                        <tr>
+                            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding:40px 30px; text-align:center;">
+                                <h1 style="margin:0; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:-0.5px;">Daily Tender Digest</h1>
+                                <p style="margin:12px 0 0 0; color:#ffffff; font-size:16px; opacity:0.95;">{uk_date.strftime('%d %B %Y')}</p>
+                            </td>
+                        </tr>
+                        <!-- Content -->
+                        <tr>
+                            <td style="padding:40px 30px;">
+                                <p style="margin:0; color:#1a202c; font-size:16px; line-height:1.6;">Hello <strong>{client_name or 'there'}</strong>,</p>
+                                
+                                <div style="margin:24px 0; padding:24px; background-color:#fef2f2; border-radius:10px; border-left:4px solid #dc2626;">
+                                    <h2 style="margin:0 0 12px 0; color:#991b1b; font-size:18px; font-weight:600;">No Matches Found Today</h2>
+                                    <p style="margin:0; color:#7f1d1d; font-size:15px; line-height:1.6;">
+                                        Unfortunately, no new tenders matched your current keywords today. This could mean:
+                                    </p>
+                                    <ul style="margin:12px 0 0 0; padding-left:20px; color:#7f1d1d; font-size:14px; line-height:1.8;">
+                                        <li>Your keywords are too specific</li>
+                                        <li>No relevant tenders were published today</li>
+                                        <li>Your keywords might need updating</li>
+                                    </ul>
+                                </div>
+                                
+                                <div style="margin:24px 0;">
+                                    <p style="margin:0 0 12px 0; color:#4a5568; font-size:14px; font-weight:600;">Your current keywords:</p>
+                                    <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                                        {keywords_html if keywords_html else '<span style="color:#718096; font-style:italic;">No keywords set</span>'}
+                                    </div>
+                                </div>
+                                
+                                <div style="margin:32px 0 0 0; text-align:center;">
+                                    <a href="{FRONTEND_BASE}/tenders" style="display:inline-block; padding:14px 32px; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:#ffffff; text-decoration:none; border-radius:8px; font-weight:600; font-size:15px; box-shadow:0 2px 4px rgba(102, 126, 234, 0.3);">Update Your Keywords</a>
+                                </div>
+                                
+                                <p style="margin:24px 0 0 0; color:#718096; font-size:14px; line-height:1.6;">
+                                    <strong>Tip:</strong> Try using broader keywords or industry terms to increase your matches. You can also add multiple keyword variations.
+                                </p>
+                            </td>
+                        </tr>
+                        <!-- Footer -->
+                        <tr>
+                            <td style="padding:30px; background-color:#f8fafc; border-top:1px solid #e2e8f0; text-align:center;">
+                                <p style="margin:0; color:#718096; font-size:13px; line-height:1.6;">
+                                    You are receiving this email because you subscribed to daily tender updates.<br>
+                                    <a href="#" style="color:#667eea; text-decoration:none;">Manage preferences</a> | <a href="#" style="color:#667eea; text-decoration:none;">Unsubscribe</a>
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+    </body>
+    </html>
+    """
 
 
 def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]:
@@ -462,6 +500,26 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
             entries.append(entry_payload)
 
         if not entries:
+            # No matches found - get the user's keywords to include in the "no matches" email
+            keyword_data = next(
+                (row for row in (keyword_resp.data or []) if row.get("client_id") == client_id),
+                None
+            )
+            user_keywords = []
+            if keyword_data and isinstance(keyword_data.get("keywords"), list):
+                user_keywords = [kw for kw in keyword_data["keywords"] if isinstance(kw, str) and kw.strip()]
+            
+            payloads.append(
+                {
+                    "client_id": client_id,
+                    "client_name": client.get("name") or "",
+                    "email": email,
+                    "subject": f"Daily Tender Digest — {uk_now.strftime('%d %b %Y')}",
+                    "entries": [],
+                    "no_matches": True,
+                    "keywords": user_keywords,
+                }
+            )
             continue
 
         # Keep only the top 10 entries by match score
@@ -479,6 +537,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
                 "email": email,
                 "subject": f"Daily Tender Digest — {uk_now.strftime('%d %b %Y')}",
                 "entries": top_entries,
+                "no_matches": False,
             }
         )
 
@@ -573,7 +632,7 @@ def send_daily_digest_since(since_utc: datetime | None = None) -> Dict[str, int]
     payloads: List[Dict[str, Any]] = digest_bundle["payloads"]
     prepared_at: datetime = digest_bundle["prepared_at"]
 
-    summary = {"attempted": 0, "sent": 0}
+    summary = {"attempted": 0, "sent": 0, "no_matches": 0}
 
     for payload in payloads:
         email = payload.get("email")
@@ -581,7 +640,22 @@ def send_daily_digest_since(since_utc: datetime | None = None) -> Dict[str, int]
             continue
 
         summary["attempted"] += 1
-        html = _build_email_html(payload.get("client_name") or "", payload.get("entries") or [], prepared_at)
+        
+        # Check if this is a "no matches" email
+        if payload.get("no_matches"):
+            summary["no_matches"] += 1
+            html = _build_no_matches_email_html(
+                payload.get("client_name") or "",
+                payload.get("keywords") or [],
+                prepared_at
+            )
+        else:
+            html = _build_email_html(
+                payload.get("client_name") or "",
+                payload.get("entries") or [],
+                prepared_at
+            )
+        
         if send_email([email], payload.get("subject") or "Daily Tender Digest", html):
             summary["sent"] += 1
 

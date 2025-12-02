@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import threading
+import traceback
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -21,6 +23,15 @@ import api.tenders as tenders_api
 
 router = APIRouter(prefix="/admin")
 
+# Track background digest job status
+_digest_job_status: dict = {
+    "running": False,
+    "started_at": None,
+    "completed_at": None,
+    "result": None,
+    "error": None,
+}
+
 
 @router.get("/status")
 def admin_status(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
@@ -28,37 +39,100 @@ def admin_status(x_client_key: str | None = Header(default=None, alias="X-Client
     return {"is_admin": is_admin_client(client_id)}
 
 
+def _run_daily_cycle_background():
+    """Background worker for daily cycle - runs ingestion and digest."""
+    global _digest_job_status
+    try:
+        ingestion_module = importlib.import_module("tender_ingestion")
+        stored = matched = 0
+        new_ids: list[str] = []
+        
+        if ENABLE_TENDER_INGESTION:
+            stored, matched, new_ids = ingestion_module.ingest_all_tenders(force=True)
+            record_ingestion(datetime.now(timezone.utc))
+            for cid in list(tenders_api._client_streams.keys()):
+                _notify_client(cid, "matches-updated", {"reason": "ingestion"})
+        else:
+            print("ENABLE_TENDER_INGESTION disabled; skipping manual ingestion run.")
+
+        # Send digest for the last 24 hours by default
+        since_utc = datetime.now(timezone.utc) - timedelta(hours=24)
+        digest_summary = send_daily_digest_since(since_utc)
+        record_digest(datetime.now(UK_TIMEZONE).date())
+
+        _digest_job_status["result"] = {
+            "stored": stored,
+            "matched": matched,
+            "new_tenders": len(new_ids),
+            "emails_attempted": digest_summary["attempted"],
+            "emails_sent": digest_summary["sent"],
+            "no_matches_emails": digest_summary.get("no_matches", 0),
+        }
+        _digest_job_status["error"] = None
+        print(f"Daily cycle completed: {_digest_job_status['result']}")
+    except Exception as e:
+        _digest_job_status["error"] = str(e)
+        _digest_job_status["result"] = None
+        print(f"Daily cycle failed: {e}")
+        traceback.print_exc()
+    finally:
+        _digest_job_status["running"] = False
+        _digest_job_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+
 @router.post("/run-daily-cycle")
 def run_daily_cycle(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """
     Manually trigger the daily ingestion and digest email process.
+    Runs in background to avoid HTTP timeout issues.
+    """
+    global _digest_job_status
+    client_id = get_client_id_from_key(x_client_key)
+    if not is_admin_client(client_id):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Check if already running
+    if _digest_job_status["running"]:
+        return {
+            "status": "already_running",
+            "message": "Daily cycle is already in progress",
+            "started_at": _digest_job_status["started_at"],
+        }
+
+    # Start background job
+    _digest_job_status = {
+        "running": True,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    }
+    
+    thread = threading.Thread(target=_run_daily_cycle_background, daemon=True)
+    thread.start()
+
+    return {
+        "status": "started",
+        "message": "Daily cycle started in background. Check /admin/daily-cycle-status for progress.",
+        "started_at": _digest_job_status["started_at"],
+    }
+
+
+@router.get("/daily-cycle-status")
+def get_daily_cycle_status(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+    """
+    Check the status of the background daily cycle job.
     """
     client_id = get_client_id_from_key(x_client_key)
     if not is_admin_client(client_id):
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    ingestion_module = importlib.import_module("tender_ingestion")
-    stored = matched = 0
-    new_ids: list[str] = []
-    if ENABLE_TENDER_INGESTION:
-        stored, matched, new_ids = ingestion_module.ingest_all_tenders(force=True)
-        record_ingestion(datetime.now(timezone.utc))
-        for cid in list(tenders_api._client_streams.keys()):
-            _notify_client(cid, "matches-updated", {"reason": "ingestion"})
-    else:
-        print("ENABLE_TENDER_INGESTION disabled; skipping manual ingestion run.")
-
-    # Send digest for the last 24 hours by default
-    since_utc = datetime.now(timezone.utc) - timedelta(hours=24)
-    digest_summary = send_daily_digest_since(since_utc)
-    record_digest(datetime.now(UK_TIMEZONE).date())
-
     return {
-        "stored": stored,
-        "matched": matched,
-        "new_tenders": len(new_ids),
-        "emails_attempted": digest_summary["attempted"],
-        "emails_sent": digest_summary["sent"],
+        "running": _digest_job_status["running"],
+        "started_at": _digest_job_status["started_at"],
+        "completed_at": _digest_job_status["completed_at"],
+        "result": _digest_job_status["result"],
+        "error": _digest_job_status["error"],
     }
 
 
