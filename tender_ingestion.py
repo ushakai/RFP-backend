@@ -10,6 +10,7 @@ This should be run as a scheduled job (e.g., daily via cron or scheduled task).
 import os
 import json
 import time
+import math
 import requests
 from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Optional
@@ -28,13 +29,46 @@ from config.settings import UK_TIMEZONE, ENABLE_TENDER_INGESTION, FILTER_UK_ONLY
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().strip('"').strip("'")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip().strip('"').strip("'")
+# Use centralized Supabase client with connection management
+from config.settings import get_supabase_client, reinitialize_supabase
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set")
+def _get_supabase() -> Client:
+    """Get a fresh Supabase client, reinitializing if needed to avoid stale HTTP/2 connections."""
+    return get_supabase_client()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# For backwards compatibility - use function to get fresh client
+supabase: Client = _get_supabase()
+
+
+def _with_retry(operation, max_attempts: int = 3, operation_name: str = "Supabase operation"):
+    """
+    Execute a Supabase operation with retry logic for transient HTTP/2 connection errors.
+    Reinitializes the Supabase client on connection failures.
+    """
+    import httpx
+    global supabase
+    
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return operation()
+        except (httpx.RemoteProtocolError, httpx.HTTPError) as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                print(f"WARNING: {operation_name} attempt {attempt + 1} failed: {exc}")
+                # Reinitialize client to get fresh connection
+                reinitialize_supabase()
+                supabase = _get_supabase()
+                time.sleep(0.3 * (attempt + 1))
+            else:
+                print(f"ERROR: {operation_name} failed after {max_attempts} attempts: {exc}")
+        except Exception as exc:
+            # For non-connection errors, don't retry
+            raise exc
+    
+    if last_exc:
+        raise last_exc
+
 
 LOOKBACK_DAYS = int(os.getenv("TENDER_LOOKBACK_DAYS", "7"))
 SAM_GOV_API_KEY = os.getenv("SAM_GOV_API_KEY", "").strip().strip('"').strip("'")
@@ -1517,7 +1551,8 @@ def _already_ingested_today(force: bool) -> tuple[bool, date]:
     if force:
         return False, today_uk
     try:
-        res = supabase.table("tender_ingestion_log").select("id").eq("ingested_date", str(today_uk)).limit(1).execute()
+        client = _get_supabase()
+        res = client.table("tender_ingestion_log").select("id").eq("ingested_date", str(today_uk)).limit(1).execute()
         if res.data:
             return True, today_uk
     except Exception as exc:
@@ -1527,7 +1562,8 @@ def _already_ingested_today(force: bool) -> tuple[bool, date]:
 
 def _record_ingestion_date(ingested_date: date):
     try:
-        supabase.table("tender_ingestion_log").upsert(
+        client = _get_supabase()
+        client.table("tender_ingestion_log").upsert(
             {
                 "ingested_date": str(ingested_date),
                 "ingested_at": datetime.now(timezone.utc).isoformat(),
@@ -1757,31 +1793,105 @@ def _is_uk_tender(tender_data: Dict[str, Any]) -> bool:
     return False
 
 
+def _sanitize_for_supabase(value):
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return float(value)
+    if isinstance(value, Decimal):
+        numeric = float(value)
+        if math.isnan(numeric) or math.isinf(numeric):
+            return None
+        return numeric
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _sanitize_for_supabase(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_supabase(item) for item in value]
+    return value
+
+
 def store_tender(tender_data: Dict[str, Any]) -> str | None:
     """
-    Store a tender in the database.
+    Store a tender in the database with retry logic for connection errors.
     Returns the tender ID if stored, None otherwise.
     """
-    try:
-        # Insert new tender
-        res = supabase.table("tenders").insert(tender_data).execute()
-        
-        if res.data:
-            tender_id = res.data[0]["id"]
-            return tender_id
-        return None
-    except PostgrestAPIError as e:
-        payload = e.args[0] if e.args else {}
-        if isinstance(payload, dict) and payload.get("code") == "23505":
-            # Duplicate key - ignore for now
+    import httpx
+    global supabase
+    
+    cleaned_payload = _sanitize_for_supabase(tender_data) or {}
+    source = cleaned_payload.get("source")
+    external_id = cleaned_payload.get("external_id")
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            # Get fresh client reference
+            client = _get_supabase()
+            
+            if source and external_id:
+                existing = (
+                    client.table("tenders")
+                    .select("id")
+                    .eq("source", source)
+                    .eq("external_id", external_id)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    return existing.data[0]["id"]
+
+            # Insert new tender
+            res = client.table("tenders").insert(cleaned_payload).execute()
+            
+            if res.data:
+                tender_id = res.data[0]["id"]
+                return tender_id
             return None
-        print(f"Error storing tender: {payload or e}")
-        traceback.print_exc()
-        return None
-    except Exception as e:
-        print(f"Error storing tender: {e}")
-        traceback.print_exc()
-        return None
+        except (httpx.RemoteProtocolError, httpx.HTTPError) as e:
+            if attempt < max_attempts - 1:
+                print(f"WARNING: store_tender connection error (attempt {attempt + 1}): {e}")
+                reinitialize_supabase()
+                supabase = _get_supabase()
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            print(f"Error storing tender after {max_attempts} attempts: {e}")
+            return None
+        except PostgrestAPIError as e:
+            payload = e.args[0] if e.args else {}
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                if code == "23505" and source and external_id:
+                    # Duplicate - try to get existing ID
+                    try:
+                        client = _get_supabase()
+                        existing = (
+                            client.table("tenders")
+                            .select("id")
+                            .eq("source", source)
+                            .eq("external_id", external_id)
+                            .limit(1)
+                            .execute()
+                        )
+                        if existing.data:
+                            return existing.data[0]["id"]
+                    except Exception:
+                        pass
+                    return None
+                if code == "PGRST102":
+                    print(f"Warning: Supabase rejected tender payload as invalid JSON for {source}:{external_id}")
+                    return None
+            print(f"Error storing tender: {payload or e}")
+            return None
+        except Exception as e:
+            print(f"Error storing tender: {e}")
+            traceback.print_exc()
+            return None
+    
+    return None
 
 
 def match_tender_against_keywords(tender_data: Dict[str, Any], keyword_set: Dict[str, Any]) -> tuple[bool, float, list]:
@@ -1798,46 +1908,67 @@ def match_tender_against_keywords(tender_data: Dict[str, Any], keyword_set: Dict
 def process_tender_matches(tender_id: str, tender_data: Dict[str, Any]):
     """
     Match a tender against all active keyword sets and create match records.
+    Uses retry logic for transient connection errors.
     """
-    try:
-        # Get all active keyword sets
-        keyword_sets_res = supabase.table("user_tender_keywords").select("*").eq("is_active", True).execute()
-        keyword_sets = keyword_sets_res.data or []
-        
-        summary_updated = False
-
-        for keyword_set in keyword_sets:
-            is_match, match_score, matched_keywords = match_tender_against_keywords(tender_data, keyword_set)
+    import httpx
+    global supabase
+    
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            client = _get_supabase()
             
-            if is_match:
-                if ANON_SUMMARY_MODE in {"matched", "all"} and not tender_data.get("summary") and not summary_updated:
-                    try:
-                        summary_text = generate_anonymised_summary(tender_data)
-                        if summary_text:
-                            supabase.table("tenders").update({"summary": summary_text}).eq("id", tender_id).execute()
-                            tender_data["summary"] = summary_text
-                            summary_updated = True
-                    except Exception as summary_error:
-                        print(f"Warning: failed to persist summary for tender {tender_id}: {summary_error}")
+            # Get all active keyword sets
+            keyword_sets_res = client.table("user_tender_keywords").select("*").eq("is_active", True).execute()
+            keyword_sets = keyword_sets_res.data or []
+            
+            summary_updated = False
 
-                # Create match record
-                match_data = {
-                    "tender_id": tender_id,
-                    "client_id": keyword_set["client_id"],
-                    "keyword_set_id": keyword_set["id"],
-                    "match_score": match_score,
-                    "matched_keywords": matched_keywords,
-                }
+            for keyword_set in keyword_sets:
+                is_match, match_score, matched_keywords = match_tender_against_keywords(tender_data, keyword_set)
                 
-                # Check if match already exists
-                existing = supabase.table("tender_matches").select("id").eq("tender_id", tender_id).eq("client_id", keyword_set["client_id"]).eq("keyword_set_id", keyword_set["id"]).execute()
-                
-                if not existing.data:
-                    supabase.table("tender_matches").insert(match_data).execute()
-                    print(f"Created match for tender {tender_id} and client {keyword_set['client_id']}")
-    except Exception as e:
-        print(f"Error processing tender matches: {e}")
-        traceback.print_exc()
+                if is_match:
+                    if ANON_SUMMARY_MODE in {"matched", "all"} and not tender_data.get("summary") and not summary_updated:
+                        try:
+                            summary_text = generate_anonymised_summary(tender_data)
+                            if summary_text:
+                                client.table("tenders").update({"summary": summary_text}).eq("id", tender_id).execute()
+                                tender_data["summary"] = summary_text
+                                summary_updated = True
+                        except Exception as summary_error:
+                            print(f"Warning: failed to persist summary for tender {tender_id}: {summary_error}")
+
+                    # Create match record
+                    match_data = {
+                        "tender_id": tender_id,
+                        "client_id": keyword_set["client_id"],
+                        "keyword_set_id": keyword_set["id"],
+                        "match_score": match_score,
+                        "matched_keywords": matched_keywords,
+                    }
+                    
+                    # Check if match already exists
+                    existing = client.table("tender_matches").select("id").eq("tender_id", tender_id).eq("client_id", keyword_set["client_id"]).eq("keyword_set_id", keyword_set["id"]).execute()
+                    
+                    if not existing.data:
+                        client.table("tender_matches").insert(match_data).execute()
+                        print(f"Created match for tender {tender_id} and client {keyword_set['client_id']}")
+            
+            # Success - exit retry loop
+            return
+            
+        except (httpx.RemoteProtocolError, httpx.HTTPError) as e:
+            if attempt < max_attempts - 1:
+                print(f"WARNING: process_tender_matches connection error (attempt {attempt + 1}): {e}")
+                reinitialize_supabase()
+                supabase = _get_supabase()
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            print(f"Error processing tender matches after {max_attempts} attempts: {e}")
+        except Exception as e:
+            print(f"Error processing tender matches: {e}")
+            traceback.print_exc()
+            return
 
 
 def ingest_all_tenders(force: bool = False):
@@ -1923,17 +2054,15 @@ def ingest_all_tenders(force: bool = False):
 
         # Store tender (checks for duplicates automatically)
         tender_id = store_tender(normalized)
-        
+
         if tender_id:
-            # Check if this is a new tender (not a duplicate we already had)
-            existing_check = supabase.table("tenders").select("created_at").eq("id", tender_id).execute()
-            if existing_check.data:
-                created_at = existing_check.data[0].get("created_at")
-                if created_at:
-                    created_dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-                    # If created within last minute, it's new
-                    if (now_utc - created_dt).total_seconds() < 60:
-                        new_tender_ids.append(tender_id)
+            # Treat all successfully stored tenders as candidates for matching.
+            # Duplicate detection is already handled inside store_tender via the
+            # (source, external_id) unique constraint, so this will not create
+            # duplicate rows, only potentially re-run matching on existing ones,
+            # which is safe and much more robust than performing additional
+            # Supabase lookups that can fail with transient connection errors.
+            new_tender_ids.append(tender_id)
             stored_count += 1
     
     print(f"Tender ingestion completed: {stored_count} new tenders stored (after duplicate detection)")
@@ -1943,10 +2072,30 @@ def ingest_all_tenders(force: bool = False):
         print(f"Matching {len(new_tender_ids)} new tenders against all user keywords...")
         matched_count = 0
         for tender_id in new_tender_ids:
-            # Get tender data for matching
-            tender_res = supabase.table("tenders").select("*").eq("id", tender_id).execute()
-            if tender_res.data:
-                tender_data = tender_res.data[0]
+            # Get tender data for matching with retry logic
+            tender_data = None
+            for attempt in range(3):
+                try:
+                    client = _get_supabase()
+                    tender_res = client.table("tenders").select("*").eq("id", tender_id).execute()
+                    if tender_res.data:
+                        tender_data = tender_res.data[0]
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        print(f"WARNING: Failed to fetch tender {tender_id} (attempt {attempt + 1}): {e}")
+                        reinitialize_supabase()
+                        time.sleep(0.3 * (attempt + 1))
+                    else:
+                        print(f"ERROR: Could not fetch tender {tender_id} after 3 attempts")
+            
+            if tender_data:
+                # Extract location_name from metadata for matching
+                metadata = tender_data.get("metadata") or {}
+                if isinstance(metadata, dict):
+                    location_name = metadata.get("location_name")
+                    if location_name:
+                        tender_data["location_name"] = location_name
                 process_tender_matches(tender_id, tender_data)
             matched_count += 1
         print(f"Keyword matching completed: {matched_count} tenders matched against user keywords")

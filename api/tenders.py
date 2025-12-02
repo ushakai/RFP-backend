@@ -7,6 +7,7 @@ import traceback
 import importlib
 import threading
 import time
+import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -19,11 +20,16 @@ from utils.auth import get_client_id_from_key
 from config.settings import get_supabase_client, reinitialize_supabase, ENABLE_PAYMENT, FILTER_UK_ONLY
 from services.tender_service import rematch_for_client
 from services.gemini_service import summarize_tender_for_paid_view
+from utils.logging_config import get_logger
 
 router = APIRouter()
+logger = get_logger(__name__, "app")
 
 _TENDERS_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 180  # 3 minutes of cached data per client
+_MATCHED_CACHE: Dict[str, Dict[str, Any]] = {}
+_PURCHASED_CACHE: Dict[str, Dict[str, Any]] = {}
+_KEYWORDS_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = 1800  # 30 minutes of cached data per client (increased for production)
 
 # Client notification streams
 _client_streams: dict[str, list[asyncio.Queue]] = {}
@@ -102,9 +108,80 @@ def _set_cached_tenders(client_id: str, data: List[dict]) -> None:
     }
 
 
+def _get_cached_matched(client_id: str) -> Optional[List[dict]]:
+    entry = _MATCHED_CACHE.get(client_id)
+    if not entry:
+        return None
+    ts = entry.get("timestamp")
+    if not ts:
+        return None
+    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
+        return None
+    data = entry.get("data")
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _set_cached_matched(client_id: str, data: List[dict]) -> None:
+    _MATCHED_CACHE[client_id] = {
+        "timestamp": datetime.now(timezone.utc),
+        "data": data,
+    }
+
+
+def _get_cached_purchased(client_id: str) -> Optional[List[dict]]:
+    entry = _PURCHASED_CACHE.get(client_id)
+    if not entry:
+        return None
+    ts = entry.get("timestamp")
+    if not ts:
+        return None
+    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
+        return None
+    data = entry.get("data")
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _set_cached_purchased(client_id: str, data: List[dict]) -> None:
+    _PURCHASED_CACHE[client_id] = {
+        "timestamp": datetime.now(timezone.utc),
+        "data": data,
+    }
+
+
+def _get_cached_keywords(client_id: str) -> Optional[dict]:
+    entry = _KEYWORDS_CACHE.get(client_id)
+    if not entry:
+        return None
+    ts = entry.get("timestamp")
+    if not ts:
+        return None
+    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
+        return None
+    return entry.get("data")
+
+
+def _set_cached_keywords(client_id: str, data: dict) -> None:
+    _KEYWORDS_CACHE[client_id] = {
+        "timestamp": datetime.now(timezone.utc),
+        "data": data,
+    }
+
+
+def _invalidate_client_caches(client_id: str) -> None:
+    """Invalidate all caches for a client when data changes"""
+    _TENDERS_CACHE.pop(client_id, None)
+    _MATCHED_CACHE.pop(client_id, None)
+    _PURCHASED_CACHE.pop(client_id, None)
+    _KEYWORDS_CACHE.pop(client_id, None)
+
+
 def _fetch_client_keyword_set(supabase, client_id: str):
     res = supabase.table("user_tender_keywords")\
-        .select("*")\
+        .select("id, client_id, keywords, categories, sectors, locations, min_value, max_value, is_active, created_at, updated_at")\
         .eq("client_id", client_id)\
         .eq("is_active", True)\
         .order("created_at", desc=True)\
@@ -129,35 +206,51 @@ def _with_supabase_retry(operation, attempts: int = 5, delay: float = 0.2):
             error_type = type(exc).__name__
             
             # Check if this is a network/connection error that should be retried
+            # Include HTTP/2 deque mutation errors and protocol errors
             is_retryable = (
                 isinstance(exc, (httpx.HTTPError, httpx.ReadError, httpx.ConnectError, httpx.TimeoutException,
-                                APIError, ConnectionError, OSError)) or
+                                httpx.RemoteProtocolError, httpx.ProtocolError, httpx.NetworkError,
+                                APIError, ConnectionError, OSError, RuntimeError,
+                                httpcore.RemoteProtocolError, httpcore.ProtocolError, httpcore.NetworkError)) or
                 "ReadError" in error_type or
                 "ConnectError" in error_type or
+                "RemoteProtocolError" in error_type or
+                "ProtocolError" in error_type or
+                "NetworkError" in error_type or
+                "deque mutated" in error_msg.lower() or
+                "deque" in error_msg.lower() or
                 "WinError 10035" in error_msg or
                 "non-blocking socket" in error_msg.lower() or
-                "connection" in error_msg.lower()
+                "connection" in error_msg.lower() or
+                "connection terminated" in error_msg.lower() or
+                "stream" in error_msg.lower()
             )
             
             # Windows socket error - use longer delay
             is_windows_socket_error = "WinError 10035" in error_msg or "non-blocking socket" in error_msg.lower()
             
             if is_retryable and attempt < attempts - 1:
-                # Longer delay for Windows socket errors
-                base_delay = delay * (attempt + 1)
-                wait_time = base_delay * (3.0 if is_windows_socket_error else 1.0)
+                # Longer delay for Windows socket errors and protocol errors
+                base_delay = delay * (2 ** attempt)  # Exponential backoff
+                wait_time = base_delay * (3.0 if is_windows_socket_error else 1.5)
+                wait_time = min(wait_time, 5.0)  # Cap at 5 seconds
                 
-                if is_windows_socket_error:
-                    print(f"WARNING: Windows socket error detected (attempt {attempt + 1}/{attempts}), retrying in {wait_time:.2f}s...")
-                else:
-                    print(f"WARNING: Supabase operation failed (attempt {attempt + 1}/{attempts}): {error_type}")
+                # Only log on first retry to reduce noise
+                if attempt == 0:
+                    if is_windows_socket_error:
+                        print(f"WARNING: Windows socket error detected, retrying in {wait_time:.2f}s...")
+                    elif "deque" in error_msg.lower() or "protocol" in error_type.lower():
+                        print(f"WARNING: Connection protocol error detected, retrying in {wait_time:.2f}s...")
+                    else:
+                        print(f"WARNING: Supabase operation failed, retrying in {wait_time:.2f}s...")
                 
                 time.sleep(wait_time)
                 
-                # Reinitialize Supabase connection on retry (but not on first retry to avoid overhead)
+                # Reinitialize Supabase connection on retry to get fresh connection
                 if attempt >= 1:
                     try:
                         reinitialize_supabase()
+                        time.sleep(0.1)  # Brief pause after reinit
                     except Exception:
                         pass  # Ignore reinit errors
                 continue
@@ -187,30 +280,37 @@ def _ensure_tender_visible(source: str | None):
 
 def _ingest_recent_tenders():
     """
-    Refresh tender data (past week) so newly saved keywords have a complete match set.
-    Safe to call multiple times; duplicates are ignored at the database layer.
+    DISABLED: Previously triggered full ingestion on keyword updates.
+    This caused repeated ingestion cycles and connection pool exhaustion.
+    
+    Tenders are now ingested on a scheduled basis (daily at 07:00 UK time).
+    When keywords are updated, we only run rematch_for_client() which matches
+    existing tenders against the new keywords without fetching new data.
     """
-    try:
-        ingestion_module = importlib.import_module("tender_ingestion")
-        stored, matched, _ = ingestion_module.ingest_all_tenders(force=True)
-        print(f"Keyword update triggered tender ingestion refresh: stored={stored}, matched={matched}")
-    except Exception as exc:
-        print(f"WARNING: Unable to refresh tenders during keyword update: {exc}")
-        traceback.print_exc()
+    # Intentionally disabled - ingestion should only run on schedule
+    # Keyword updates now only trigger rematch_for_client() in background
+    pass
 
 
 def _schedule_tender_refresh():
-    try:
-        thread = threading.Thread(target=_ingest_recent_tenders, daemon=True)
-        thread.start()
-    except Exception as exc:
-        print(f"WARNING: Unable to schedule tender refresh thread: {exc}")
+    """
+    DISABLED: No longer triggers ingestion on keyword updates.
+    Rematching is handled separately via rematch_for_client().
+    """
+    # Intentionally disabled - see _ingest_recent_tenders() docstring
+    pass
 
 
 @router.get("/tenders/keywords")
 def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get the keyword set for the client (single set)."""
     client_id = get_client_id_from_key(x_client_key)
+    
+    # Check cache first
+    cached = _get_cached_keywords(client_id)
+    if cached is not None:
+        return cached
+    
     try:
         def fetch_keywords():
             supabase = get_supabase_client()
@@ -218,7 +318,7 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
 
         record = _with_supabase_retry(fetch_keywords)
         if not record:
-            return {
+            result = {
                 "client_id": client_id,
                 "keywords": [],
                 "categories": [],
@@ -228,7 +328,11 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
                 "max_value": None,
                 "is_active": True,
             }
-        return record
+        else:
+            result = record
+        
+        _set_cached_keywords(client_id, result)
+        return result
     except Exception as e:
         print(f"Error getting tender keywords: {e}")
         traceback.print_exc()
@@ -660,14 +764,16 @@ def upsert_tender_keyword(
     """Create or replace the client's keyword set."""
     client_id = get_client_id_from_key(x_client_key)
     keyword_data = _normalize_keyword_payload(client_id, payload)
-
-    # Require at least one of: keywords, locations, or industries
-    has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
-    has_locations = keyword_data.get("locations") and len(keyword_data["locations"]) > 0
-    has_industries = keyword_data.get("sectors") and len(keyword_data["sectors"]) > 0
     
-    if not (has_keywords or has_locations or has_industries):
-        raise HTTPException(status_code=400, detail="At least one keyword, location, or industry is required")
+    logger.info(f"POST /tenders/keywords - client_id={client_id[:8]}... keywords={keyword_data.get('keywords')}")
+    print(f">>>>>> POST /tenders/keywords - keywords={keyword_data.get('keywords')}", flush=True)
+    sys.stdout.flush()
+
+    # Require at least one keyword (location and industry are optional filters)
+    has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
+    
+    if not has_keywords:
+        raise HTTPException(status_code=400, detail="At least one keyword is required")
     
     try:
         existing = _with_supabase_retry(
@@ -689,17 +795,30 @@ def upsert_tender_keyword(
 
         if res.data:
             _schedule_tender_refresh()
-            # Run rematching in background thread to avoid blocking the response
-            def _rematch_in_background():
-                try:
-                    rematch_for_client(client_id)
-                    notify_client(client_id, "matches-updated", {"reason": "keywords-upserted"})
-                except Exception as e:
-                    print(f"Error in background rematch for client {client_id}: {e}")
-                    traceback.print_exc()
+            # Invalidate caches
+            _invalidate_client_caches(client_id)
             
-            thread = threading.Thread(target=_rematch_in_background, daemon=True)
-            thread.start()
+            # Run rematching SYNCHRONOUSLY so the frontend can show loading state
+            # This is faster than before because AI enhancement is disabled during rematch
+            try:
+                logger.info(f"Starting synchronous rematch for client {client_id[:8]}...")
+                print(f">>>>>> Starting synchronous rematch for client {client_id[:8]}...", flush=True)
+                sys.stdout.flush()
+                
+                created = rematch_for_client(client_id)
+                
+                logger.info(f"Rematch complete: {created} matches created")
+                print(f">>>>>> Rematch complete: {created} matches created", flush=True)
+                sys.stdout.flush()
+                
+                # Notify connected clients about the update
+                notify_client(client_id, "matches-updated", {"reason": "keywords-upserted"})
+            except Exception as e:
+                logger.error(f"Error in rematch for client {client_id}: {e}")
+                print(f">>>>>> ERROR in rematch: {e}", flush=True)
+                traceback.print_exc()
+                sys.stdout.flush()
+            
             return res.data[0]
         raise HTTPException(status_code=500, detail="Failed to store tender keywords")
     except HTTPException:
@@ -724,7 +843,9 @@ def update_tender_keyword(
     keyword_data = _normalize_keyword_payload(client_id, payload)
     keyword_data["updated_at"] = datetime.now().isoformat()
 
-    if "keywords" in payload and not keyword_data["keywords"]:
+    # Require at least one keyword (location and industry are optional filters)
+    has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
+    if not has_keywords:
         raise HTTPException(status_code=400, detail="At least one keyword is required")
 
     try:
@@ -745,20 +866,30 @@ def update_tender_keyword(
         if not res.data:
             raise HTTPException(status_code=404, detail="Keyword set not found")
 
-        if keyword_data["keywords"]:
-            _schedule_tender_refresh()
+        _schedule_tender_refresh()
 
-        # Run rematching in background thread to avoid blocking the response
-        def _rematch_in_background():
-            try:
-                rematch_for_client(client_id)
-                notify_client(client_id, "matches-updated", {"reason": "keywords-updated"})
-            except Exception as e:
-                print(f"Error in background rematch for client {client_id}: {e}")
-                traceback.print_exc()
+        # Invalidate caches
+        _invalidate_client_caches(client_id)
         
-        thread = threading.Thread(target=_rematch_in_background, daemon=True)
-        thread.start()
+        # Run rematching SYNCHRONOUSLY so the frontend can show loading state
+        try:
+            logger.info(f"Starting synchronous rematch for client {client_id[:8]}... (PUT)")
+            print(f">>>>>> Starting synchronous rematch for client {client_id[:8]}... (PUT)", flush=True)
+            sys.stdout.flush()
+            
+            created = rematch_for_client(client_id)
+            
+            logger.info(f"Rematch complete (PUT): {created} matches created")
+            print(f">>>>>> Rematch complete (PUT): {created} matches created", flush=True)
+            sys.stdout.flush()
+            
+            notify_client(client_id, "matches-updated", {"reason": "keywords-updated"})
+        except Exception as e:
+            logger.error(f"Error in rematch for client {client_id}: {e}")
+            print(f">>>>>> ERROR in rematch (PUT): {e}", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+        
         return res.data[0]
     except HTTPException:
         raise
@@ -784,6 +915,8 @@ def delete_tender_keyword(
                 lambda: get_supabase_client().table("user_tender_keywords").delete().eq("id", existing["id"]).execute()
             )
         
+        # Invalidate caches
+        _invalidate_client_caches(client_id)
         # Run rematching in background thread to avoid blocking the response
         def _rematch_in_background():
             try:
@@ -814,8 +947,8 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         def fetch_tenders():
             supabase = get_supabase_client()
             query = supabase.table("tenders").select(
-                "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata, full_data"
-            ).gte("published_date", lookback).order("published_date", desc=True)
+                "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata"
+            ).gte("published_date", lookback).eq("is_duplicate", False).order("published_date", desc=True)
             query = query.or_(f"deadline.is.null,deadline.gte.{now_iso}")
             if FILTER_UK_ONLY:
                 query = query.not_.ilike("source", "%ted%")
@@ -827,7 +960,7 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         def fetch_matches():
             supabase = get_supabase_client()
             return supabase.table("tender_matches").select(
-                "id, tender_id, match_score, matched_keywords"
+                "id, tender_id, match_score, matched_keywords, created_at"
             ).eq("client_id", client_id).execute()
 
         matches_res = _with_supabase_retry(fetch_matches)
@@ -836,7 +969,7 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         def fetch_access():
             supabase = get_supabase_client()
             return supabase.table("tender_access").select(
-                "tender_id, payment_status"
+                "tender_id, payment_status, access_granted_at"
             ).eq("client_id", client_id).eq("payment_status", "completed").execute()
 
         access_res = _with_supabase_retry(fetch_access)
@@ -852,71 +985,81 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         def build_cards(enforce_uk_filter: bool) -> list[dict]:
             cards: list[dict] = []
             for tender in tenders:
-                tender_id = tender.get("id")
-                if not tender_id:
+                try:
+                    tender_id = tender.get("id")
+                    if not tender_id:
+                        continue
+
+                    if enforce_uk_filter and FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
+                        continue
+
+                    metadata = tender.get("metadata") or {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    location_name = metadata.get("location_name") or tender.get("location")
+                    category_label = metadata.get("category_label") or tender.get("category")
+                    title = _enrich_title(
+                        tender.get("title"),
+                        category_label,
+                        tender.get("category"),
+                        location_name,
+                        tender.get("location"),
+                    )
+
+                    match = match_map.get(tender_id)
+                    match_score = 0.0
+                    matched_keywords: list[str] = []
+                    match_id = None
+
+                    if match:
+                        try:
+                            match_score = float(match.get("match_score") or 0.0)
+                        except (TypeError, ValueError):
+                            match_score = 0.0
+                        mk = match.get("matched_keywords")
+                        if isinstance(mk, list):
+                            matched_keywords = mk
+                        match_id = match.get("id")
+
+                    summary_preview = _derive_summary_preview({**tender, "metadata": metadata})
+
+                    cards.append(
+                        {
+                            "id": tender_id,
+                            "match_id": match_id,
+                            "title": title,
+                            "summary": tender.get("summary", ""),
+                            "summary_preview": summary_preview,
+                            "description": tender.get("description", ""),
+                            "source": tender.get("source", ""),
+                            "deadline": tender.get("deadline"),
+                            "published_date": tender.get("published_date"),
+                            "value_amount": tender.get("value_amount"),
+                            "value_currency": tender.get("value_currency"),
+                            "location": tender.get("location"),
+                            "location_name": location_name,
+                            "category": tender.get("category"),
+                            "category_label": category_label,
+                            "match_score": match_score,
+                            "matched_keywords": matched_keywords,
+                            "is_matched": bool(match),
+                            "has_access": access_map.get(tender_id, False),
+                        }
+                    )
+                except Exception as e:
+                    # Skip individual tender errors - don't break entire request
+                    print(f"Warning: Error processing tender {tender.get('id', 'unknown')}: {e}")
                     continue
-
-                if enforce_uk_filter and FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
-                    continue
-
-                metadata = tender.get("metadata") or {}
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                location_name = metadata.get("location_name") or tender.get("location")
-                category_label = metadata.get("category_label") or tender.get("category")
-                title = _enrich_title(
-                    tender.get("title"),
-                    category_label,
-                    tender.get("category"),
-                    location_name,
-                    tender.get("location"),
-                )
-
-                match = match_map.get(tender_id)
-                match_score = 0.0
-                matched_keywords: list[str] = []
-                match_id = None
-
-                if match:
-                    try:
-                        match_score = float(match.get("match_score") or 0.0)
-                    except (TypeError, ValueError):
-                        match_score = 0.0
-                    mk = match.get("matched_keywords")
-                    if isinstance(mk, list):
-                        matched_keywords = mk
-                    match_id = match.get("id")
-
-                summary_preview = _derive_summary_preview({**tender, "metadata": metadata})
-
-                cards.append(
-                    {
-                        "id": tender_id,
-                        "match_id": match_id,
-                        "title": title,
-                        "summary": tender.get("summary", ""),
-                        "summary_preview": summary_preview,
-                        "description": tender.get("description", ""),
-                        "source": tender.get("source", ""),
-                        "deadline": tender.get("deadline"),
-                        "published_date": tender.get("published_date"),
-                        "value_amount": tender.get("value_amount"),
-                        "value_currency": tender.get("value_currency"),
-                        "location": tender.get("location"),
-                        "location_name": location_name,
-                        "category": tender.get("category"),
-                        "category_label": category_label,
-                        "match_score": match_score,
-                        "matched_keywords": matched_keywords,
-                        "is_matched": bool(match),
-                        "has_access": access_map.get(tender_id, False),
-                    }
-                )
             return cards
 
         return build_cards(enforce_uk_filter=True)
 
     try:
+        # Check cache first
+        cached = _get_cached_tenders(client_id)
+        if cached is not None:
+            return cached
+        
         results = build_response()
         _set_cached_tenders(client_id, results)
         return results
@@ -944,12 +1087,23 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
     except Exception as e:
         print(f"Error getting all tenders: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to get tenders")
+        # Try to return cached data if available, otherwise return empty list
+        cached = _get_cached_tenders(client_id)
+        if cached is not None:
+            print("WARNING: Returning cached tender data due to error.")
+            return cached
+        # Return empty list instead of crashing - graceful degradation for production
+        return []
 
 
 @router.get("/tenders/purchased")
 def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     client_id = get_client_id_from_key(x_client_key)
+
+    # Check cache first
+    cached = _get_cached_purchased(client_id)
+    if cached is not None:
+        return cached
 
     try:
         def fetch_access():
@@ -976,6 +1130,7 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
                     "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata"
                 )
                 .in_("id", tender_ids)
+                .eq("is_duplicate", False)
                 .order("published_date", desc=True)
             )
             if FILTER_UK_ONLY:
@@ -999,69 +1154,83 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
         match_map: dict[str, dict] = {row["tender_id"]: row for row in (matches_res.data or []) if row.get("tender_id")}
 
         results = []
+        now_utc = datetime.now(timezone.utc)
         for tender in tenders:
-            tender_id = tender.get("id")
-            if not tender_id:
-                continue
-            if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
-                continue
-            
-            # Purchased tenders are always shown regardless of UK filter
-            # (User has already paid for them, so they should see them)
-            
-            metadata = tender.get("metadata") or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            location_name = metadata.get("location_name") or tender.get("location")
-            category_label = metadata.get("category_label") or tender.get("category")
-            title = _enrich_title(
-                tender.get("title"),
-                category_label,
-                tender.get("category"),
-                location_name,
-                tender.get("location"),
-            )
+            try:
+                tender_id = tender.get("id")
+                if not tender_id:
+                    continue
+                if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
+                    continue
+                
+                # Filter expired tenders
+                deadline = tender.get("deadline")
+                if deadline:
+                    try:
+                        deadline_dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+                        if deadline_dt < now_utc:
+                            continue
+                    except Exception:
+                        pass
+                
+                metadata = tender.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                location_name = metadata.get("location_name") or tender.get("location")
+                category_label = metadata.get("category_label") or tender.get("category")
+                title = _enrich_title(
+                    tender.get("title"),
+                    category_label,
+                    tender.get("category"),
+                    location_name,
+                    tender.get("location"),
+                )
 
-            match = match_map.get(tender_id)
-            if match:
-                try:
-                    match_score = float(match.get("match_score") or 0.0)
-                except (TypeError, ValueError):
+                match = match_map.get(tender_id)
+                if match:
+                    try:
+                        match_score = float(match.get("match_score") or 0.0)
+                    except (TypeError, ValueError):
+                        match_score = 0.0
+                    matched_keywords = match.get("matched_keywords") if isinstance(match.get("matched_keywords"), list) else []
+                else:
                     match_score = 0.0
-                matched_keywords = match.get("matched_keywords") if isinstance(match.get("matched_keywords"), list) else []
-            else:
-                match_score = 0.0
-                matched_keywords = []
+                    matched_keywords = []
 
-            summary_preview = _derive_summary_preview({
-                **tender,
-                "metadata": metadata,
-            })
+                summary_preview = _derive_summary_preview({
+                    **tender,
+                    "metadata": metadata,
+                })
 
-            results.append(
-                {
-                    "id": tender_id,
-                    "title": title,
-                    "summary": tender.get("summary", ""),
-                    "summary_preview": summary_preview,
-                    "description": tender.get("description", ""),
-                    "source": tender.get("source", ""),
-                    "deadline": tender.get("deadline"),
-                    "published_date": tender.get("published_date"),
-                    "value_amount": tender.get("value_amount"),
-                    "value_currency": tender.get("value_currency"),
-                    "location": tender.get("location"),
-                    "location_name": location_name,
-                    "category": tender.get("category"),
-                    "category_label": category_label,
-                    "match_score": match_score,
-                    "matched_keywords": matched_keywords,
-                    "is_matched": bool(match),
-                    "has_access": True,
-                }
-            )
+                results.append(
+                    {
+                        "id": tender_id,
+                        "title": title,
+                        "summary": tender.get("summary", ""),
+                        "summary_preview": summary_preview,
+                        "description": tender.get("description", ""),
+                        "source": tender.get("source", ""),
+                        "deadline": tender.get("deadline"),
+                        "published_date": tender.get("published_date"),
+                        "value_amount": tender.get("value_amount"),
+                        "value_currency": tender.get("value_currency"),
+                        "location": tender.get("location"),
+                        "location_name": location_name,
+                        "category": tender.get("category"),
+                        "category_label": category_label,
+                        "match_score": match_score,
+                        "matched_keywords": matched_keywords,
+                        "is_matched": bool(match),
+                        "has_access": True,
+                    }
+                )
+            except Exception as e:
+                # Skip individual tender errors - don't break entire request
+                print(f"Warning: Error processing purchased tender {tender.get('id', 'unknown')}: {e}")
+                continue
 
         results.sort(key=lambda item: (item.get("published_date") or ""), reverse=True)
+        _set_cached_purchased(client_id, results)
         return results
     except HTTPException:
         raise
@@ -1076,88 +1245,134 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
 
 @router.get("/tenders/matches")
 def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """Get all matched tenders for the client (excludes tenders with passed deadlines)"""
+    """Get all matched tenders for the client (excludes tenders with passed deadlines)
+    
+    NOTE: Cache is disabled for matched tenders to ensure fresh results after keyword changes.
+    """
     client_id = get_client_id_from_key(x_client_key)
+    logger.info(f"GET /tenders/matches - client_id={client_id[:8]}... (cache disabled)")
+    print(f">>>>>> GET /tenders/matches for client {client_id[:8]}...", flush=True)
+    sys.stdout.flush()
+    
+    # DISABLED: Always fetch fresh matched tenders (no cache) to ensure keywords changes are reflected immediately
+    # cached = _get_cached_matched(client_id)
+    # if cached is not None:
+    #     return cached
+    
     try:
-        def fetch_matches():
-            supabase = get_supabase_client()
-            return supabase.table("tender_matches").select(
-                "id, tender_id, keyword_set_id, match_score, matched_keywords, created_at, "
-                "tenders(id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata, full_data)"
-            ).eq("client_id", client_id).order("created_at", desc=True).execute()
-
-        res = _with_supabase_retry(fetch_matches)
+        # Fetch all matches with pagination (Supabase limits to 1000 rows per request)
+        all_matches = []
+        page_size = 1000
+        offset = 0
+        max_matches = 50000  # Safety limit
         
-        matches = res.data or []
+        while offset < max_matches:
+            def fetch_matches_page(off=offset):
+                supabase = get_supabase_client()
+                return supabase.table("tender_matches").select(
+                    "id, tender_id, keyword_set_id, match_score, matched_keywords, created_at, "
+                    "tenders(id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata)"
+                ).eq("client_id", client_id).order("created_at", desc=True).range(off, off + page_size - 1).execute()
+
+            res = _with_supabase_retry(fetch_matches_page)
+            matches = res.data or []
+            
+            if not matches:
+                break
+                
+            all_matches.extend(matches)
+            offset += page_size
+            
+            if len(matches) < page_size:
+                break
+        
+        if not all_matches:
+            return []  # Early return if no matches
         
         def fetch_access():
             supabase = get_supabase_client()
             return supabase.table("tender_access").select("tender_id, payment_status").eq("client_id", client_id).eq("payment_status", "completed").execute()
 
         access_res = _with_supabase_retry(fetch_access)
-        access_map = {acc["tender_id"]: True for acc in (access_res.data or [])}
+        access_map = {acc["tender_id"]: True for acc in (access_res.data or []) if acc.get("tender_id")}
+        
+        matches = all_matches  # Use all fetched matches
         
         # Filter out tenders with passed deadlines (but keep them in DB)
         now_utc = datetime.now(timezone.utc)
         result = []
         for match in matches:
-            tender = match.get("tenders")
-            if not tender:
-                continue
-            
-            if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
-                continue
-            
-            metadata = tender.get("metadata") or {}
-            if not isinstance(metadata, dict):
-                metadata = {}
-            location_name = metadata.get("location_name") or tender.get("location")
-            category_label = metadata.get("category_label") or tender.get("category")
-            title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
-            
-            # Check if deadline has passed
-            deadline = tender.get("deadline")
-            if deadline:
-                try:
-                    deadline_dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
-                    if deadline_dt < now_utc:
-                        # Skip this tender - deadline has passed (but it's still in DB)
-                        continue
-                except Exception:
-                    # If we can't parse the deadline, include it anyway
-                    pass
-            
-            summary_preview = _derive_summary_preview({
-                **tender,
-                "metadata": metadata,
-            })
+            try:
+                tender = match.get("tenders")
+                if not tender:
+                    continue
+                
+                if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
+                    continue
+                
+                metadata = tender.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                location_name = metadata.get("location_name") or tender.get("location")
+                category_label = metadata.get("category_label") or tender.get("category")
+                title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
+                
+                # Check if deadline has passed
+                deadline = tender.get("deadline")
+                if deadline:
+                    try:
+                        deadline_dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+                        if deadline_dt < now_utc:
+                            # Skip this tender - deadline has passed (but it's still in DB)
+                            continue
+                    except Exception:
+                        # If we can't parse the deadline, include it anyway
+                        pass
+                
+                summary_preview = _derive_summary_preview({
+                    **tender,
+                    "metadata": metadata,
+                })
 
-            result.append({
-                "id": match["id"],
-                "tender_id": match["tender_id"],
-                "title": title,
-                "summary": tender.get("summary", ""),
-                "summary_preview": summary_preview,
-                 "description": tender.get("description", ""),
-                "source": tender.get("source", ""),
-                "deadline": tender.get("deadline"),
-                "published_date": tender.get("published_date"),
-                "value_amount": tender.get("value_amount"),
-                "value_currency": tender.get("value_currency"),
-                "location": tender.get("location"),
-                "location_name": location_name,
-                "category": tender.get("category"),
-                "category_label": category_label,
-                "match_score": match.get("match_score", 0.0),
-                "matched_keywords": match.get("matched_keywords", []),
-                "has_access": access_map.get(match["tender_id"], False),
-            })
+                result.append({
+                    "id": match.get("id"),
+                    "tender_id": match.get("tender_id"),
+                    "title": title,
+                    "summary": tender.get("summary", ""),
+                    "summary_preview": summary_preview,
+                    "description": tender.get("description", ""),
+                    "source": tender.get("source", ""),
+                    "deadline": tender.get("deadline"),
+                    "published_date": tender.get("published_date"),
+                    "value_amount": tender.get("value_amount"),
+                    "value_currency": tender.get("value_currency"),
+                    "location": tender.get("location"),
+                    "location_name": location_name,
+                    "category": tender.get("category"),
+                    "category_label": category_label,
+                    "match_score": match.get("match_score", 0.0),
+                    "matched_keywords": match.get("matched_keywords", []),
+                    "has_access": access_map.get(match.get("tender_id"), False),
+                })
+            except Exception as e:
+                # Skip individual match errors - don't break entire request
+                print(f"Warning: Error processing match {match.get('id', 'unknown')}: {e}")
+                continue
         
+        logger.info(f"GET /tenders/matches - returning {len(result)} matched tenders")
+        print(f">>>>>> Returning {len(result)} matched tenders", flush=True)
+        sys.stdout.flush()
+        _set_cached_matched(client_id, result)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error getting matched tenders: {e}")
+        logger.error(f"Error getting matched tenders: {e}")
+        print(f">>>>>> ERROR in get_matched_tenders: {e}", flush=True)
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to get matched tenders")
+        sys.stdout.flush()
+        # Return empty list instead of crashing - graceful degradation for production
+        return []
 
 
 @router.get("/tenders/{tender_id}")
@@ -1177,7 +1392,7 @@ def get_tender_details(
         supabase = get_supabase_client()
         # Check if user has access (only if payment is enabled)
         if ENABLE_PAYMENT:
-            access_res = supabase.table("tender_access").select("*")\
+            access_res = supabase.table("tender_access").select("id, tender_id, payment_status, access_granted_at")\
                 .eq("client_id", client_id)\
                 .eq("tender_id", tender_id)\
                 .eq("payment_status", "completed")\
@@ -1187,8 +1402,11 @@ def get_tender_details(
             if not access_data:
                 raise HTTPException(status_code=403, detail="Access denied. Please purchase access to view this tender.")
         
-        # Get tender details
-        tender_res = supabase.table("tenders").select("*").eq("id", tender_id).limit(1).execute()
+        # Get tender details - include full_data only for detail view
+        tender_res = supabase.table("tenders").select(
+            "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, "
+            "location, category, sector, metadata, full_data, external_id"
+        ).eq("id", tender_id).limit(1).execute()
         tender_rows = tender_res.data or []
         if not tender_rows:
             raise HTTPException(status_code=404, detail="Tender not found")
@@ -1219,6 +1437,17 @@ def get_tender_details(
         location_name = metadata.get("location_name") or tender_row.get("location")
         category_label = metadata.get("category_label") or tender_row.get("category")
 
+        # Get matched keywords for this tender and client
+        matched_keywords = []
+        try:
+            match_res = supabase.table("tender_matches").select("matched_keywords, match_score").eq("tender_id", tender_id).eq("client_id", client_id).limit(1).execute()
+            if match_res.data and len(match_res.data) > 0:
+                mk = match_res.data[0].get("matched_keywords")
+                if isinstance(mk, list):
+                    matched_keywords = mk
+        except Exception as e:
+            print(f"Warning: Could not fetch matched keywords: {e}")
+
         processed_details = metadata.get("processed_details")
         if not processed_details:
             tender_core = {
@@ -1235,7 +1464,7 @@ def get_tender_details(
                 "category": category_label or tender_row.get("category"),
                 "sector": tender_row.get("sector"),
             }
-            processed_details = summarize_tender_for_paid_view(tender_core, full_payload)
+            processed_details = summarize_tender_for_paid_view(tender_core, full_payload, matched_keywords=matched_keywords)
             if processed_details:
                 metadata["processed_details"] = processed_details
                 metadata["processed_details_generated_at"] = datetime.now().isoformat()
@@ -1297,7 +1526,7 @@ def request_tender_access(
         _ensure_tender_visible(tender_rows[0].get("source"))
 
         # Check if access already exists
-        existing = supabase.table("tender_access").select("*").eq("client_id", client_id).eq("tender_id", tender_id).execute()
+        existing = supabase.table("tender_access").select("id, tender_id, payment_status").eq("client_id", client_id).eq("tender_id", tender_id).execute()
         
         if existing.data and existing.data[0].get("payment_status") == "completed":
             return {"message": "Access already granted", "access_id": existing.data[0]["id"]}
@@ -1347,7 +1576,7 @@ def complete_tender_access(
         _ensure_tender_visible(tender_rows[0].get("source"))
 
         # Ensure access record exists
-        existing = supabase.table("tender_access").select("*")\
+        existing = supabase.table("tender_access").select("id, tender_id, payment_status, client_id")\
             .eq("client_id", client_id).eq("tender_id", tender_id).execute()
         if not existing.data:
             # Create pending then complete
@@ -1366,6 +1595,10 @@ def complete_tender_access(
             "payment_date": datetime.now().isoformat(),
             "access_granted_at": datetime.now().isoformat(),
         }).eq("id", access_id).execute()
+        
+        # Invalidate caches when access is granted
+        _invalidate_client_caches(client_id)
+        
         return {"ok": True, "access_id": access_id}
     except Exception as e:
         print(f"Error completing tender access: {e}")

@@ -8,6 +8,138 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from config.settings import GEMINI_MODEL
 
+# Circuit breaker for AI keyword enhancement
+_ai_enhancement_failures = 0
+_ai_enhancement_disabled_until = None
+MAX_CONSECUTIVE_FAILURES = 5
+CIRCUIT_BREAKER_TIMEOUT_SECONDS = 300  # 5 minutes
+
+def enhance_keywords_with_ai(keywords: list[str]) -> list[str]:
+    """
+    Use AI to enhance keywords by generating synonyms, related terms, and variations.
+    This helps improve tender matching accuracy.
+    
+    Args:
+        keywords: List of original keywords
+        
+    Returns:
+        Enhanced list of keywords including original + AI-generated variations
+    """
+    global _ai_enhancement_failures, _ai_enhancement_disabled_until
+    
+    if not keywords or len(keywords) == 0:
+        return []
+    
+    # Check circuit breaker - disable AI if too many failures
+    if _ai_enhancement_disabled_until:
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc) < _ai_enhancement_disabled_until:
+            # Circuit breaker is open - skip AI enhancement
+            return []
+        else:
+            # Circuit breaker timeout expired - reset
+            _ai_enhancement_disabled_until = None
+            _ai_enhancement_failures = 0
+    
+    # If we've had too many failures, disable for a period
+    if _ai_enhancement_failures >= MAX_CONSECUTIVE_FAILURES:
+        from datetime import datetime, timezone, timedelta
+        _ai_enhancement_disabled_until = datetime.now(timezone.utc) + timedelta(seconds=CIRCUIT_BREAKER_TIMEOUT_SECONDS)
+        return []
+    
+    try:
+        gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        # Limit to 10 keywords to avoid long prompts and reduce processing time
+        keywords_str = ", ".join(keywords[:10])
+        prompt = f"""Given these tender search keywords: {keywords_str}
+
+Generate a comprehensive list of related terms, synonyms, and variations that would help match relevant tenders. Include:
+1. The original keywords
+2. Common synonyms and alternative terms
+3. Related technical terms
+4. Common abbreviations
+5. Variations in spelling/formatting
+
+Return ONLY a comma-separated list of keywords (no explanations, no formatting, just keywords separated by commas).
+Keep the list focused and relevant - maximum 20 keywords total."""
+
+        # Use request_options for timeout (5 seconds max)
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.3,
+                "max_output_tokens": 300,
+            },
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+            },
+            request_options={"timeout": 5.0}  # 5 second timeout
+        )
+        
+        # Check if response was blocked by safety filters
+        if not response.candidates or len(response.candidates) == 0:
+            raise ValueError("Response was blocked by safety filters")
+        
+        candidate = response.candidates[0]
+        if candidate.safety_ratings:
+            # Check if any safety rating indicates blocking
+            for rating in candidate.safety_ratings:
+                if rating.probability.name in ["HIGH", "MEDIUM"]:
+                    raise ValueError(f"Response blocked by safety filter: {rating.category.name}")
+        
+        # Check if candidate has content
+        if not candidate.content or not candidate.content.parts:
+            raise ValueError("Response has no content parts")
+        
+        enhanced_text = response.text.strip()
+        if not enhanced_text:
+            raise ValueError("Response text is empty")
+        
+        # Clean up the response - remove any markdown, extra formatting
+        enhanced_text = enhanced_text.replace("*", "").replace("-", ",").replace("\n", ",")
+        
+        # Parse comma-separated keywords
+        enhanced_keywords = []
+        for kw in enhanced_text.split(","):
+            kw_clean = kw.strip().lower()
+            if kw_clean and len(kw_clean) > 2:  # Only keep meaningful keywords
+                enhanced_keywords.append(kw_clean)
+        
+        # Combine original and enhanced, remove duplicates
+        all_keywords = keywords + enhanced_keywords
+        seen = set()
+        unique_keywords = []
+        for kw in all_keywords:
+            kw_lower = kw.lower().strip()
+            if kw_lower and kw_lower not in seen:
+                seen.add(kw_lower)
+                unique_keywords.append(kw_lower)
+        
+        # Limit to reasonable number
+        # Reset failure counter on success
+        _ai_enhancement_failures = 0
+        return unique_keywords[:30]
+        
+    except ValueError as e:
+        # Safety filter blocking or empty response - silently fall back to original keywords
+        # Don't log these as they're expected for certain keyword combinations
+        _ai_enhancement_failures += 1
+        return [kw.lower().strip() for kw in keywords if kw and kw.strip()]
+    except Exception as e:
+        # Other errors - increment failure counter
+        _ai_enhancement_failures += 1
+        error_msg = str(e)
+        # Only log non-safety errors and only occasionally to reduce noise
+        if "safety" not in error_msg.lower() and "blocked" not in error_msg.lower() and _ai_enhancement_failures == 1:
+            print(f"Warning: AI keyword enhancement failed (failures: {_ai_enhancement_failures}): {error_msg[:100]}")
+        # Return original keywords if AI fails
+        return [kw.lower().strip() for kw in keywords if kw and kw.strip()]
+
+
 def get_embedding(text: str) -> list:
     """Generate embedding for text using Google's embedding-001 model"""
     if not text:
@@ -358,10 +490,16 @@ Sheet Data:
         return []
 
 
-def summarize_tender_for_paid_view(tender_core: dict, full_payload: dict | str | None, gemini_model=None) -> dict:
+def summarize_tender_for_paid_view(tender_core: dict, full_payload: dict | str | None, gemini_model=None, matched_keywords: list[str] | None = None) -> dict:
     """
     Use Gemini to produce a structured, human-readable summary for paid tender access.
     Returns a dictionary with sections such as executive summary, scope, timeline, etc.
+    
+    Args:
+        tender_core: Core tender fields (title, description, etc.)
+        full_payload: Full tender data from source
+        gemini_model: Optional Gemini model instance
+        matched_keywords: List of keywords that matched this tender (for AI focus)
     """
     if gemini_model is None:
         gemini_model = genai.GenerativeModel(GEMINI_MODEL)
@@ -444,11 +582,18 @@ def summarize_tender_for_paid_view(tender_core: dict, full_payload: dict | str |
         "required": ["executive_summary"],
     }
 
+    # Build prompt with matched keywords context
+    keywords_context = ""
+    if matched_keywords and len(matched_keywords) > 0:
+        keywords_str = ", ".join(matched_keywords)
+        keywords_context = f"\n\nIMPORTANT: This tender matched the following keywords: {keywords_str}. Please pay special attention to these areas in your summary and highlight how the tender relates to these keywords."
+
     prompt = f"""
 You are preparing a structured briefing for a paying client who has unlocked full access to a public procurement notice.
 
 Using the data provided, produce a concise, business-friendly JSON object that helps the client quickly understand the opportunity.
 Focus on clarity, professional tone, and actionable detail. Summaries must be in English even if the source data is another language.
+{keywords_context}
 
 Input data (truncated if very large):
 {serialized}

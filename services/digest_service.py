@@ -15,6 +15,11 @@ from services.email_service import send_email
 from services.tender_service import is_uk_tender, is_uk_specific_source
 
 FRONTEND_BASE = FRONTEND_ORIGIN.rstrip("/")
+
+
+def _is_ted_source(value: str | None) -> bool:
+    """Check if the source is TED."""
+    return isinstance(value, str) and "ted" in value.lower()
 _LAST_INGESTION_UTC: datetime | None = None
 _LAST_DIGEST_DATE: date | None = None
 
@@ -321,13 +326,11 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
                 continue
 
             # Filter UK-only tenders if flag is enabled
-            # UK-specific sources always pass (ContractsFinder, Sell2Wales, PCS Scotland, FindATender)
+            # When FILTER_UK_ONLY=1, exclude ALL TED source tenders
             if FILTER_UK_ONLY:
                 source = tender.get("source") or ""
-                if not is_uk_specific_source(source):
-                    # For other sources (TED, etc.), check if UK-based
-                    if not is_uk_tender(tender):
-                        continue
+                if _is_ted_source(source):
+                    continue
 
             # Check if this match/tender should be included:
             # - For new keyword clients (added keywords in last 7 days): include all matches
