@@ -53,12 +53,16 @@ def get_client_id_from_key(client_key: str | None) -> str:
             # Check if this is a network/connection error that should be retried
             is_retryable = (
                 isinstance(exc, (httpx.HTTPError, httpx.ReadError, httpx.ConnectError, httpx.TimeoutException,
-                                ConnectionError, OSError)) or
+                                httpcore.ReadError, httpcore.RemoteProtocolError,
+                                ConnectionError, OSError, RuntimeError)) or
                 "ReadError" in error_type or
                 "ConnectError" in error_type or
+                "RemoteProtocolError" in error_type or
                 "WinError 10035" in error_msg or
                 "non-blocking socket" in error_msg.lower() or
-                "connection" in error_msg.lower()
+                "connection" in error_msg.lower() or
+                "client has been closed" in error_msg.lower() or
+                "Server disconnected" in error_msg
             )
             
             # Windows socket error - use longer delay
@@ -125,18 +129,20 @@ def is_admin_client(client_id: str) -> bool:
             return email in ADMIN_CLIENT_EMAILS
         except Exception as exc:
             error_msg = str(exc)
-            is_windows_socket_error = "WinError 10035" in error_msg or "non-blocking socket" in error_msg.lower()
+            is_connection_error = (
+                "WinError 10035" in error_msg or 
+                "non-blocking socket" in error_msg.lower() or
+                "Server disconnected" in error_msg or
+                "client has been closed" in error_msg.lower()
+            )
             
             if attempt < attempts - 1:
-                wait_time = delay * (attempt + 1) * (3.0 if is_windows_socket_error else 1.0)
-                if is_windows_socket_error:
-                    print(f"WARNING: Windows socket error in admin check (attempt {attempt + 1}/{attempts}), retrying...")
+                wait_time = delay * (attempt + 1) * (2.0 if is_connection_error else 1.0)
                 time.sleep(wait_time)
-                if attempt >= 1:
-                    try:
-                        reinitialize_supabase()
-                    except Exception:
-                        pass
+                try:
+                    reinitialize_supabase()
+                except Exception:
+                    pass
                 continue
             else:
                 print(f"Failed to determine admin status for {client_id}: {exc}")

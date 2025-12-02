@@ -105,7 +105,7 @@ def get_supabase_client() -> Client:
     return supabase
 
 def reinitialize_supabase():
-    """Force reinitialize Supabase client"""
+    """Force reinitialize Supabase client - creates fresh connection"""
     global supabase
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     return supabase

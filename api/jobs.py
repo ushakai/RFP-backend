@@ -10,7 +10,7 @@ from utils.auth import get_client_id_from_key
 from utils.helpers import create_rfp_from_filename
 from config.settings import get_supabase_client, reinitialize_supabase
 from services.excel_service import estimate_minutes_from_chars
-from services.supabase_service import fetch_paginated_rows
+from services.supabase_service import fetch_paginated_rows, execute_with_retry
 
 router = APIRouter()
 
@@ -140,54 +140,50 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get specific job details with retry logic"""
     client_id = get_client_id_from_key(x_client_key)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            supabase = get_supabase_client()
-            res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
-            job_data = res.data
+    
+    def _fetch_job():
+        supabase = get_supabase_client()
+        return supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
+    
+    try:
+        res = execute_with_retry(_fetch_job)
+        job_data = res.data
+        
+        if job_data:
+            created_at = datetime.fromisoformat(job_data["created_at"].replace('Z', '+00:00'))
+            elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
             
-            if job_data:
-                created_at = datetime.fromisoformat(job_data["created_at"].replace('Z', '+00:00'))
-                elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
-                
-                job_data["elapsed_minutes"] = round(elapsed_minutes, 1)
-                
-                if job_data["status"] == "pending":
-                    job_data["estimated_remaining_minutes"] = job_data.get("estimated_minutes", 10)
-                elif job_data["status"] == "processing":
-                    estimated_total = job_data.get("estimated_minutes", 10)
-                    remaining = max(0, estimated_total - elapsed_minutes)
-                    job_data["estimated_remaining_minutes"] = round(remaining, 1)
-                else:
-                    job_data["estimated_remaining_minutes"] = 0
-                
-                if "job_data" in job_data:
-                    del job_data["job_data"]
+            job_data["elapsed_minutes"] = round(elapsed_minutes, 1)
             
-            return job_data
-        except Exception as e:
-            print(f"ERROR: Error fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
-            traceback.print_exc()
-            try:
-                reinitialize_supabase()
-            except Exception as reinit_err:
-                print(f"Supabase re-init failed in /jobs/{job_id}: {reinit_err}")
-                traceback.print_exc()
-            if attempt < max_retries - 1:
-                time.sleep(1)
+            if job_data["status"] == "pending":
+                job_data["estimated_remaining_minutes"] = job_data.get("estimated_minutes", 10)
+            elif job_data["status"] == "processing":
+                estimated_total = job_data.get("estimated_minutes", 10)
+                remaining = max(0, estimated_total - elapsed_minutes)
+                job_data["estimated_remaining_minutes"] = round(remaining, 1)
             else:
-                print(f"Failed to fetch job {job_id} after {max_retries} attempts")
-                raise HTTPException(status_code=500, detail="Database connection failed")
+                job_data["estimated_remaining_minutes"] = 0
+            
+            if "job_data" in job_data:
+                del job_data["job_data"]
+        
+        return job_data
+    except Exception as e:
+        print(f"ERROR: Error fetching job {job_id} after retries: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
 
 
 @router.get("/jobs/{job_id}/status")
 def get_job_status(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get job status for polling - lightweight endpoint"""
     client_id = get_client_id_from_key(x_client_key)
-    try:
+    
+    def _fetch_status():
         supabase = get_supabase_client()
-        res = supabase.table("client_jobs").select("id, status, progress_percent, current_step, created_at, completed_at").eq("id", job_id).eq("client_id", client_id).single().execute()
+        return supabase.table("client_jobs").select("id, status, progress_percent, current_step, created_at, completed_at").eq("id", job_id).eq("client_id", client_id).single().execute()
+    
+    try:
+        res = execute_with_retry(_fetch_status)
         job = res.data
         
         if job:

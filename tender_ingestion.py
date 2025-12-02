@@ -2105,6 +2105,17 @@ def ingest_all_tenders(force: bool = False):
     
     _record_ingestion_date(today_uk)
     
+    # Invalidate all clients' tenders and matched caches after new tenders are ingested
+    if stored_count > 0 or matched_count > 0:
+        try:
+            from utils.cache_manager import invalidate_all_tenders_cache, invalidate_all_matched_cache
+            print(f"Invalidating all clients' caches due to new tender ingestion...")
+            invalidate_all_tenders_cache()
+            invalidate_all_matched_cache()
+            print("Cache invalidation complete")
+        except Exception as cache_err:
+            print(f"Warning: Failed to invalidate caches after ingestion: {cache_err}")
+    
     return stored_count, matched_count, new_tender_ids
 
 

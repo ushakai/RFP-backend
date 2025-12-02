@@ -1,6 +1,7 @@
 """
 Tender Service - Tender monitoring and matching
 """
+import os
 import re
 import traceback
 import time
@@ -395,16 +396,15 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
 
     # Check location match (OR - at least one location must match if locations are provided)
     # Use word boundary matching for better city/location detection
-    # NOTE: If tender has no location data, we still allow it to match (lenient mode)
-    # This prevents filtering out tenders that simply don't have location metadata
+    debug_matching = os.getenv("DEBUG_LOCATION_MATCHING") == "1"
     location_match = True  # Default to True if no locations specified
     if keyword_locations:
-        # If tender has no location data at all, still allow it to match
-        # (many tenders don't have location info but are still relevant)
-        if not location_text or not location_text.strip():
-            location_match = True  # Lenient: allow match when tender has no location data
-        else:
-            location_match = False
+        location_match = False  # User specified locations - require a match
+        matched_location = None
+        match_source = None  # Track where we found the match
+        
+        # First, check primary location fields
+        if location_text and location_text.strip():
             for loc in keyword_locations:
                 if not loc:
                     continue
@@ -413,32 +413,97 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
                 pattern = r'\b' + re.escape(loc) + r'\b'
                 if re.search(pattern, location_text, re.IGNORECASE):
                     location_match = True
+                    matched_location = loc
+                    match_source = "location_fields"
                     break
                 # Also try substring match as fallback for compound locations
+                # e.g., "Greater Manchester" contains "Manchester"
                 elif loc in location_text:
                     location_match = True
+                    matched_location = loc
+                    match_source = "location_fields (substring)"
                     break
+        
+        # If no match in location fields, also check title and description as fallback
+        # This helps catch tenders where location is mentioned in the title/description
+        # but not in the structured location fields
+        if not location_match:
+            # Combine title and description for fallback search
+            title_desc_text = (
+                (title or "") + " " + 
+                (description or "") + " " + 
+                (summary or "")
+            ).lower()
+            
+            for loc in keyword_locations:
+                if not loc:
+                    continue
+                # Use word boundary matching to avoid false positives
+                pattern = r'\b' + re.escape(loc) + r'\b'
+                if re.search(pattern, title_desc_text, re.IGNORECASE):
+                    location_match = True
+                    matched_location = loc
+                    match_source = "title/description"
+                    break
+        
+        # Debug logging
+        if debug_matching:
+            tender_title = tender_data.get("title", "Unknown")[:60]
+            status = "✓ MATCHED" if location_match else "✗ REJECTED"
+            if location_match:
+                print(f"[Location Match] {status}: {tender_title}")
+                print(f"  └─ Found '{matched_location}' in {match_source}")
+                if match_source == "location_fields" or match_source == "location_fields (substring)":
+                    print(f"  └─ Location text: '{location_text[:100]}'")
+            else:
+                print(f"[Location Match] {status}: {tender_title}")
+                print(f"  └─ Required: {keyword_locations}")
+                print(f"  └─ Tender location: '{location_text[:100] if location_text else '(empty)'}'")
 
     # Check industry/sector match (OR - at least one industry must match if industries are provided)
-    # NOTE: If tender has no sector/category data, we still allow it to match (lenient mode)
     industry_match = True  # Default to True if no industries specified
     if keyword_sectors:
+        industry_match = False  # User specified industries - require a match
+        
         tender_sectors = _normalize_str_list(tender_data.get("sector"))
         tender_categories = _normalize_str_list(tender_data.get("category"))
         # Check both sector and category fields
         all_tender_industries = set(tender_sectors + tender_categories)
         
-        # If tender has no industry data at all, still allow it to match
-        # (many tenders don't have sector/category info but are still relevant)
+        # If tender has no industry data, it CANNOT match (strict mode)
         if not all_tender_industries:
-            industry_match = True  # Lenient: allow match when tender has no industry data
+            industry_match = False  # Reject tenders with no industry when user specified industries
+            # Debug logging
+            if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
+                tender_title = tender_data.get("title", "Unknown")[:50]
+                print(f"[Industry Match] REJECTED (no industry): {tender_title}")
         else:
-            industry_match = False
+            # Check if any of the user's specified industries match
             if set(keyword_sectors).intersection(all_tender_industries):
                 industry_match = True
+                # Debug logging
+                if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
+                    tender_title = tender_data.get("title", "Unknown")[:50]
+                    matched = set(keyword_sectors).intersection(all_tender_industries)
+                    print(f"[Industry Match] MATCHED: {tender_title} | Required: {keyword_sectors} | Found: {matched}")
+            else:
+                # Debug logging
+                if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
+                    tender_title = tender_data.get("title", "Unknown")[:50]
+                    print(f"[Industry Match] REJECTED: {tender_title} | Required: {keyword_sectors} | Tender has: {all_tender_industries}")
 
     # All three conditions must be true (AND)
     is_match = keyword_match and location_match and industry_match
+
+    # Debug logging - final decision
+    if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
+        tender_title = tender_data.get("title", "Unknown")[:60]
+        status = "✓ MATCH" if is_match else "✗ NO MATCH"
+        print(f"\n[FINAL DECISION] {status}: {tender_title}")
+        print(f"  └─ Keyword Match: {'✓' if keyword_match else '✗'} (matched: {matched_keywords})")
+        print(f"  └─ Location Match: {'✓' if location_match else '✗'} (required: {keyword_locations})")
+        print(f"  └─ Industry Match: {'✓' if industry_match else '✗'} (required: {keyword_sectors})")
+        print()
 
     # Calculate match score based on keyword matches
     match_score = len(matched_keywords) / len(keywords) if keywords else 0.0
@@ -469,10 +534,17 @@ def _rematch_for_client_once(client_id: str) -> int:
         supabase.table("tender_matches").delete().eq("client_id", client_id).execute()
         return 0
 
+    # Log keyword set details for debugging
+    debug_matching = os.getenv("DEBUG_LOCATION_MATCHING") == "1"
+    if debug_matching:
+        for kw in keyword_sets:
+            print(f"[Rematch] Keyword set: keywords={kw.get('keywords')}, locations={kw.get('locations')}, sectors={kw.get('sectors')}")
+
     supabase.table("tender_matches").delete().eq("client_id", client_id).execute()
 
     # Fetch active tenders with pagination (Supabase limits to 1000 rows per request)
     # Also exclude duplicates and fetch metadata for location_name
+    # IMPORTANT: Include full_data to get detailed location info (buyer address, delivery locations)
     now_utc = datetime.now(timezone.utc).isoformat()
     
     to_insert = []
@@ -482,6 +554,9 @@ def _rematch_for_client_once(client_id: str) -> int:
     max_tenders = 50000  # Safety limit to prevent infinite loops
     
     while offset < max_tenders:
+        # Note: We intentionally do NOT fetch full_data here to avoid performance issues
+        # (full_data can be very large JSON). Location matching uses:
+        # - location field, location_name from metadata, title/description fallback
         tenders_res = (
             supabase.table("tenders")
             .select("id, title, description, summary, category, sector, location, value_amount, metadata, is_duplicate, source")
@@ -513,7 +588,8 @@ def _rematch_for_client_once(client_id: str) -> int:
                 location_name = metadata.get("location_name")
             
             # Include metadata in tender_data for keyword matching against structured fields
-            # (executive_summary, scope_summary, category_label, etc.)
+            # Note: full_data is NOT fetched for performance (can be very large)
+            # Location matching uses: location field, metadata.location_name, title/description fallback
             tender_data = {
                 "title": tender.get("title"),
                 "description": tender.get("description"),

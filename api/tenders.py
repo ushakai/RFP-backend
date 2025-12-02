@@ -7,7 +7,6 @@ import traceback
 import importlib
 import threading
 import time
-import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -21,15 +20,23 @@ from config.settings import get_supabase_client, reinitialize_supabase, ENABLE_P
 from services.tender_service import rematch_for_client
 from services.gemini_service import summarize_tender_for_paid_view
 from utils.logging_config import get_logger
+from utils.cache_manager import (
+    get_cached_tenders,
+    set_cached_tenders,
+    get_cached_matched,
+    set_cached_matched,
+    get_cached_purchased,
+    set_cached_purchased,
+    get_cached_keywords,
+    set_cached_keywords,
+    invalidate_client_caches,
+    invalidate_matched_cache,
+    invalidate_keywords_cache,
+    invalidate_purchased_cache,
+)
 
 router = APIRouter()
 logger = get_logger(__name__, "app")
-
-_TENDERS_CACHE: Dict[str, Dict[str, Any]] = {}
-_MATCHED_CACHE: Dict[str, Dict[str, Any]] = {}
-_PURCHASED_CACHE: Dict[str, Dict[str, Any]] = {}
-_KEYWORDS_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 1800  # 30 minutes of cached data per client (increased for production)
 
 # Client notification streams
 _client_streams: dict[str, list[asyncio.Queue]] = {}
@@ -86,97 +93,7 @@ def _is_schema_cache_error(exc: Exception) -> bool:
     return "schema cache" in message or "pgrst002" in message
 
 
-def _get_cached_tenders(client_id: str) -> Optional[List[dict]]:
-    entry = _TENDERS_CACHE.get(client_id)
-    if not entry:
-        return None
-    ts = entry.get("timestamp")
-    if not ts:
-        return None
-    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
-        return None
-    data = entry.get("data")
-    if isinstance(data, list):
-        return data
-    return None
-
-
-def _set_cached_tenders(client_id: str, data: List[dict]) -> None:
-    _TENDERS_CACHE[client_id] = {
-        "timestamp": datetime.now(timezone.utc),
-        "data": data,
-    }
-
-
-def _get_cached_matched(client_id: str) -> Optional[List[dict]]:
-    entry = _MATCHED_CACHE.get(client_id)
-    if not entry:
-        return None
-    ts = entry.get("timestamp")
-    if not ts:
-        return None
-    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
-        return None
-    data = entry.get("data")
-    if isinstance(data, list):
-        return data
-    return None
-
-
-def _set_cached_matched(client_id: str, data: List[dict]) -> None:
-    _MATCHED_CACHE[client_id] = {
-        "timestamp": datetime.now(timezone.utc),
-        "data": data,
-    }
-
-
-def _get_cached_purchased(client_id: str) -> Optional[List[dict]]:
-    entry = _PURCHASED_CACHE.get(client_id)
-    if not entry:
-        return None
-    ts = entry.get("timestamp")
-    if not ts:
-        return None
-    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
-        return None
-    data = entry.get("data")
-    if isinstance(data, list):
-        return data
-    return None
-
-
-def _set_cached_purchased(client_id: str, data: List[dict]) -> None:
-    _PURCHASED_CACHE[client_id] = {
-        "timestamp": datetime.now(timezone.utc),
-        "data": data,
-    }
-
-
-def _get_cached_keywords(client_id: str) -> Optional[dict]:
-    entry = _KEYWORDS_CACHE.get(client_id)
-    if not entry:
-        return None
-    ts = entry.get("timestamp")
-    if not ts:
-        return None
-    if (datetime.now(timezone.utc) - ts).total_seconds() > CACHE_TTL_SECONDS:
-        return None
-    return entry.get("data")
-
-
-def _set_cached_keywords(client_id: str, data: dict) -> None:
-    _KEYWORDS_CACHE[client_id] = {
-        "timestamp": datetime.now(timezone.utc),
-        "data": data,
-    }
-
-
-def _invalidate_client_caches(client_id: str) -> None:
-    """Invalidate all caches for a client when data changes"""
-    _TENDERS_CACHE.pop(client_id, None)
-    _MATCHED_CACHE.pop(client_id, None)
-    _PURCHASED_CACHE.pop(client_id, None)
-    _KEYWORDS_CACHE.pop(client_id, None)
+# Note: Cache functions are imported from utils.cache_manager
 
 
 def _fetch_client_keyword_set(supabase, client_id: str):
@@ -307,7 +224,7 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
     client_id = get_client_id_from_key(x_client_key)
     
     # Check cache first
-    cached = _get_cached_keywords(client_id)
+    cached = get_cached_keywords(client_id)
     if cached is not None:
         return cached
     
@@ -331,7 +248,7 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
         else:
             result = record
         
-        _set_cached_keywords(client_id, result)
+        set_cached_keywords(client_id, result)
         return result
     except Exception as e:
         print(f"Error getting tender keywords: {e}")
@@ -765,9 +682,13 @@ def upsert_tender_keyword(
     client_id = get_client_id_from_key(x_client_key)
     keyword_data = _normalize_keyword_payload(client_id, payload)
     
-    logger.info(f"POST /tenders/keywords - client_id={client_id[:8]}... keywords={keyword_data.get('keywords')}")
-    print(f">>>>>> POST /tenders/keywords - keywords={keyword_data.get('keywords')}", flush=True)
-    sys.stdout.flush()
+    # Log all filter criteria for debugging
+    logger.info(
+        f"POST /tenders/keywords - client_id={client_id[:8]}... "
+        f"keywords={keyword_data.get('keywords')}, "
+        f"locations={keyword_data.get('locations')}, "
+        f"sectors/industries={keyword_data.get('sectors')}"
+    )
 
     # Require at least one keyword (location and industry are optional filters)
     has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
@@ -796,28 +717,19 @@ def upsert_tender_keyword(
         if res.data:
             _schedule_tender_refresh()
             # Invalidate caches
-            _invalidate_client_caches(client_id)
+            invalidate_client_caches(client_id)
             
             # Run rematching SYNCHRONOUSLY so the frontend can show loading state
             # This is faster than before because AI enhancement is disabled during rematch
             try:
                 logger.info(f"Starting synchronous rematch for client {client_id[:8]}...")
-                print(f">>>>>> Starting synchronous rematch for client {client_id[:8]}...", flush=True)
-                sys.stdout.flush()
-                
                 created = rematch_for_client(client_id)
-                
                 logger.info(f"Rematch complete: {created} matches created")
-                print(f">>>>>> Rematch complete: {created} matches created", flush=True)
-                sys.stdout.flush()
-                
                 # Notify connected clients about the update
                 notify_client(client_id, "matches-updated", {"reason": "keywords-upserted"})
             except Exception as e:
                 logger.error(f"Error in rematch for client {client_id}: {e}")
-                print(f">>>>>> ERROR in rematch: {e}", flush=True)
                 traceback.print_exc()
-                sys.stdout.flush()
             
             return res.data[0]
         raise HTTPException(status_code=500, detail="Failed to store tender keywords")
@@ -869,26 +781,17 @@ def update_tender_keyword(
         _schedule_tender_refresh()
 
         # Invalidate caches
-        _invalidate_client_caches(client_id)
+        invalidate_client_caches(client_id)
         
         # Run rematching SYNCHRONOUSLY so the frontend can show loading state
         try:
             logger.info(f"Starting synchronous rematch for client {client_id[:8]}... (PUT)")
-            print(f">>>>>> Starting synchronous rematch for client {client_id[:8]}... (PUT)", flush=True)
-            sys.stdout.flush()
-            
             created = rematch_for_client(client_id)
-            
             logger.info(f"Rematch complete (PUT): {created} matches created")
-            print(f">>>>>> Rematch complete (PUT): {created} matches created", flush=True)
-            sys.stdout.flush()
-            
             notify_client(client_id, "matches-updated", {"reason": "keywords-updated"})
         except Exception as e:
             logger.error(f"Error in rematch for client {client_id}: {e}")
-            print(f">>>>>> ERROR in rematch (PUT): {e}", flush=True)
             traceback.print_exc()
-            sys.stdout.flush()
         
         return res.data[0]
     except HTTPException:
@@ -916,7 +819,7 @@ def delete_tender_keyword(
             )
         
         # Invalidate caches
-        _invalidate_client_caches(client_id)
+        invalidate_client_caches(client_id)
         # Run rematching in background thread to avoid blocking the response
         def _rematch_in_background():
             try:
@@ -1056,18 +959,18 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
 
     try:
         # Check cache first
-        cached = _get_cached_tenders(client_id)
+        cached = get_cached_tenders(client_id)
         if cached is not None:
             return cached
         
         results = build_response()
-        _set_cached_tenders(client_id, results)
+        set_cached_tenders(client_id, results)
         return results
     except HTTPException:
         raise
     except APIError as e:
         if _is_schema_cache_error(e):
-            cached = _get_cached_tenders(client_id)
+            cached = get_cached_tenders(client_id)
             if cached is not None:
                 print("WARNING: Returning cached tender data due to Supabase schema cache error.")
                 return cached
@@ -1078,7 +981,7 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
                 pass
             try:
                 results = build_response()
-                _set_cached_tenders(client_id, results)
+                set_cached_tenders(client_id, results)
                 return results
             except APIError:
                 pass
@@ -1088,7 +991,7 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         print(f"Error getting all tenders: {e}")
         traceback.print_exc()
         # Try to return cached data if available, otherwise return empty list
-        cached = _get_cached_tenders(client_id)
+        cached = get_cached_tenders(client_id)
         if cached is not None:
             print("WARNING: Returning cached tender data due to error.")
             return cached
@@ -1101,7 +1004,7 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
     client_id = get_client_id_from_key(x_client_key)
 
     # Check cache first
-    cached = _get_cached_purchased(client_id)
+    cached = get_cached_purchased(client_id)
     if cached is not None:
         return cached
 
@@ -1230,7 +1133,7 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
                 continue
 
         results.sort(key=lambda item: (item.get("published_date") or ""), reverse=True)
-        _set_cached_purchased(client_id, results)
+        set_cached_purchased(client_id, results)
         return results
     except HTTPException:
         raise
@@ -1250,12 +1153,10 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
     NOTE: Cache is disabled for matched tenders to ensure fresh results after keyword changes.
     """
     client_id = get_client_id_from_key(x_client_key)
-    logger.info(f"GET /tenders/matches - client_id={client_id[:8]}... (cache disabled)")
-    print(f">>>>>> GET /tenders/matches for client {client_id[:8]}...", flush=True)
-    sys.stdout.flush()
+    logger.info(f"GET /tenders/matches - client_id={client_id[:8]}...")
     
     # DISABLED: Always fetch fresh matched tenders (no cache) to ensure keywords changes are reflected immediately
-    # cached = _get_cached_matched(client_id)
+    # cached = get_cached_matched(client_id)
     # if cached is not None:
     #     return cached
     
@@ -1360,17 +1261,13 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
                 continue
         
         logger.info(f"GET /tenders/matches - returning {len(result)} matched tenders")
-        print(f">>>>>> Returning {len(result)} matched tenders", flush=True)
-        sys.stdout.flush()
-        _set_cached_matched(client_id, result)
+        set_cached_matched(client_id, result)
         return result
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting matched tenders: {e}")
-        print(f">>>>>> ERROR in get_matched_tenders: {e}", flush=True)
         traceback.print_exc()
-        sys.stdout.flush()
         # Return empty list instead of crashing - graceful degradation for production
         return []
 
@@ -1597,7 +1494,10 @@ def complete_tender_access(
         }).eq("id", access_id).execute()
         
         # Invalidate caches when access is granted
-        _invalidate_client_caches(client_id)
+        invalidate_client_caches(client_id)
+        
+        # Notify client about the update
+        notify_client(client_id, "tender-purchased", {"tender_id": tender_id})
         
         return {"ok": True, "access_id": access_id}
     except Exception as e:

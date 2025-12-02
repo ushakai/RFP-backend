@@ -14,12 +14,13 @@ from services.gemini_service import get_embedding
 
 def execute_with_retry(
     operation_factory: Callable[[], Any],
-    retries: int = 3,
-    backoff_seconds: float = 0.3,
+    retries: int = 5,
+    backoff_seconds: float = 0.5,
     on_retry: Callable[[], None] | None = None,
 ):
-    """Execute a Supabase/PostgREST operation with retries on socket read errors."""
+    """Execute a Supabase/PostgREST operation with retries on socket/network errors."""
     last_error: Exception | None = None
+    
     for attempt in range(1, retries + 1):
         try:
             return operation_factory()
@@ -30,27 +31,38 @@ def execute_with_retry(
             httpx.TimeoutException,
             httpcore.ReadError,
             httpcore.RemoteProtocolError,
+            ConnectionError,
+            ConnectionResetError,
+            BrokenPipeError,
+            RuntimeError,  # "Cannot send a request, as the client has been closed"
         ) as err:
             last_error = err
-            print(f"Supabase read error (attempt {attempt}/{retries}): {err}")
-            traceback.print_exc()
+            error_msg = str(err)
+            
+            # Only log first and last attempt to reduce noise
+            if attempt == 1 or attempt == retries:
+                print(f"Supabase connection error (attempt {attempt}/{retries}): {error_msg[:100]}")
+            
+            # Reinitialize client to get fresh connection
             try:
                 reinitialize_supabase()
-            except Exception as reinit_err:
-                print(f"Supabase reinit failed during retry: {reinit_err}")
-                traceback.print_exc()
+            except Exception:
+                pass  # Ignore reinit errors, will retry anyway
+            
             if on_retry:
                 try:
                     on_retry()
-                except Exception as cb_err:
-                    print(f"Retry callback failed: {cb_err}")
-                    traceback.print_exc()
-            if attempt == retries:
-                break
-            time.sleep(backoff_seconds * attempt)
+                except Exception:
+                    pass
+            
+            if attempt < retries:
+                # Exponential backoff
+                sleep_time = backoff_seconds * (2 ** (attempt - 1))
+                time.sleep(min(sleep_time, 5.0))  # Cap at 5 seconds
         except Exception as err:
             # Non-network errors bubble up immediately
             raise err
+    
     if last_error:
         raise last_error
 
