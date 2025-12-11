@@ -1,0 +1,25 @@
+### SAM.gov API Information
+
+Your API key for ushakaleem95@gmail.com has been e-mailed to you.
+Account Email: ushakaleem95@gmail.com
+Account ID: 66d2319f-259f-4117-8f3b-284a3ca9f966
+API key: e9yu6HloH2gp7apkJuYXttu4AsbT5QMRaW2lABcP
+
+### IMPORTANT: API Key Status
+The API key above is currently returning "API_KEY_INVALID" errors.
+
+### Actions Required:
+1. Check your email (ushakaleem95@gmail.com) for the activation link from SAM.gov
+2. Visit https://open.gsa.gov/api/get-opportunities-public-api/ and log in
+3. Verify the API key is activated and has permissions for the "opportunities" endpoint
+4. If the key still doesn't work, generate a new API key from the portal
+5. Once you have a working key, update the .env file:
+   SAM_GOV_API_KEY=your_working_key_here
+
+### Test the API Key:
+Run this command to test if your key is working:
+```bash
+curl "https://api.sam.gov/opportunities/v2/search?api_key=YOUR_KEY&postedFrom=11/01/2025&postedTo=11/13/2025&limit=1"
+```
+
+If you see a 403 error with "API_KEY_INVALID", the key needs to be activated or regenerated.

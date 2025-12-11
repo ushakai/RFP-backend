@@ -18,3 +18,5 @@ postgrest>=0.13.0
 sse-starlette==2.1.0
 websockets>=12.0
 fpdf2>=2.7.0,<3.0.0
+pyjwt==2.10.1
+pytest==8.3.3

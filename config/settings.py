@@ -67,6 +67,25 @@ _admin_emails_env = {
 ADMIN_CLIENT_EMAILS = set(_admin_emails_env)
 ADMIN_CLIENT_EMAILS.add("admin@rfp.com")
 
+# Admin auth and security
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "admin")
+ADMIN_JWT_SECRET = _clean_env(os.getenv("ADMIN_JWT_SECRET") or SUPABASE_KEY)
+ADMIN_JWT_EXPIRES_MINUTES = int(os.getenv("ADMIN_JWT_EXPIRES_MINUTES", "720"))
+ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "5"))
+ADMIN_LOGIN_WINDOW_SECONDS = int(os.getenv("ADMIN_LOGIN_WINDOW_SECONDS", "300"))
+ADMIN_ACTIVITY_RETENTION_DAYS = int(os.getenv("ADMIN_ACTIVITY_RETENTION_DAYS", "90"))
+ADMIN_ANALYTICS_CACHE_SECONDS = int(os.getenv("ADMIN_ANALYTICS_CACHE_SECONDS", "300"))
+ADMIN_SESSION_MAX_AGE_DAYS = int(os.getenv("ADMIN_SESSION_MAX_AGE_DAYS", "60"))
+SUPER_ADMIN_EMAIL = _clean_env(os.getenv("SUPER_ADMIN_EMAIL", "admin@bidwell.com")).lower()
+
+# Protected admin emails that cannot be modified by other admins
+PROTECTED_ADMIN_EMAILS = {
+    "admin@bidwell.com",
+    "admin@rfp.com",
+    "dean@purple.ai"
+}
+
+
 # Email / SMTP settings
 SMTP_HOST = _clean_env(os.getenv("SMTP_HOST"))
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))

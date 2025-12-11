@@ -1,19 +1,31 @@
-"""
-Authentication utilities
-"""
+"""Authentication and authorization utilities."""
+import hashlib
+import os
 import time
 import traceback
-from fastapi import HTTPException
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+
 import httpx
-import httpcore
+import jwt
+from fastapi import HTTPException, Header
 
 from config.settings import (
     ADMIN_CLIENT_EMAILS,
     ADMIN_CLIENT_IDS,
+    ADMIN_JWT_EXPIRES_MINUTES,
+    ADMIN_JWT_SECRET,
+    ADMIN_LOGIN_MAX_ATTEMPTS,
+    ADMIN_ROLE_NAME,
+    SUPER_ADMIN_EMAIL,
+    PROTECTED_ADMIN_EMAILS,
     get_supabase_client,
     reinitialize_supabase,
 )
+
+
+def hash_password(password: str) -> str:
+    """Return a deterministic SHA-256 hash for the supplied password."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 def get_client_id_from_key(client_key: str | None) -> str:
     """
@@ -31,19 +43,66 @@ def get_client_id_from_key(client_key: str | None) -> str:
     if not client_key:
         raise HTTPException(status_code=401, detail="Missing X-Client-Key")
     
-    attempts = 5
-    delay = 0.2
+    # Use fewer retries in production to avoid timeouts
+    attempts = 3 if os.getenv("RENDER") or os.getenv("VERCEL") else 5
+    delay = 0.3
     last_exc: Exception | None = None
     
     for attempt in range(attempts):
         try:
             supabase = get_supabase_client()
-            resp = supabase.table("clients").select("id").eq("api_key", client_key).limit(1).execute()
+            resp = (
+                supabase.table("clients")
+                .select("id, status, api_key_revoked, role, last_active_at, name, contact_email")
+                .eq("api_key", client_key)
+                .limit(1)
+                .execute()
+            )
             rows = resp.data or []
             if not rows:
+                # Don't retry for invalid API keys - fail fast
                 raise HTTPException(status_code=401, detail="Invalid X-Client-Key")
-            return rows[0]["id"]
-        except HTTPException:
+
+            row = rows[0]
+            status = (row.get("status") or "active").lower()
+            if status != "active":
+                raise HTTPException(status_code=403, detail="Account is suspended")
+
+            if row.get("api_key_revoked"):
+                raise HTTPException(status_code=403, detail="API key revoked")
+
+            client_id = row["id"]
+
+            # Check session blacklist
+            try:
+                sess = (
+                    supabase.table("client_sessions")
+                    .select("revoked")
+                    .eq("api_key", client_key)
+                    .limit(1)
+                    .execute()
+                )
+                sess_rows = sess.data or []
+                if sess_rows and sess_rows[0].get("revoked"):
+                    raise HTTPException(status_code=403, detail="Session revoked")
+            except HTTPException:
+                raise
+            except Exception:
+                # Non-blocking
+                pass
+
+            # Opportunistically bump last_active_at; failures are non-blocking
+            try:
+                supabase.table("clients").update(
+                    {"last_active_at": datetime.now(timezone.utc).isoformat()}
+                ).eq("id", client_id).execute()
+            except Exception:
+                pass
+
+            return client_id
+        except HTTPException as http_exc:
+            # Don't retry for authentication/authorization errors - fail fast
+            print(f"Authentication error: {http_exc.detail}")
             raise
         except Exception as exc:
             last_exc = exc
@@ -109,6 +168,25 @@ def is_admin_client(client_id: str) -> bool:
     Determine whether the given client ID has administrator privileges.
     Admins can be configured via ADMIN_CLIENT_IDS or ADMIN_CLIENT_EMAILS environment variables.
     """
+    try:
+        supabase = get_supabase_client()
+        resp = (
+            supabase.table("clients")
+            .select("contact_email, role")
+            .eq("id", client_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return False
+        role = (rows[0].get("role") or "").strip().lower()
+        if role == ADMIN_ROLE_NAME:
+            return True
+    except Exception:
+        # fall back to legacy checks if the role column is unavailable
+        pass
+
     if client_id in ADMIN_CLIENT_IDS:
         return True
 
@@ -149,3 +227,155 @@ def is_admin_client(client_id: str) -> bool:
                 return False
     return False
 
+
+def is_super_admin_client(client_id: str) -> bool:
+    """Return True if the client is the configured super admin."""
+    try:
+        supabase = get_supabase_client()
+        resp = (
+            supabase.table("clients")
+            .select("contact_email")
+            .eq("id", client_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return False
+        email = (rows[0].get("contact_email") or "").strip().lower()
+        return email == SUPER_ADMIN_EMAIL
+    except Exception:
+        return False
+
+
+def is_protected_admin(client_id: str) -> bool:
+    """Return True if the client is a protected admin (cannot be modified)."""
+    try:
+        supabase = get_supabase_client()
+        resp = (
+            supabase.table("clients")
+            .select("contact_email")
+            .eq("id", client_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return False
+        email = (rows[0].get("contact_email") or "").strip().lower()
+        return email in PROTECTED_ADMIN_EMAILS
+    except Exception:
+        return False
+
+
+def verify_admin_credentials(email: str, password: str) -> str | None:
+    """
+    Validate admin credentials against the clients table (role == ADMIN_ROLE_NAME).
+    Returns the admin client ID when valid, otherwise None.
+    """
+    normalized_email = (email or "").strip().lower()
+    password_hash = hash_password(password)
+
+    attempts = max(1, ADMIN_LOGIN_MAX_ATTEMPTS)
+    delay = 0.2
+
+    for attempt in range(attempts):
+        try:
+            supabase = get_supabase_client()
+            resp = (
+                supabase.table("clients")
+                .select("id, password_hash, role, status, api_key_revoked")
+                .eq("contact_email", normalized_email)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                return None
+
+            row = rows[0]
+            status = (row.get("status") or "active").lower()
+            if status != "active" or row.get("api_key_revoked"):
+                # super admin is always allowed even if mis-set
+                if (row.get("contact_email") or "").strip().lower() != SUPER_ADMIN_EMAIL:
+                    return None
+
+            role = (row.get("role") or "").strip().lower()
+            if role != ADMIN_ROLE_NAME:
+                return None
+
+            stored_hash = (row.get("password_hash") or "").strip()
+            if stored_hash and stored_hash == password_hash:
+                return row["id"]
+            return None
+        except Exception:
+            if attempt < attempts - 1:
+                time.sleep(delay * (attempt + 1))
+                if attempt >= 1:
+                    try:
+                        reinitialize_supabase()
+                    except Exception:
+                        pass
+                continue
+            raise
+    return None
+
+
+def create_admin_token(admin_id: str, admin_email: str) -> str:
+    """Create a signed JWT for admin sessions."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": admin_id,
+        "email": admin_email,
+        "role": ADMIN_ROLE_NAME,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ADMIN_JWT_EXPIRES_MINUTES)).timestamp()),
+    }
+    return jwt.encode(payload, ADMIN_JWT_SECRET, algorithm="HS256")
+
+
+def decode_admin_token(token: str) -> dict:
+    """Decode and validate an admin JWT."""
+    try:
+        return jwt.decode(token, ADMIN_JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError as exc:
+        raise HTTPException(status_code=401, detail="Admin token expired") from exc
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="Invalid admin token") from exc
+
+
+def require_admin(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key")
+) -> dict:
+    """
+    FastAPI dependency to require admin authentication.
+    Accepts either Bearer JWT token OR x-api-key for admin users.
+    Returns a dict with 'sub' (client_id) and 'email'.
+    """
+    # Try JWT first
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        claims = decode_admin_token(token)
+        if claims.get("role") != ADMIN_ROLE_NAME:
+            raise HTTPException(status_code=403, detail="Admin role required")
+        return claims
+    
+    # Try API key
+    if x_api_key:
+        client_id = get_client_id_from_key(x_api_key)
+        if not is_admin_client(client_id):
+            raise HTTPException(status_code=403, detail="Admin role required")
+        
+        # Fetch email for consistency
+        try:
+            supabase = get_supabase_client()
+            resp = supabase.table("clients").select("contact_email").eq("id", client_id).limit(1).execute()
+            rows = resp.data or []
+            email = rows[0].get("contact_email") if rows else ""
+        except Exception:
+            email = ""
+        
+        return {"sub": client_id, "email": email, "role": ADMIN_ROLE_NAME}
+    
+    raise HTTPException(status_code=401, detail="Missing authentication")

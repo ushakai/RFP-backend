@@ -887,11 +887,14 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
 
         def build_cards(enforce_uk_filter: bool) -> list[dict]:
             cards: list[dict] = []
+            seen_tenders: set[str] = set()
             for tender in tenders:
-                try:
-                    tender_id = tender.get("id")
-                    if not tender_id:
-                        continue
+                tender_id = tender.get("id")
+                if not tender_id:
+                    continue
+                if tender_id in seen_tenders:
+                    continue
+                seen_tenders.add(tender_id)
 
                     if enforce_uk_filter and FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
                         continue
@@ -1202,63 +1205,61 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
         # Filter out tenders with passed deadlines (but keep them in DB)
         now_utc = datetime.now(timezone.utc)
         result = []
+        seen_matches: set[str] = set()
         for match in matches:
-            try:
-                tender = match.get("tenders")
-                if not tender:
-                    continue
-                
-                if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
-                    continue
-                
-                metadata = tender.get("metadata") or {}
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                location_name = metadata.get("location_name") or tender.get("location")
-                category_label = metadata.get("category_label") or tender.get("category")
-                title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
-                
-                # Check if deadline has passed
-                deadline = tender.get("deadline")
-                if deadline:
-                    try:
-                        deadline_dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
-                        if deadline_dt < now_utc:
-                            # Skip this tender - deadline has passed (but it's still in DB)
-                            continue
-                    except Exception:
-                        # If we can't parse the deadline, include it anyway
-                        pass
-                
-                summary_preview = _derive_summary_preview({
-                    **tender,
-                    "metadata": metadata,
-                })
-
-                result.append({
-                    "id": match.get("id"),
-                    "tender_id": match.get("tender_id"),
-                    "title": title,
-                    "summary": tender.get("summary", ""),
-                    "summary_preview": summary_preview,
-                    "description": tender.get("description", ""),
-                    "source": tender.get("source", ""),
-                    "deadline": tender.get("deadline"),
-                    "published_date": tender.get("published_date"),
-                    "value_amount": tender.get("value_amount"),
-                    "value_currency": tender.get("value_currency"),
-                    "location": tender.get("location"),
-                    "location_name": location_name,
-                    "category": tender.get("category"),
-                    "category_label": category_label,
-                    "match_score": match.get("match_score", 0.0),
-                    "matched_keywords": match.get("matched_keywords", []),
-                    "has_access": access_map.get(match.get("tender_id"), False),
-                })
-            except Exception as e:
-                # Skip individual match errors - don't break entire request
-                print(f"Warning: Error processing match {match.get('id', 'unknown')}: {e}")
+            tender = match.get("tenders")
+            if not tender:
                 continue
+            tender_id = match.get("tender_id")
+            if not tender_id or tender_id in seen_matches:
+                continue
+            seen_matches.add(tender_id)
+            
+            if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
+                continue
+            
+            metadata = tender.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            location_name = metadata.get("location_name") or tender.get("location")
+            category_label = metadata.get("category_label") or tender.get("category")
+            title = _enrich_title(tender.get("title"), category_label, tender.get("category"), location_name, tender.get("location"))
+            
+            deadline_value = tender.get("deadline")
+            deadline_passed = False
+            if deadline_value:
+                try:
+                    deadline_dt = datetime.fromisoformat(str(deadline_value).replace("Z", "+00:00"))
+                    deadline_passed = deadline_dt < now_utc
+                except Exception:
+                    deadline_passed = False
+
+            summary_preview = _derive_summary_preview({
+                **tender,
+                "metadata": metadata,
+            })
+
+            result.append({
+                "id": match["id"],
+                "tender_id": tender_id,
+                "title": title,
+                "summary": tender.get("summary", ""),
+                "summary_preview": summary_preview,
+                "description": tender.get("description", ""),
+                "source": tender.get("source", ""),
+                "deadline": tender.get("deadline"),
+                "published_date": tender.get("published_date"),
+                "value_amount": tender.get("value_amount"),
+                "value_currency": tender.get("value_currency"),
+                "location": tender.get("location"),
+                "location_name": location_name,
+                "category": tender.get("category"),
+                "category_label": category_label,
+                "match_score": match.get("match_score", 0.0),
+                "matched_keywords": match.get("matched_keywords", []),
+                "has_access": access_map.get(match["tender_id"], False),
+                "deadline_passed": deadline_passed,
+            })
         
         logger.info(f"GET /tenders/matches - returning {len(result)} matched tenders")
         set_cached_matched(client_id, result)
@@ -1278,14 +1279,29 @@ def get_tender_details(
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
 ):
     """Get full tender details (requires access)"""
-    client_id = get_client_id_from_key(x_client_key)
+    print(f"=== GET TENDER DETAILS: {tender_id} ===")
+    print(f"Received x_client_key: {x_client_key[:8]}..." if x_client_key else "No API key provided")
+    
+    try:
+        client_id = get_client_id_from_key(x_client_key)
+        print(f"✓ Authenticated client_id: {client_id}")
+    except HTTPException as he:
+        print(f"✗ Auth failed: {he.detail}")
+        raise
+    except Exception as e:
+        print(f"✗ Unexpected auth error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+    
     tender_id = (tender_id or "").strip()
     try:
         UUID(tender_id)
     except ValueError:
+        print(f"✗ Invalid UUID: {tender_id}")
         raise HTTPException(status_code=400, detail="Invalid tender identifier")
     
     try:
+        print(f"Fetching tender details from database...")
         supabase = get_supabase_client()
         # Check if user has access (only if payment is enabled)
         if ENABLE_PAYMENT:
@@ -1400,10 +1416,13 @@ def get_tender_details(
         }
     except HTTPException:
         raise
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error getting tender details: {e}")
+        print(f"✗ Error getting tender details: {e}")
+        print(f"Error type: {type(e).__name__}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to get tender details")
+        raise HTTPException(status_code=500, detail=f"Failed to get tender details: {str(e)}")
 
 
 @router.post("/tenders/{tender_id}/access")

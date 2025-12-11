@@ -37,18 +37,30 @@ async def process_excel(
 def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """List all RFPs for a client"""
     print(f"=== /rfps ENDPOINT CALLED ===")
-    print("RFPs endpoint called")
-    client_id = get_client_id_from_key(x_client_key)
-    print(f"Resolved client_id: {client_id}")
+    print(f"Received x_client_key: {x_client_key[:8]}..." if x_client_key else "No API key provided")
+    
+    try:
+        client_id = get_client_id_from_key(x_client_key)
+        print(f"✓ Resolved client_id: {client_id}")
+    except HTTPException as he:
+        print(f"✗ Auth failed: {he.detail}")
+        raise
+    except Exception as e:
+        print(f"✗ Unexpected auth error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+    
     try:
         supabase = get_supabase_client()
+        print(f"✓ Got Supabase client")
         res = supabase.table("client_rfps").select("id, name, description, created_at, updated_at").eq("client_id", client_id).order("created_at", desc=True).execute()
-        print(f"Found {len(res.data or [])} RFPs")
+        rfp_count = len(res.data or [])
+        print(f"✓ Found {rfp_count} RFPs")
         return {"rfps": res.data or []}
     except Exception as e:
-        print(f"Error listing RFPs: {e}")
+        print(f"✗ Database error listing RFPs: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to list RFPs")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @router.post("/rfps")
 def create_rfp(

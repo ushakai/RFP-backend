@@ -6,8 +6,17 @@ create table if not exists public.clients (
   contact_email text,
   api_key text unique,
   password_hash text,
+  role text default 'client',
+  status text default 'active',
+  api_key_revoked boolean default false,
+  last_login_at timestamptz,
+  last_active_at timestamptz,
   created_at timestamptz default now()
 );
+
+-- Indexes for admin queries
+create index if not exists idx_clients_status on public.clients(status);
+create index if not exists idx_clients_role on public.clients(role);
 
 -- Tender ingestion log (tracks daily ingestions)
 create table if not exists public.tender_ingestion_log (
@@ -208,6 +217,39 @@ create table if not exists public.user_tender_keywords (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- ============================================================================
+-- ADMIN AUDIT & SESSIONS
+-- ============================================================================
+create table if not exists public.activity_events (
+  id uuid primary key default gen_random_uuid(),
+  event_type text not null, -- auth, bid, file, system
+  action text not null,
+  actor_client_id uuid references public.clients(id),
+  actor_email text,
+  subject_id text,
+  subject_type text,
+  metadata jsonb,
+  created_at timestamptz default now()
+);
+create index if not exists idx_activity_events_created_at on public.activity_events(created_at desc);
+create index if not exists idx_activity_events_actor on public.activity_events(actor_client_id);
+create index if not exists idx_activity_events_type on public.activity_events(event_type);
+
+create table if not exists public.client_sessions (
+  id uuid primary key default gen_random_uuid(),
+  client_id uuid references public.clients(id) on delete cascade,
+  api_key text unique,
+  user_agent text,
+  ip_address text,
+  created_at timestamptz default now(),
+  last_seen_at timestamptz,
+  revoked boolean default false,
+  revoked_by text,
+  revoked_at timestamptz
+);
+create index if not exists idx_client_sessions_client on public.client_sessions(client_id);
+create index if not exists idx_client_sessions_last_seen on public.client_sessions(last_seen_at desc);
 
 -- Tender matches - links tenders to users based on keyword matching
 create table if not exists public.tender_matches (

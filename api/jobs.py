@@ -7,6 +7,7 @@ import traceback
 from datetime import datetime, timedelta
 from fastapi import APIRouter, UploadFile, Header, HTTPException, File, Form
 from utils.auth import get_client_id_from_key
+from services.activity_service import record_event
 from utils.helpers import create_rfp_from_filename
 from config.settings import get_supabase_client, reinitialize_supabase
 from services.excel_service import estimate_minutes_from_chars
@@ -93,6 +94,14 @@ async def submit_job(
         job_result = supabase.table("client_jobs").insert(job_data).execute()
         job_id = job_result.data[0]["id"]
         print(f"Created job with ID: {job_id}")
+        record_event(
+            "bid" if job_type == "process_rfp" else "file",
+            "job_submitted",
+            actor_client_id=client_id,
+            subject_id=job_id,
+            subject_type="job",
+            metadata={"job_type": job_type, "rfp_id": rfp_id, "file_name": file.filename},
+        )
     except Exception as e:
         print(f"Error inserting job data: {e}")
         traceback.print_exc()
@@ -106,6 +115,18 @@ async def submit_job(
         "message": "Job submitted successfully. Processing will begin shortly."
     }
     print(f"Returning job submission result for job_id={result.get('job_id')}")
+    
+    # Log activity
+    from services.activity_service import record_event
+    record_event(
+        "bid",
+        "job_submitted",
+        actor_client_id=client_id,
+        subject_id=job_id,
+        subject_type="job",
+        metadata={"job_type": job_type, "file_name": file.filename},
+    )
+    
     return result
 
 

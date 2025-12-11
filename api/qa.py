@@ -20,6 +20,7 @@ from services.supabase_service import (
     fetch_paginated_rows,
 )
 import google.generativeai as genai
+from services.activity_service import record_event
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 router = APIRouter()
@@ -127,6 +128,7 @@ def ingest_org_qa(
             print(f"ingest_org_qa error: {e}")
             traceback.print_exc()
             continue
+    record_event("qa", "qa_ingested", actor_client_id=client_id, subject_type="qa_batch", metadata={"created": created})
     return {"created": created}
 
 
@@ -183,6 +185,7 @@ async def extract_qa_from_upload(
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Upload .zip or .xlsx")
 
+    record_event("qa", "qa_extracted", actor_client_id=client_id, subject_type="qa_batch", metadata={"created": created, "file": file.filename})
     return {"created": created}
 
 
