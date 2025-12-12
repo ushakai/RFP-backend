@@ -896,66 +896,62 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
                     continue
                 seen_tenders.add(tender_id)
 
-                    if enforce_uk_filter and FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
-                        continue
-
-                    metadata = tender.get("metadata") or {}
-                    if not isinstance(metadata, dict):
-                        metadata = {}
-                    location_name = metadata.get("location_name") or tender.get("location")
-                    category_label = metadata.get("category_label") or tender.get("category")
-                    title = _enrich_title(
-                        tender.get("title"),
-                        category_label,
-                        tender.get("category"),
-                        location_name,
-                        tender.get("location"),
-                    )
-
-                    match = match_map.get(tender_id)
-                    match_score = 0.0
-                    matched_keywords: list[str] = []
-                    match_id = None
-
-                    if match:
-                        try:
-                            match_score = float(match.get("match_score") or 0.0)
-                        except (TypeError, ValueError):
-                            match_score = 0.0
-                        mk = match.get("matched_keywords")
-                        if isinstance(mk, list):
-                            matched_keywords = mk
-                        match_id = match.get("id")
-
-                    summary_preview = _derive_summary_preview({**tender, "metadata": metadata})
-
-                    cards.append(
-                        {
-                            "id": tender_id,
-                            "match_id": match_id,
-                            "title": title,
-                            "summary": tender.get("summary", ""),
-                            "summary_preview": summary_preview,
-                            "description": tender.get("description", ""),
-                            "source": tender.get("source", ""),
-                            "deadline": tender.get("deadline"),
-                            "published_date": tender.get("published_date"),
-                            "value_amount": tender.get("value_amount"),
-                            "value_currency": tender.get("value_currency"),
-                            "location": tender.get("location"),
-                            "location_name": location_name,
-                            "category": tender.get("category"),
-                            "category_label": category_label,
-                            "match_score": match_score,
-                            "matched_keywords": matched_keywords,
-                            "is_matched": bool(match),
-                            "has_access": access_map.get(tender_id, False),
-                        }
-                    )
-                except Exception as e:
-                    # Skip individual tender errors - don't break entire request
-                    print(f"Warning: Error processing tender {tender.get('id', 'unknown')}: {e}")
+                if enforce_uk_filter and FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
                     continue
+
+                metadata = tender.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                location_name = metadata.get("location_name") or tender.get("location")
+                category_label = metadata.get("category_label") or tender.get("category")
+                title = _enrich_title(
+                    tender.get("title"),
+                    category_label,
+                    tender.get("category"),
+                    location_name,
+                    tender.get("location"),
+                )
+
+                match = match_map.get(tender_id)
+                match_score = 0.0
+                matched_keywords: list[str] = []
+                match_id = None
+
+                if match:
+                    try:
+                        match_score = float(match.get("match_score") or 0.0)
+                    except (TypeError, ValueError):
+                        match_score = 0.0
+                    mk = match.get("matched_keywords")
+                    if isinstance(mk, list):
+                        matched_keywords = mk
+                    match_id = match.get("id")
+
+                summary_preview = _derive_summary_preview({**tender, "metadata": metadata})
+
+                cards.append(
+                    {
+                        "id": tender_id,
+                        "match_id": match_id,
+                        "title": title,
+                        "summary": tender.get("summary", ""),
+                        "summary_preview": summary_preview,
+                        "description": tender.get("description", ""),
+                        "source": tender.get("source", ""),
+                        "deadline": tender.get("deadline"),
+                        "published_date": tender.get("published_date"),
+                        "value_amount": tender.get("value_amount"),
+                        "value_currency": tender.get("value_currency"),
+                        "location": tender.get("location"),
+                        "location_name": location_name,
+                        "category": tender.get("category"),
+                        "category_label": category_label,
+                        "match_score": match_score,
+                        "matched_keywords": matched_keywords,
+                        "is_matched": bool(match),
+                        "has_access": access_map.get(tender_id, False),
+                    }
+                )
             return cards
 
         return build_cards(enforce_uk_filter=True)

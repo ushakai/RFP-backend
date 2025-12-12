@@ -380,24 +380,14 @@ def run_daily_cycle(admin: dict = Depends(require_admin)):
         metadata={"stored": stored, "matched": matched, "new_ids": len(new_ids)},
     )
 
-        _digest_job_status["result"] = {
-            "stored": stored,
-            "matched": matched,
-            "new_tenders": len(new_ids),
-            "emails_attempted": digest_summary["attempted"],
-            "emails_sent": digest_summary["sent"],
-            "no_matches_emails": digest_summary.get("no_matches", 0),
-        }
-        _digest_job_status["error"] = None
-        print(f"Daily cycle completed: {_digest_job_status['result']}")
-    except Exception as e:
-        _digest_job_status["error"] = str(e)
-        _digest_job_status["result"] = None
-        print(f"Daily cycle failed: {e}")
-        traceback.print_exc()
-    finally:
-        _digest_job_status["running"] = False
-        _digest_job_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+    return {
+        "stored": stored,
+        "matched": matched,
+        "new_tenders": len(new_ids),
+        "emails_attempted": digest_summary["attempted"],
+        "emails_sent": digest_summary["sent"],
+        "no_matches_emails": digest_summary.get("no_matches", 0),
+    }
 
 
 @router.post("/run-daily-cycle")
