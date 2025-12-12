@@ -116,8 +116,7 @@ async def submit_job(
     }
     print(f"Returning job submission result for job_id={result.get('job_id')}")
     
-    # Log activity
-    from services.activity_service import record_event
+    # Log activity (record_event already imported at top of file)
     record_event(
         "bid",
         "job_submitted",

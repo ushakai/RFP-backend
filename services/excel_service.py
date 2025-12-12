@@ -187,7 +187,7 @@ def estimate_minutes_from_chars(file_bytes: bytes, job_type: str) -> int:
     """
     try:
         bio = io.BytesIO(file_bytes)
-        xls = pd.ExcelFile(bio)
+        xls = pd.ExcelFile(bio, engine="openpyxl")
         total_chars = 0
         for sheet in xls.sheet_names:
             try:

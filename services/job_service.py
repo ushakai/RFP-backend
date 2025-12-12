@@ -115,7 +115,7 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
         
         try:
             update_job_progress(job_id, 20, "Loading Excel file for QA extraction...")
-            xls = pd.ExcelFile(tmp_path)
+            xls = pd.ExcelFile(tmp_path, engine="openpyxl")
             
             total_sheets = len(xls.sheet_names)
             processed_sheets = 0
@@ -126,7 +126,7 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 
                 update_job_progress(job_id, progress_start_sheet, f"Extracting from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
                 
-                df = pd.read_excel(tmp_path, sheet_name=sheet, header=None)
+                df = pd.read_excel(tmp_path, sheet_name=sheet, header=None, engine="openpyxl")
                 if df.empty:
                     print(f"DEBUG: Sheet {sheet} is empty, skipping for QA extraction.")
                     processed_sheets += 1
