@@ -8,8 +8,10 @@ import traceback
 import importlib
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 
 # Import logging
 from utils.logging_config import get_logger
@@ -50,22 +52,66 @@ app = FastAPI(
 )
 
 # CORS configuration
+# Combine explicit origins with regex pattern for dynamic subdomains
+cors_origins = ALLOWED_ORIGINS.copy() if isinstance(ALLOWED_ORIGINS, list) else list(ALLOWED_ORIGINS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1|.*\\.onrender\\.com|.*\\.vercel\\.app)(:\\d+)?",
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|.*\.onrender\.com|.*\.vercel\.app)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=[
-        "*",
-        "Content-Type",
-        "X-Client-Key",
-        "X-RFP-ID",
-    ],
+    allow_headers=["*"],
     expose_headers=[
         "Content-Disposition",
     ],
 )
+
+# Exception handler to ensure CORS headers are set on errors
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Ensure CORS headers are set even when exceptions occur"""
+    from fastapi import HTTPException
+    import re
+    
+    # Get origin from request
+    origin = request.headers.get("origin", "")
+    
+    # Validate origin against allowed origins
+    cors_headers = {}
+    if origin:
+        # Check if origin is in allowed list or matches regex
+        origin_allowed = False
+        if origin in cors_origins:
+            origin_allowed = True
+        else:
+            # Check regex pattern
+            regex_pattern = r"https?://(localhost|127\.0\.0\.1|.*\.onrender\.com|.*\.vercel\.app)(:\d+)?"
+            if re.match(regex_pattern, origin):
+                origin_allowed = True
+        
+        if origin_allowed:
+            cors_headers = {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+    
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=cors_headers
+        )
+    
+    # Log unexpected errors
+    logger.error(f"Unexpected error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=cors_headers
+    )
 
 # Register API routers
 app.include_router(auth.router, tags=["Auth"])

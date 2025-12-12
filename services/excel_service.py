@@ -5,6 +5,7 @@ import io
 import time
 import gc
 import traceback
+import zipfile
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Alignment
@@ -12,6 +13,77 @@ from openpyxl.utils import get_column_letter
 from services.gemini_service import get_embedding, detect_questions_in_batch, generate_tailored_answer
 from services.supabase_service import search_supabase, pick_best_match
 from utils.helpers import format_ai_answer
+
+
+def validate_excel_file(file_bytes: bytes, filename: str = None) -> tuple[bool, str]:
+    """
+    Validate if the file is a valid Excel file.
+    Returns (is_valid, error_message)
+    """
+    if not file_bytes or len(file_bytes) < 100:
+        return False, "File is too small or empty"
+    
+    # Check for Excel file signatures
+    # .xlsx files start with PK (ZIP signature)
+    # .xls files start with D0 CF 11 E0 A1 B1 1A E1 (OLE2 signature)
+    first_bytes = file_bytes[:8]
+    
+    # Check for .xlsx (ZIP-based format)
+    if first_bytes[:2] == b'PK':
+        try:
+            # Try to open as ZIP to verify it's a valid Excel file
+            with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_file:
+                # Check for required Excel structure
+                if 'xl/workbook.xml' in zip_file.namelist() or '[Content_Types].xml' in zip_file.namelist():
+                    return True, ""
+        except zipfile.BadZipFile:
+            return False, "File appears to be corrupted or not a valid Excel file (.xlsx)"
+        except Exception as e:
+            return False, f"Error validating Excel file: {str(e)}"
+    
+    # Check for .xls (OLE2 format)
+    elif first_bytes[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        # This is an old .xls format - would need xlrd engine
+        return True, ""  # Assume valid, will be handled by engine selection
+    
+    # Check filename extension as fallback
+    if filename:
+        filename_lower = filename.lower()
+        if filename_lower.endswith(('.xlsx', '.xls', '.xlsm')):
+            # File has Excel extension but wrong signature - likely corrupted
+            return False, f"File '{filename}' has Excel extension but is not a valid Excel file. The file may be corrupted or in an unsupported format."
+    
+    return False, "File is not a valid Excel file. Please upload a .xlsx or .xls file."
+
+
+def read_excel_with_fallback(file_path_or_buffer, **kwargs):
+    """
+    Try to read Excel file with multiple engines as fallback.
+    Returns ExcelFile object or raises exception.
+    """
+    engines_to_try = []
+    
+    # Determine which engines to try based on file extension or default
+    if isinstance(file_path_or_buffer, str):
+        filename_lower = file_path_or_buffer.lower()
+        if filename_lower.endswith('.xls'):
+            engines_to_try = ['xlrd', 'openpyxl']
+        else:
+            engines_to_try = ['openpyxl', 'xlrd']
+    else:
+        # For BytesIO, try openpyxl first (most common)
+        engines_to_try = ['openpyxl', 'xlrd']
+    
+    last_error = None
+    for engine in engines_to_try:
+        try:
+            return pd.ExcelFile(file_path_or_buffer, engine=engine, **kwargs)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # If all engines failed, raise the last error with a helpful message
+    raise ValueError(f"Could not read Excel file with any engine. Last error: {str(last_error)}")
 
 
 def _extract_row_data(ws, row_num: int) -> list:
@@ -186,8 +258,13 @@ def estimate_minutes_from_chars(file_bytes: bytes, job_type: str) -> int:
     Falls back to file-size estimation on error.
     """
     try:
+        # Validate file first
+        is_valid, error_msg = validate_excel_file(file_bytes)
+        if not is_valid:
+            raise ValueError(error_msg)
+        
         bio = io.BytesIO(file_bytes)
-        xls = pd.ExcelFile(bio, engine="openpyxl")
+        xls = read_excel_with_fallback(bio)
         total_chars = 0
         for sheet in xls.sheet_names:
             try:
@@ -242,9 +319,18 @@ def process_excel_file_obj(file_obj: io.BytesIO, filename: str, client_id: str, 
 
     try:
         original_bytes = file_obj.getvalue()
+        
+        # Validate file first
+        is_valid, error_msg = validate_excel_file(original_bytes)
+        if not is_valid:
+            raise ValueError(f"Invalid Excel file: {error_msg}")
 
-        wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
-        xls = pd.ExcelFile(io.BytesIO(original_bytes))
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
+        except Exception as e:
+            raise ValueError(f"Failed to load Excel workbook: {str(e)}. The file may be corrupted or in an unsupported format.")
+        
+        xls = read_excel_with_fallback(io.BytesIO(original_bytes))
 
         total_sheets = len(wb.sheetnames)
         

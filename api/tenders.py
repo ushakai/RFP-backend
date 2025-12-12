@@ -1137,12 +1137,26 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
     except HTTPException:
         raise
     except APIError as e:
+        # Try to return cached data if available
+        cached = get_cached_purchased(client_id)
+        if cached is not None:
+            print("WARNING: Returning cached purchased tenders due to Supabase API error.")
+            return cached
         detail = getattr(e, "message", None) or "Failed to fetch purchased tenders"
-        raise HTTPException(status_code=500, detail=detail)
+        print(f"Error getting purchased tenders (APIError): {detail}")
+        traceback.print_exc()
+        # Return empty array instead of raising - graceful degradation
+        return []
     except Exception as e:
         print(f"Error getting purchased tenders: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to get purchased tenders")
+        # Try to return cached data if available
+        cached = get_cached_purchased(client_id)
+        if cached is not None:
+            print("WARNING: Returning cached purchased tenders due to error.")
+            return cached
+        # Return empty array instead of raising - graceful degradation
+        return []
 
 
 @router.get("/tenders/matches")

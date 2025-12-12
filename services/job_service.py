@@ -60,6 +60,12 @@ def process_rfp_background(job_id: str, file_content: bytes, file_name: str, cli
         if file_size_mb > 50:  # 50MB limit
             raise Exception(f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
         
+        # Validate Excel file before processing
+        from services.excel_service import validate_excel_file
+        is_valid, error_msg = validate_excel_file(file_content, file_name)
+        if not is_valid:
+            raise ValueError(f"Invalid Excel file: {error_msg}")
+        
         print(f"DEBUG: Processing file {file_name} ({file_size_mb:.1f}MB)")
         
         file_obj = io.BytesIO(file_content)
@@ -109,13 +115,20 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
     try:
         update_job_progress(job_id, 10, "Starting QA extraction: Loading file...")
         
+        # Validate file before processing
+        from services.excel_service import validate_excel_file
+        is_valid, error_msg = validate_excel_file(file_content, file_name)
+        if not is_valid:
+            raise ValueError(f"Invalid Excel file: {error_msg}")
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
             tmp_file.write(file_content)
             tmp_path = tmp_file.name
         
         try:
             update_job_progress(job_id, 20, "Loading Excel file for QA extraction...")
-            xls = pd.ExcelFile(tmp_path, engine="openpyxl")
+            from services.excel_service import read_excel_with_fallback
+            xls = read_excel_with_fallback(tmp_path)
             
             total_sheets = len(xls.sheet_names)
             processed_sheets = 0
@@ -126,7 +139,12 @@ def extract_qa_background(job_id: str, file_content: bytes, file_name: str, clie
                 
                 update_job_progress(job_id, progress_start_sheet, f"Extracting from sheet {sheet_idx + 1}/{total_sheets}: {sheet}")
                 
-                df = pd.read_excel(tmp_path, sheet_name=sheet, header=None, engine="openpyxl")
+                # Try to read with openpyxl first, fallback to xlrd if needed
+                try:
+                    df = pd.read_excel(tmp_path, sheet_name=sheet, header=None, engine="openpyxl")
+                except Exception:
+                    # Fallback to xlrd for older .xls files
+                    df = pd.read_excel(tmp_path, sheet_name=sheet, header=None, engine="xlrd")
                 if df.empty:
                     print(f"DEBUG: Sheet {sheet} is empty, skipping for QA extraction.")
                     processed_sheets += 1

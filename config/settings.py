@@ -30,16 +30,14 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://localhost:5173",
     "https://127.0.0.1:5173",
-    "https://rfp-two.vercel.app"
+    "https://rfp-two.vercel.app",  # Explicitly allow production frontend
 ]
 
-# Add production origins if running on Render
-if os.getenv("RENDER"):
-    ALLOWED_ORIGINS.extend([
-        "https://rfp-two.vercel.app",
-        "https://*.vercel.app",
-        "https://*.onrender.com"
-    ])
+# Add production origins if running on Render (regex will handle subdomains)
+if os.getenv("RENDER") or os.getenv("VERCEL"):
+    # Don't add wildcard strings - regex pattern in app.py handles subdomains
+    if "https://rfp-two.vercel.app" not in ALLOWED_ORIGINS:
+        ALLOWED_ORIGINS.append("https://rfp-two.vercel.app")
 
 # Background task configuration
 TENDER_INGESTION_INTERVAL_MINUTES = int(os.getenv("TENDER_INGESTION_INTERVAL_MINUTES", "360"))

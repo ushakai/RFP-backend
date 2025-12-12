@@ -172,7 +172,7 @@ def user_detail(client_id: str, _: dict = Depends(require_admin)):
 
 @router.post("/users/{client_id}/password")
 def update_user_password(client_id: str, payload: UserPasswordRequest, admin: dict = Depends(require_admin)):
-    _ensure_not_super_admin(client_id)
+    _ensure_not_protected_admin(client_id)
     new_hash = hash_password(payload.password)
     supabase = get_supabase_client()
     resp = supabase.table("clients").update({"password_hash": new_hash}).eq("id", client_id).execute()

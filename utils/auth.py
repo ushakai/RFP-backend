@@ -346,11 +346,12 @@ def decode_admin_token(token: str) -> dict:
 
 def require_admin(
     authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="x-api-key")
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
 ) -> dict:
     """
     FastAPI dependency to require admin authentication.
-    Accepts either Bearer JWT token OR x-api-key for admin users.
+    Accepts either Bearer JWT token, x-api-key, or X-Client-Key for admin users.
     Returns a dict with 'sub' (client_id) and 'email'.
     """
     # Try JWT first
@@ -361,9 +362,10 @@ def require_admin(
             raise HTTPException(status_code=403, detail="Admin role required")
         return claims
     
-    # Try API key
-    if x_api_key:
-        client_id = get_client_id_from_key(x_api_key)
+    # Try API key (accept both x-api-key and X-Client-Key for compatibility)
+    api_key = x_api_key or x_client_key
+    if api_key:
+        client_id = get_client_id_from_key(api_key)
         if not is_admin_client(client_id):
             raise HTTPException(status_code=403, detail="Admin role required")
         

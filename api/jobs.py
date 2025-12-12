@@ -64,6 +64,12 @@ async def submit_job(
     if file_size_mb > 50:
         raise HTTPException(status_code=400, detail=f"File too large: {file_size_mb:.1f}MB. Maximum allowed: 50MB")
     
+    # Validate Excel file before processing
+    from services.excel_service import validate_excel_file
+    is_valid, error_msg = validate_excel_file(file_content, file.filename)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+    
     estimated_minutes = estimate_minutes_from_chars(file_content, job_type)
     estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
     
@@ -90,22 +96,30 @@ async def submit_job(
     }
     print(f"Job data created, file content encoded")
     
+    job_id = None
     try:
         job_result = supabase.table("client_jobs").insert(job_data).execute()
         job_id = job_result.data[0]["id"]
         print(f"Created job with ID: {job_id}")
-        record_event(
-            "bid" if job_type == "process_rfp" else "file",
-            "job_submitted",
-            actor_client_id=client_id,
-            subject_id=job_id,
-            subject_type="job",
-            metadata={"job_type": job_type, "rfp_id": rfp_id, "file_name": file.filename},
-        )
     except Exception as e:
         print(f"Error inserting job data: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to create job record: {str(e)}")
+    
+    # Log activity after successful job creation
+    if job_id:
+        try:
+            record_event(
+                "bid" if job_type == "process_rfp" else "file",
+                "job_submitted",
+                actor_client_id=client_id,
+                subject_id=job_id,
+                subject_type="job",
+                metadata={"job_type": job_type, "rfp_id": rfp_id, "file_name": file.filename},
+            )
+        except Exception as e:
+            # Don't fail the request if activity logging fails
+            print(f"Warning: Failed to log activity event: {e}")
     
     result = {
         "job_id": job_id, 
@@ -115,16 +129,6 @@ async def submit_job(
         "message": "Job submitted successfully. Processing will begin shortly."
     }
     print(f"Returning job submission result for job_id={result.get('job_id')}")
-    
-    # Log activity (record_event already imported at top of file)
-    record_event(
-        "bid",
-        "job_submitted",
-        actor_client_id=client_id,
-        subject_id=job_id,
-        subject_type="job",
-        metadata={"job_type": job_type, "file_name": file.filename},
-    )
     
     return result
 
