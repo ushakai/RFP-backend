@@ -131,20 +131,33 @@ def change_password(payload: dict = Body(...), client_id: str = Depends(get_clie
 @router.delete("/account")
 def delete_account(client_id: str = Depends(get_client_id)):
     """Permanently delete user account and all data."""
+    from config.settings import get_supabase_admin_client
     supabase = get_supabase_client()
     try:
         # 1. Get client data
         client_resp = supabase.table("clients").select("contact_email").eq("id", client_id).single().execute()
+        if not client_resp.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+            
         email = client_resp.data.get("contact_email")
         
-        # 2. Delete from clients table (cascade takes care of RFP data)
+        # 2. Try to delete from Supabase Auth if service role key is available
+        try:
+            admin_supabase = get_supabase_admin_client()
+            auth_users = admin_supabase.auth.admin.list_users()
+            user_to_delete = next((u for u in auth_users if u.email.lower() == email.lower()), None)
+            
+            if user_to_delete:
+                admin_supabase.auth.admin.delete_user(user_to_delete.id)
+                logger.info(f"Deleted auth user {user_to_delete.id} for email {email}")
+        except Exception as auth_err:
+            logger.warning(f"Failed to delete auth user for {email}: {auth_err}")
+            # Continue with public data deletion even if auth deletion fails
+        
+        # 3. Delete from clients table (cascade takes care of RFP data)
         supabase.table("clients").delete().eq("id", client_id).execute()
         
-        # 3. Supabase Auth user deletion requires Service Role key if done from backend
-        # For now, we've deleted the profile. If we want to delete from auth.users, 
-        # we'd need to use the service role client.
-        
-        logger.info(f"User {email} (ID: {client_id}) deleted their account.")
+        logger.info(f"User {email} (ID: {client_id}) permanently deleted their account.")
         return {"message": "Account deleted successfully."}
     except Exception as e:
         logger.error(f"Account deletion failed: {e}")

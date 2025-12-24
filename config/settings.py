@@ -113,6 +113,10 @@ if not SUPABASE_KEY:
 
 # Global Supabase client (simple and reliable)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase_admin: Client | None = None
+
+# Service role key (for administrative operations like deleting users from auth.users)
+SUPABASE_SERVICE_ROLE_KEY = _clean_env(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 
 def get_supabase_client() -> Client:
     """
@@ -134,15 +138,40 @@ def get_supabase_client() -> Client:
             print(f"Failed to create Supabase client: {e2}")
             raise Exception("Cannot connect to database. Please try again later.") from e2
 
+def get_supabase_admin_client() -> Client:
+    """
+    Get a Supabase client with service role privileges.
+    Used for administrative tasks like deleting users from auth.users.
+    """
+    global supabase_admin
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise ValueError("SUPABASE_SERVICE_ROLE_KEY is missing from environment variables")
+        
+    try:
+        if supabase_admin is None:
+            supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        return supabase_admin
+    except Exception as e:
+        print(f"Error getting Supabase admin client: {e}")
+        # Try to create a fresh client
+        try:
+            supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+            return supabase_admin
+        except Exception as e2:
+            print(f"Failed to create Supabase admin client: {e2}")
+            raise Exception("Cannot connect to database with administrative privileges.") from e2
+
 def reinitialize_supabase():
     """
     Force reinitialize Supabase client - creates fresh connection.
     Call this when experiencing connection issues.
     """
-    global supabase
+    global supabase, supabase_admin
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✓ Reinitialized Supabase client successfully")
+        if SUPABASE_SERVICE_ROLE_KEY:
+            supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        print("✓ Reinitialized Supabase clients successfully")
         return supabase
     except Exception as e:
         print(f"✗ Failed to reinitialize Supabase client: {e}")

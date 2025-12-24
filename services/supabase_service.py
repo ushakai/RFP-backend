@@ -390,15 +390,21 @@ def search_with_documents(
     
     print(f"DEBUG: Enhanced search - client_id={client_id}, rfp_id={rfp_id}, match_count={match_count}")
     
-    # 1. Search Q&A pairs
+    # 1. Search Q&A pairs (try RFP-specific first, then client-wide)
     print("DEBUG: Searching Q&A pairs...")
     qa_matches = _search_qa_pairs(question_embedding, client_id, rfp_id, match_threshold, match_count)
     print(f"DEBUG: Found {len(qa_matches)} Q&A matches")
     
-    # 2. Search document chunks
+    # 2. Search document chunks (try RFP-specific first)
     print("DEBUG: Searching document chunks...")
     doc_matches = _search_document_chunks(question_embedding, client_id, rfp_id, match_threshold, match_count)
-    print(f"DEBUG: Found {len(doc_matches)} document chunk matches")
+    print(f"DEBUG: Found {len(doc_matches)} document chunk matches (RFP-specific)")
+    
+    # 2b. If no document matches for specific RFP, try client-wide document search
+    if len(doc_matches) == 0 and rfp_id:
+        print("DEBUG: No RFP-specific document matches, searching client-wide...")
+        doc_matches = _search_document_chunks(question_embedding, client_id, None, match_threshold, match_count)
+        print(f"DEBUG: Found {len(doc_matches)} document chunk matches (client-wide)")
     
     # 3. Combine all matches
     all_matches = qa_matches + doc_matches

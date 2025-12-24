@@ -195,9 +195,17 @@ def update_user_password(client_id: str, payload: UserPasswordRequest, admin: di
 @router.delete("/users/{client_id}")
 def delete_user(client_id: str, admin: dict = Depends(require_admin)):
     _ensure_not_protected_admin(client_id)
+    from config.settings import get_supabase_admin_client
     supabase = get_supabase_client()
     
-    # Hard delete: remove user and all related data (cascade via foreign keys)
+    # 1. Fetch user data before deletion to get email
+    client_res = supabase.table("clients").select("contact_email").eq("id", client_id).execute()
+    if not client_res.data:
+        raise HTTPException(status_code=404, detail="Client not found")
+    
+    email = client_res.data[0].get("contact_email")
+    
+    # 2. Hard delete: remove user and all related data (cascade via foreign keys)
     try:
         # First log the deletion event before deleting (so we still have the client_id)
         record_event(
@@ -207,12 +215,30 @@ def delete_user(client_id: str, admin: dict = Depends(require_admin)):
             actor_email=admin.get("email"),
             subject_id=client_id,
             subject_type="client",
+            metadata={"email": email}
         )
         
-        # Delete client (cascade will remove related rfps, questions, answers, jobs, sessions, etc.)
+        # 3. Try to delete from Supabase Auth if service role key is available
+        try:
+            admin_supabase = get_supabase_admin_client()
+            # We need to find the user in auth.users by email
+            # list_users doesn't support filtering by email directly in current sdk version 
+            # easily, so we'll fetch them all or use a workaround if possible.
+            # For most bidwell instances, user count is small enough to list.
+            auth_users = admin_supabase.auth.admin.list_users()
+            user_to_delete = next((u for u in auth_users if u.email.lower() == email.lower()), None)
+            
+            if user_to_delete:
+                admin_supabase.auth.admin.delete_user(user_to_delete.id)
+                logger.info(f"Deleted auth user {user_to_delete.id} for email {email}")
+            else:
+                logger.warning(f"No auth user found for email {email}")
+        except Exception as auth_err:
+            logger.warning(f"Failed to delete auth user for {email}: {auth_err}")
+            # We continue even if auth deletion fails, as deleting from clients is primary
+        
+        # 4. Delete client (cascade will remove related rfps, questions, answers, jobs, sessions, etc.)
         resp = supabase.table("clients").delete().eq("id", client_id).execute()
-        if not resp.data:
-            raise HTTPException(status_code=404, detail="Client not found")
         
         logger.info(f"Successfully deleted user {client_id} and all related data")
         return {"success": True, "message": "User and all related data deleted"}

@@ -74,12 +74,9 @@ def update_job_progress(job_id: str, progress: int, current_step: str, result_da
                 except Exception as e:
                     print(f"WARNING: [PID {os.getpid()}] PID ownership check failed: {e}")
 
-            # Include PID and caller in step for easier debugging
-            step_with_pid = f"[PID {os.getpid()}] {current_step}"
-            
             updates = {
                 "progress_percent": progress,
-                "current_step": step_with_pid,
+                "current_step": current_step,
                 "last_updated": datetime.now().isoformat()
             }
             if result_data:
