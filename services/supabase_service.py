@@ -14,34 +14,63 @@ from services.gemini_service import get_embedding
 
 def execute_with_retry(
     operation_factory: Callable[[], Any],
-    retries: int = 5,
-    backoff_seconds: float = 0.5,
+    retries: int = 3,  # Reduced from 5 to 3 to prevent long hangs
+    backoff_seconds: float = 0.3,  # Reduced from 0.5 to 0.3
     on_retry: Callable[[], None] | None = None,
+    max_total_time: float = 10.0,  # Maximum total time for all retries (seconds)
 ):
-    """Execute a Supabase/PostgREST operation with retries on socket/network errors."""
+    """Execute a Supabase/PostgREST operation with retries on socket/network errors.
+    
+    Args:
+        operation_factory: Function that returns the operation to execute
+        retries: Maximum number of retry attempts
+        backoff_seconds: Initial backoff delay in seconds
+        on_retry: Optional callback to execute on each retry
+        max_total_time: Maximum total time to spend on all retries (prevents infinite hangs)
+    """
     last_error: Exception | None = None
+    start_time = time.time()
     
     for attempt in range(1, retries + 1):
+        # Check if we've exceeded maximum time
+        elapsed = time.time() - start_time
+        if elapsed > max_total_time:
+            print(f"ERROR: Exceeded maximum retry time ({max_total_time}s), giving up")
+            if last_error:
+                raise last_error
+            raise TimeoutError(f"Operation timed out after {elapsed:.2f} seconds")
+        
         try:
             return operation_factory()
         except (
             httpx.ReadError,
             httpx.RemoteProtocolError,
+            httpx.ProtocolError,
+            httpx.NetworkError,
             httpx.ConnectError,
             httpx.TimeoutException,
             httpcore.ReadError,
             httpcore.RemoteProtocolError,
+            httpcore.ProtocolError,
+            httpcore.NetworkError,
             ConnectionError,
             ConnectionResetError,
             BrokenPipeError,
+            OSError,  # Catch WinError 10035, 10060, etc.
             RuntimeError,  # "Cannot send a request, as the client has been closed"
+            KeyError,  # HTTP/2 stream ID errors
         ) as err:
             last_error = err
-            error_msg = str(err)
+            error_msg = str(err).lower()
+            
+            # Check if it's a known Windows socket error if it's an OSError
+            is_socket_error = "winerror 10035" in error_msg or "non-blocking socket" in error_msg or "10060" in error_msg
+            is_protocol_error = isinstance(err, KeyError) or "protocol" in error_msg or "stream" in error_msg
             
             # Only log first and last attempt to reduce noise
-            if attempt == 1 or attempt == retries:
-                print(f"Supabase connection error (attempt {attempt}/{retries}): {error_msg[:100]}")
+            if attempt == 1 or attempt == retries or is_socket_error or is_protocol_error:
+                suffix = " (Windows socket error)" if is_socket_error else (" (HTTP/2 protocol error)" if is_protocol_error else "")
+                print(f"Supabase connection error (attempt {attempt}/{retries}): {error_msg[:100]}{suffix}")
             
             # Reinitialize client to get fresh connection
             try:
@@ -56,9 +85,15 @@ def execute_with_retry(
                     pass
             
             if attempt < retries:
-                # Exponential backoff
+                # Exponential backoff, but cap at 2 seconds and respect max_total_time
                 sleep_time = backoff_seconds * (2 ** (attempt - 1))
-                time.sleep(min(sleep_time, 5.0))  # Cap at 5 seconds
+                sleep_time = min(sleep_time, 2.0)  # Cap at 2 seconds (reduced from 5)
+                
+                # Don't sleep if it would exceed max_total_time
+                if elapsed + sleep_time < max_total_time:
+                    time.sleep(sleep_time)
+                else:
+                    print(f"WARNING: Skipping sleep to avoid exceeding max_total_time")
         except Exception as err:
             # Non-network errors bubble up immediately
             raise err
@@ -134,6 +169,264 @@ def fetch_question_answer_mappings(
             mappings.extend(res.data)
 
     return mappings
+
+
+def _date_score(date_str):
+    """Convert date to score (more recent = higher)
+    
+    Returns days since 2020-01-01 (more recent dates = higher score)
+    Used as tiebreaker when similarity scores are close
+    """
+    if not date_str:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        # Handle both date strings and datetime objects
+        if isinstance(date_str, str):
+            date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        else:
+            date = date_str
+            
+        # Ensure date is timezone-aware for comparison
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+            
+        # Score = days since epoch (recent dates have higher scores)
+        epoch = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        days = (date - epoch).days
+        return days
+    except Exception as e:
+        print(f"WARN: Failed to parse date '{date_str}': {e}")
+        return 0
+
+
+def _search_qa_pairs(question_embedding: list, client_id: str, rfp_id: str, match_threshold: float, match_count: int) -> list:
+    """Search Q&A pairs using the existing search_supabase logic
+    
+    Returns matches with 'source': 'qa' tag
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Try RFP-specific search first
+        if rfp_id:
+            try:
+                res = supabase.rpc(
+                    "client_match_questions", {
+                        "query_embedding": question_embedding,
+                        "match_threshold": match_threshold,
+                        "match_count": match_count,
+                        "p_client_id": client_id,
+                        "p_rfp_id": rfp_id
+                    }).execute()
+                
+                if res.data and len(res.data) > 0:
+                    # Tag as Q&A source
+                    for match in res.data:
+                        match['source'] = 'qa'
+                    return res.data
+            except Exception as e:
+                print(f"WARN: RFP-specific Q&A search failed: {e}")
+        
+        # Fallback to client-wide search
+        res = supabase.rpc(
+            "client_match_questions", {
+                "query_embedding": question_embedding,
+                "match_threshold": match_threshold,
+                "match_count": match_count,
+                "p_client_id": client_id,
+                "p_rfp_id": None
+            }).execute()
+        
+        if res.data:
+            for match in res.data:
+                match['source'] = 'qa'
+            return res.data
+        
+        return []
+    except Exception as e:
+        print(f"ERROR: Q&A pair search failed: {e}")
+        traceback.print_exc()
+        return []
+
+
+def _search_document_chunks(question_embedding: list, client_id: str, rfp_id: str, match_threshold: float, match_count: int) -> list:
+    """Search client_docs table for matching chunks using hybrid search
+    
+    Returns matches in same format as Q&A pairs with 'source': 'document' tag
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # 1. Try RPC for efficient database-side vector search
+        try:
+            res = supabase.rpc(
+                "match_client_docs", {
+                    "query_embedding": question_embedding,
+                    "match_threshold": match_threshold,
+                    "match_count": match_count,
+                    "p_client_id": client_id,
+                    "p_rfp_id": rfp_id
+                }).execute()
+            
+            if res.data:
+                matches = []
+                for doc in res.data:
+                    matches.append({
+                        "question": f"[Document: {doc.get('filename')}, chunk {doc.get('chunk_index', 0)}]",
+                        "answer": doc.get('content_text'),
+                        "similarity": doc.get("similarity", 0),
+                        "source": "document",
+                        "original_rfp_date": doc.get("original_rfp_date") or doc.get("created_at"),
+                        "metadata": doc.get("metadata", {})
+                    })
+                return matches
+        except Exception as rpc_error:
+            # Fallback if RPC is not yet created in Supabase
+            if "PGRST202" in str(rpc_error) or "match_client_docs" in str(rpc_error):
+                print("DEBUG: match_client_docs RPC not found, falling back to optimized in-memory search")
+            else:
+                print(f"WARN: match_client_docs RPC failed, falling back: {rpc_error}")
+        
+        # 2. Fallback: Optimized in-memory search using numpy
+        import numpy as np
+        
+        # Fetch document chunks for this client with joined RFP date
+        query_builder = supabase.table("client_docs").select(
+            "id, content_text, embedding, filename, chunk_index, metadata, created_at, rfp_id, client_rfps(original_rfp_date)"
+        ).eq("client_id", client_id)
+        
+        if rfp_id:
+            query_builder = query_builder.eq("rfp_id", rfp_id)
+        
+        docs = query_builder.execute().data or []
+        
+        if not docs:
+            print(f"DEBUG: No document chunks found for client {client_id}")
+            return []
+            
+        print(f"DEBUG: Found {len(docs)} total chunks for client, checking embeddings...")
+        embeddings = []
+        valid_indices = []
+        for i, doc in enumerate(docs):
+            emb = doc.get("embedding")
+            if emb:
+                # Handle cases where embedding might be a string from Supabase
+                if isinstance(emb, str):
+                    try:
+                        import json
+                        emb = json.loads(emb.replace('{', '[').replace('}', ']'))
+                    except:
+                        pass
+                
+                if isinstance(emb, list) and len(emb) == len(question_embedding):
+                    embeddings.append(emb)
+                    valid_indices.append(i)
+        
+        print(f"DEBUG: {len(embeddings)}/{len(docs)} chunks have valid embeddings")
+        if not embeddings:
+            return []
+            
+        # Vectorized cosine similarity
+        emb_matrix = np.array(embeddings)
+        q_vec = np.array(question_embedding)
+        dot_product = np.dot(emb_matrix, q_vec)
+        norms = np.linalg.norm(emb_matrix, axis=1) * np.linalg.norm(q_vec)
+        sims = np.divide(dot_product, norms, out=np.zeros_like(dot_product), where=norms!=0)
+        
+        matches = []
+        for i, score in enumerate(sims):
+            if score >= match_threshold:
+                doc = docs[valid_indices[i]]
+                # Extract original_rfp_date from the nested join if available
+                rfp_date = None
+                if doc.get("client_rfps"):
+                    rfp_date = doc["client_rfps"].get("original_rfp_date")
+                
+                matches.append({
+                    "question": f"[Document: {doc['filename']}, chunk {doc.get('chunk_index', 0)}]",
+                    "answer": doc['content_text'],
+                    "similarity": float(score),
+                    "source": "document",
+                    "original_rfp_date": rfp_date or doc.get("created_at"),
+                    "metadata": doc.get("metadata", {})
+                })
+        
+        matches.sort(key=lambda x: x["similarity"], reverse=True)
+        return matches[:match_count]
+    except Exception as e:
+        print(f"ERROR: Document chunk search failed: {e}")
+        traceback.print_exc()
+        return []
+
+
+def search_with_documents(
+    question_embedding: list, 
+    client_id: str, 
+    rfp_id: str = None,
+    match_threshold: float = 0.0,
+    match_count: int = 10
+) -> list:
+    """
+    Enhanced search combining Q&A pairs AND document chunks
+    Returns combined results ranked by similarity, with date as tiebreaker
+    
+    This is the new primary search function that replaces search_supabase()
+    for tender question matching.
+    
+    Args:
+        question_embedding: Question embedding vector
+        client_id: Client ID
+        rfp_id: Optional RFP ID to filter by
+        match_threshold: Minimum similarity threshold
+        match_count: Maximum number of results to return
+        
+    Returns:
+        List of matches sorted by relevance (similarity + date recency)
+    """
+    if not question_embedding:
+        print("ERROR: No embedding provided to search_with_documents")
+        return []
+    
+    print(f"DEBUG: Enhanced search - client_id={client_id}, rfp_id={rfp_id}, match_count={match_count}")
+    
+    # 1. Search Q&A pairs
+    print("DEBUG: Searching Q&A pairs...")
+    qa_matches = _search_qa_pairs(question_embedding, client_id, rfp_id, match_threshold, match_count)
+    print(f"DEBUG: Found {len(qa_matches)} Q&A matches")
+    
+    # 2. Search document chunks
+    print("DEBUG: Searching document chunks...")
+    doc_matches = _search_document_chunks(question_embedding, client_id, rfp_id, match_threshold, match_count)
+    print(f"DEBUG: Found {len(doc_matches)} document chunk matches")
+    
+    # 3. Combine all matches
+    all_matches = qa_matches + doc_matches
+    
+    if not all_matches:
+        print("WARN: No matches found in Q&A pairs or document chunks")
+        return []
+    
+    # 4. Sort by similarity (primary), then by date recency (secondary tiebreaker)
+    # When similarity scores are very close (< 0.05 difference), more recent date wins
+    all_matches.sort(key=lambda x: (
+        x.get('similarity', 0),  # Primary: similarity score
+        _date_score(x.get('original_rfp_date'))  # Secondary: date recency
+    ), reverse=True)
+    
+    # 5. Return top matches
+    top_matches = all_matches[:match_count]
+    
+    print(f"SUCCESS: Returning {len(top_matches)} combined matches (Q&A + documents)")
+    for i, match in enumerate(top_matches[:3]):
+        source_type = match.get('source', 'unknown')
+        similarity = match.get('similarity', 0)
+        date = match.get('original_rfp_date', 'N/A')
+        question_preview = match.get('question', '')[:60]
+        print(f"  {i+1}. [{source_type.upper()}] sim={similarity:.3f}, date={date} | {question_preview}...")
+    
+    return top_matches
+
 
 def search_supabase(question_embedding: list, client_id: str, rfp_id: str = None) -> list:
     """Search for matching questions in Supabase using embeddings

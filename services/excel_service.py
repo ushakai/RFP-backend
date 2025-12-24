@@ -11,7 +11,7 @@ import openpyxl
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 from services.gemini_service import get_embedding, detect_questions_in_batch, generate_tailored_answer
-from services.supabase_service import search_supabase, pick_best_match
+from services.supabase_service import search_supabase, search_with_documents, pick_best_match
 from utils.helpers import format_ai_answer
 
 
@@ -205,8 +205,8 @@ def process_detected_questions_batch(detected_questions: list, client_id: str, r
                 }
                 continue
             
-            # Search Supabase for matching answers
-            matches = search_supabase(emb, client_id, rfp_id)
+            # Search Supabase for matching answers (Q&A pairs + document chunks)
+            matches = search_with_documents(emb, client_id, rfp_id, match_threshold=0.0, match_count=10)
             
             final_answer = "Not found, needs review."
             review_status = "Need review"

@@ -225,6 +225,46 @@ def delete_user(client_id: str, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(exc)}")
 
 
+@router.delete("/rfps/{rfp_id}")
+def delete_rfp_admin(rfp_id: str, admin: dict = Depends(require_admin)):
+    """
+    Admin-only: delete an entire RFP and all dependent data (questions, answers, jobs, mappings).
+    Client-level deletes still exist; this provides cross-tenant admin control.
+    """
+    supabase = get_supabase_client()
+    try:
+        rfp_resp = (
+            supabase.table("client_rfps")
+            .select("id, client_id, name")
+            .eq("id", rfp_id)
+            .limit(1)
+            .execute()
+        )
+        rows = rfp_resp.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="RFP not found")
+
+        rfp_row = rows[0]
+        supabase.table("client_rfps").delete().eq("id", rfp_id).execute()
+
+        record_event(
+            "system",
+            "rfp_deleted",
+            actor_client_id=admin.get("sub"),
+            actor_email=admin.get("email"),
+            subject_id=rfp_id,
+            subject_type="rfp",
+            metadata={"client_id": rfp_row.get("client_id"), "name": rfp_row.get("name")},
+        )
+        return {"success": True, "message": "RFP and related data deleted"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Failed to delete RFP {rfp_id}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to delete RFP")
+
+
 @router.post("/users/{client_id}/status")
 def update_user_status(client_id: str, payload: UserStatusRequest, admin: dict = Depends(require_admin)):
     new_status = payload.status.lower()

@@ -173,7 +173,7 @@ def _build_email_html(client_name: str, entries: List[Dict[str, str]], uk_date: 
                                     
                                     <!-- CTA Button -->
                                     <div style="padding:0 24px 24px 24px;">
-                                        <a href="{entry['link']}" style="display:inline-block; width:100%; padding:14px 24px; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:#ffffff; text-decoration:none; border-radius:8px; font-weight:600; font-size:15px; text-align:center; transition:opacity 0.2s; box-shadow:0 2px 4px rgba(102, 126, 234, 0.3);" target="_blank">View Full Details & Purchase (£5)</a>
+                                        <a href="{entry['link']}" style="display:inline-block; width:100%; padding:14px 24px; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:#ffffff; text-decoration:none; border-radius:8px; font-weight:600; font-size:15px; text-align:center; transition:opacity 0.2s; box-shadow:0 2px 4px rgba(102, 126, 234, 0.3);" target="_blank">View Full Details & Purchase</a>
             </div>
         </div>
                             </td>

@@ -107,11 +107,25 @@ async def global_exception_handler(request: Request, exc: Exception):
     
     # Log unexpected errors
     logger.error(f"Unexpected error: {exc}", exc_info=True)
+    
+    # Provide more specific error messages for common issues
+    error_msg = "Internal server error"
+    exc_str = str(exc).lower()
+    
+    if "connection" in exc_str or "timeout" in exc_str:
+        error_msg = "Database connection error. Please try again in a moment."
+    elif "resource temporarily unavailable" in exc_str:
+        error_msg = "Service temporarily unavailable. Please try again in a few moments."
+    elif "too many connections" in exc_str or "pool" in exc_str:
+        error_msg = "Server is experiencing high load. Please try again shortly."
+    elif "permission denied" in exc_str or "forbidden" in exc_str:
+        error_msg = "Access denied. Please check your permissions."
+    
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": error_msg},
         headers=cors_headers
-    )
+)
 
 # Register API routers
 app.include_router(auth.router, tags=["Auth"])

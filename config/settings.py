@@ -111,19 +111,40 @@ if not SUPABASE_URL or not SUPABASE_URL.startswith("https://") or ".supabase.co"
 if not SUPABASE_KEY:
     raise ValueError("SUPABASE_KEY is missing")
 
-# Global Supabase client (will be reinitialized as needed)
+# Global Supabase client (simple and reliable)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_supabase_client() -> Client:
-    """Get or reinitialize Supabase client"""
+    """
+    Get or reinitialize Supabase client.
+    Returns a reliable connection with automatic retry on failure.
+    """
     global supabase
-    if supabase is None:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return supabase
+    try:
+        if supabase is None:
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        return supabase
+    except Exception as e:
+        print(f"Error getting Supabase client: {e}")
+        # Try to create a fresh client
+        try:
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            return supabase
+        except Exception as e2:
+            print(f"Failed to create Supabase client: {e2}")
+            raise Exception("Cannot connect to database. Please try again later.") from e2
 
 def reinitialize_supabase():
-    """Force reinitialize Supabase client - creates fresh connection"""
+    """
+    Force reinitialize Supabase client - creates fresh connection.
+    Call this when experiencing connection issues.
+    """
     global supabase
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return supabase
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✓ Reinitialized Supabase client successfully")
+        return supabase
+    except Exception as e:
+        print(f"✗ Failed to reinitialize Supabase client: {e}")
+        raise Exception("Cannot reconnect to database. Please try again later.") from e
 

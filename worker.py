@@ -20,17 +20,41 @@ load_dotenv()
 
 # Import from modular structure
 from config.settings import get_supabase_client
-from services.job_service import process_rfp_background, extract_qa_background, update_job_progress
+from services.job_service import process_rfp_background, extract_qa_background, ingest_text_background, update_job_progress
 from utils.logging_config import get_logger
 
 # Setup logger
 logger = get_logger(__name__, "worker")
 
+
+def get_supabase_with_retry(max_retries=3):
+    """Get Supabase client with retry for network issues"""
+    for attempt in range(max_retries):
+        try:
+            client = get_supabase_client()
+            # Test connection with a simple query
+            client.table("client_jobs").select("id").limit(1).execute()
+            logger.debug(f"Supabase connection successful (attempt {attempt + 1}/{max_retries})")
+            return client
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                logger.warning(f"Supabase connection failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.warning(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Supabase connection failed after {max_retries} attempts: {e}")
+                logger.error("Please check: 1) Internet connection, 2) SUPABASE_URL in .env, 3) DNS resolution")
+                raise Exception(f"Failed to connect to Supabase after {max_retries} attempts") from e
+    return None
+
+
 def get_pending_jobs():
-    """Get all pending jobs from the database"""
+    """Get all jobs waiting for processing (pending or queued)"""
     try:
-        supabase = get_supabase_client()
-        res = supabase.table("client_jobs").select("*").eq("status", "pending").order("created_at", desc=False).execute()
+        supabase = get_supabase_with_retry()
+        # Fetch both pending and queued jobs
+        res = supabase.table("client_jobs").select("*").in_("status", ["pending", "queued"]).order("created_at", desc=False).execute()
         return res.data or []
     except Exception as e:
         logger.error(f"Failed to get pending jobs: {e}")
@@ -41,7 +65,7 @@ def get_pending_jobs():
 def reset_stuck_jobs():
     """Reset jobs that have been stuck in processing for too long (30+ minutes)"""
     try:
-        supabase = get_supabase_client()
+        supabase = get_supabase_with_retry()
         cutoff_time = (datetime.now() - timedelta(minutes=30)).isoformat()
         
         res = supabase.table("client_jobs").select("*").eq("status", "processing").lt("last_updated", cutoff_time).execute()
@@ -66,19 +90,59 @@ def reset_stuck_jobs():
 
 def process_job(job: dict):
     """Process a single job"""
-    job_id = job["id"]
-    job_type = job["job_type"]
+    job_id = job.get("id", "unknown")
+    
+    # Normalize job type with alias mapping
+    raw_job_type = str(job.get("job_type", "")).strip()
+    job_type = raw_job_type.lower()
+    
+    # Alias mapping for robustness
+    ALIASES = {
+        "rfp processing": "process_rfp",
+        "rfp_processing": "process_rfp",
+        "process-rfp": "process_rfp",
+        "qa extraction": "extract_qa",
+        "qa_extraction": "extract_qa",
+        "extract-qa": "extract_qa",
+        "qa_extract": "extract_qa",
+        "text ingestion": "ingest_text",
+        "text_ingestion": "ingest_text",
+        "ingest-text": "ingest_text",
+        "text_ingest": "ingest_text"
+    }
+    
+    if job_type in ALIASES:
+        # Only log if it's actually an alias (not already canonical)
+        if job_type != ALIASES[job_type]:
+            logger.info(f"Mapping job type alias '{job_type}' to canonical type '{ALIASES[job_type]}'")
+        job_type = ALIASES[job_type]
+    
     job_data = job.get("job_data", {})
     
-    logger.info(f"Processing job {job_id} (type: {job_type})")
+    logger.info(f"Starting processing for job {job_id} (canonical type: {job_type}, raw: {raw_job_type})")
     
     try:
-        # Mark job as processing
-        supabase = get_supabase_client()
-        supabase.table("client_jobs").update({
+        # Mark job as processing - use atomic update to claim the job
+        # Only claim if it's still in its original state (pending or queued)
+        # Store worker PID to prevent ghost workers from marking job as failed
+        original_status = job.get("status", "pending")
+        worker_pid = str(os.getpid())
+        supabase = get_supabase_with_retry()
+        update_res = supabase.table("client_jobs").update({
             "status": "processing",
-            "last_updated": datetime.now().isoformat()
-        }).eq("id", job_id).execute()
+            "last_updated": datetime.now().isoformat(),
+            "started_at": datetime.now().isoformat(),
+            "current_step": f"Processing started [PID {worker_pid}] (type: {job_type})",
+            "worker_pid": worker_pid  # Track which worker owns this job
+        }).eq("id", job_id).eq("status", original_status).execute()
+        
+        # If no row was updated, it means another worker already claimed it
+        if not update_res.data:
+            logger.info(f"Job {job_id} already claimed by another worker. Skipping.")
+            return
+        
+        logger.info(f"Successfully claimed job {job_id}")
+
         
         # Extract job data
         file_content_b64 = job_data.get("file_content")
@@ -87,10 +151,17 @@ def process_job(job: dict):
         rfp_id = job_data.get("rfp_id")
         
         if not all([file_content_b64, file_name, client_id]):
-            raise ValueError("Missing required job data fields")
+            missing = []
+            if not file_content_b64: missing.append("file_content")
+            if not file_name: missing.append("file_name")
+            if not client_id: missing.append("client_id")
+            raise ValueError(f"Missing required job data fields: {', '.join(missing)}")
         
         # Decode file content
-        file_content = base64.b64decode(file_content_b64)
+        try:
+            file_content = base64.b64decode(file_content_b64)
+        except Exception as b64_err:
+            raise ValueError(f"Failed to decode file content: {b64_err}")
         
         # Process based on job type
         if job_type == "process_rfp":
@@ -103,14 +174,63 @@ def process_job(job: dict):
             extract_qa_background(job_id, file_content, file_name, client_id, rfp_id)
             logger.info(f"Completed QA extraction for job {job_id}")
             
+        elif job_type == "ingest_text":
+            logger.info(f"Starting text ingestion for job {job_id}")
+            try:
+                ingest_text_background(job_id, file_content, file_name, client_id, rfp_id)
+                logger.info(f"Completed text ingestion for job {job_id}")
+            except Exception as ingest_error:
+                # Check if the job was actually completed (status might be updated even if exception raised)
+                # This prevents marking successful jobs as failed due to status update errors
+                try:
+                    supabase = get_supabase_with_retry()
+                    job_check = supabase.table("client_jobs").select("status, progress_percent, result_data").eq("id", job_id).limit(1).execute()
+                    if job_check.data:
+                        job_status = job_check.data[0].get("status")
+                        job_progress = job_check.data[0].get("progress_percent", 0)
+                        result_data = job_check.data[0].get("result_data", {})
+                        
+                        # If job is already marked as completed or has result_data with chunks_stored, don't mark as failed
+                        if job_status == "completed" or (job_progress == 100 and result_data.get("chunks_stored", 0) > 0):
+                            logger.info(f"Job {job_id} already marked as completed despite exception - ingestion succeeded")
+                            return  # Don't mark as failed
+                except:
+                    pass
+                
+                # Only mark as failed if job wasn't already completed
+                error_msg = f"Text ingestion failed: {str(ingest_error)}"
+                logger.error(f"Error in text ingestion for job {job_id}: {error_msg}")
+                traceback.print_exc()
+                try:
+                    update_job_progress(job_id, -1, error_msg)
+                except Exception as update_error:
+                    logger.error(f"Failed to update job progress: {update_error}")
+            
         else:
-            raise ValueError(f"Unknown job type: {job_type}")
+            logger.error(f"Unknown job type: {job_type} (raw: {raw_job_type})")
+            # List supported types for clarity in logs
+            logger.info("Supported job types: process_rfp, extract_qa, ingest_text")
+            raise ValueError(f"Unknown job type: {job_type}. Please use 'process_rfp', 'extract_qa', or 'ingest_text'.")
             
     except Exception as e:
         error_msg = f"Job processing failed: {str(e)}"
         logger.error(f"Error processing job {job_id}: {error_msg}")
         traceback.print_exc()
-        update_job_progress(job_id, -1, error_msg)
+        try:
+            update_job_progress(job_id, -1, error_msg)
+        except Exception as update_error:
+            logger.error(f"Failed to update job progress: {update_error}")
+            # Try direct update as fallback
+            try:
+                supabase = get_supabase_with_retry()
+                job_res = supabase.table("client_jobs").select("rfp_id").eq("id", job_id).limit(1).execute()
+                if job_res.data and job_res.data[0].get("rfp_id"):
+                    rfp_id = job_res.data[0]["rfp_id"]
+                    supabase.table("client_rfps").update({
+                        "last_job_status": "failed"
+                    }).eq("id", rfp_id).execute()
+            except Exception as fallback_error:
+                logger.error(f"Fallback RFP status update also failed: {fallback_error}")
 
 
 def worker_loop():
