@@ -10,3 +10,12 @@ __pycache__/
 .env.local
 __pycache__/*
 *.log
+RAG_IMPLEMENTATION_SUMMARY.md
+IMPLEMENTATION_SUMMARY_2025-12-18.md
+test_*.py
+__pycache__/app.cpython-313.pyc
+WORKER_FIX_GUIDE.md
+RETRY_SYSTEM.md
+restart_worker.ps1
+restart_worker.bat
+RAG_SYSTEM_DOCUMENTATION.md
