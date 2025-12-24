@@ -132,7 +132,7 @@ def process_job(job: dict):
             "status": "processing",
             "last_updated": datetime.now().isoformat(),
             "started_at": datetime.now().isoformat(),
-            "current_step": f"Processing started [PID {worker_pid}] (type: {job_type})",
+            "current_step": f"Processing started (type: {job_type})",
             "worker_pid": worker_pid  # Track which worker owns this job
         }).eq("id", job_id).eq("status", original_status).execute()
         

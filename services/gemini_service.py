@@ -141,7 +141,13 @@ Keep the list focused and relevant - maximum 20 keywords total."""
 
 
 def get_embedding(text: str) -> list:
-    """Generate embedding for text using Google's embedding-001 model"""
+    """Generate embedding for text using the configured embedding model.
+    
+    IMPORTANT: This model MUST match the model used for document ingestion
+    to ensure compatible embedding spaces for similarity search.
+    """
+    from config.rag_config import GEMINI_EMBEDDING_MODEL
+    
     if not text:
         print("DEBUG: Empty text provided to get_embedding")
         return []
@@ -153,8 +159,9 @@ def get_embedding(text: str) -> list:
         return []
     
     try:
+        # Use the same model as document ingestion for compatible embeddings
         res = genai.embed_content(
-            model="models/embedding-001",
+            model=GEMINI_EMBEDDING_MODEL,
             content=text,
             task_type="retrieval_query"
         )
@@ -169,7 +176,7 @@ def get_embedding(text: str) -> list:
             print(f"ERROR: Empty embedding returned for text: {text[:100]}...")
             return []
         
-        print(f"DEBUG: Generated embedding (length {len(embedding)}) for: '{text[:60]}...'")
+        print(f"DEBUG: Generated embedding (model={GEMINI_EMBEDDING_MODEL}, length {len(embedding)}) for: '{text[:60]}...'")
         return embedding
         
     except Exception as e:
