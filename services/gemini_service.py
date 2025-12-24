@@ -297,24 +297,45 @@ def detect_questions_in_batch(rows_with_numbers: list) -> list:
 
 
 def generate_tailored_answer(question: str, matches: list, gemini_model = None) -> str:
-    """Generate a tailored answer based on similar Q&A pairs"""
+    """Generate a tailored answer based on similar Q&A pairs and document chunks
+    
+    Matches can now include both Q&A pairs (source='qa') and document chunks (source='document')
+    """
     if gemini_model is None:
         gemini_model = genai.GenerativeModel(GEMINI_MODEL)
     
-    context = "\n".join(
-        f"- Q: {m['question']} | A: {m['answer']} (similarity {m['similarity']:.2f})"
-        for m in matches)
+    # Format context with source type indicators and dates
+    context_lines = []
+    for m in matches:
+        source_type = m.get('source', 'qa')
+        source_label = '[DOC]' if source_type == 'document' else '[Q&A]'
+        similarity = m.get('similarity', 0)
+        date = m.get('original_rfp_date', 'N/A')
+        question_text = m.get('question', '')
+        answer_text = m.get('answer', '')
+        
+        context_lines.append(
+            f"- {source_label} Q: {question_text} | A: {answer_text} "
+            f"(similarity {similarity:.2f}, date: {date})"
+        )
+    
+    context = "\n".join(context_lines)
+    
     prompt = f"""
 You are answering an RFP vendor question.  
 
 New Question:
 {question}
 
-Reference Q&A Pairs:
+Reference Sources (Q&A Pairs and Document Chunks):
 {context}
 
 Write a concise, tailored answer that best addresses the new question using the references.
-If unclear, combine and adapt from references.
+- [Q&A] sources are previous question-answer pairs from our knowledge base
+- [DOC] sources are relevant excerpts from uploaded documents
+- More recent dates indicate more current information
+- Combine and adapt from references as needed
+
 Return only the answer text, without any additional conversational filler or markdown formatting.
 """
     try:

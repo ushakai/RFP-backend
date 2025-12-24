@@ -127,20 +127,21 @@ def _with_supabase_retry(operation, attempts: int = 5, delay: float = 0.2):
             is_retryable = (
                 isinstance(exc, (httpx.HTTPError, httpx.ReadError, httpx.ConnectError, httpx.TimeoutException,
                                 httpx.RemoteProtocolError, httpx.ProtocolError, httpx.NetworkError,
-                                APIError, ConnectionError, OSError, RuntimeError,
+                                APIError, ConnectionError, OSError, RuntimeError, KeyError,
                                 httpcore.RemoteProtocolError, httpcore.ProtocolError, httpcore.NetworkError)) or
                 "ReadError" in error_type or
                 "ConnectError" in error_type or
                 "RemoteProtocolError" in error_type or
                 "ProtocolError" in error_type or
                 "NetworkError" in error_type or
+                "KeyError" in error_type or
                 "deque mutated" in error_msg.lower() or
                 "deque" in error_msg.lower() or
+                "stream" in error_msg.lower() or
                 "WinError 10035" in error_msg or
                 "non-blocking socket" in error_msg.lower() or
                 "connection" in error_msg.lower() or
-                "connection terminated" in error_msg.lower() or
-                "stream" in error_msg.lower()
+                "connection terminated" in error_msg.lower()
             )
             
             # Windows socket error - use longer delay
@@ -250,10 +251,23 @@ def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X
         
         set_cached_keywords(client_id, result)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error getting tender keywords: {e}")
+        error_msg = str(e)
+        error_type = type(e).__name__
+        print(f"Error getting tender keywords after retries: {error_type} - {error_msg}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to get tender keywords")
+        
+        # Provide user-friendly error message
+        if "KeyError" in error_type or "stream" in error_msg.lower():
+            detail = "Connection error while fetching keywords. Please refresh the page."
+        elif "timeout" in error_msg.lower():
+            detail = "Request timed out. Please try again."
+        else:
+            detail = "Failed to get tender keywords. Please try again later."
+        
+        raise HTTPException(status_code=500, detail=detail)
 
 
 def _extract_original_url(full_data: Any, source: str, external_id: str) -> str | None:

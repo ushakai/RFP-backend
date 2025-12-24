@@ -9,7 +9,8 @@ import zipfile
 import tempfile
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import base64
+from datetime import datetime, timedelta
 from fastapi import APIRouter, UploadFile, Header, HTTPException, Body, File
 from utils.auth import get_client_id_from_key
 from config.settings import get_supabase_client, GEMINI_MODEL
@@ -19,11 +20,104 @@ from services.supabase_service import (
     fetch_question_answer_mappings,
     fetch_paginated_rows,
 )
+from utils.db_utils import safe_db_operation
 import google.generativeai as genai
 from services.activity_service import record_event
+from services.chunking_service import chunk_text_semantic
+from services.hybrid_search_service import search_knowledge_base, hybrid_search_documents, hybrid_search_qa
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import io
+import uuid
+import base64
 
 router = APIRouter()
+
+SUPPORTED_TEXT_TYPES = {".txt", ".md", ".markdown", ".pdf", ".docx"}
+
+def _guess_extension(filename: str) -> str:
+    import os
+    return os.path.splitext(filename or "")[1].lower()
+
+def _extract_text_from_file(file_bytes: bytes, filename: str, mime_type: str | None = None) -> str:
+    ext = _guess_extension(filename)
+    if ext in {".txt", ".md", ".markdown"}:
+        return file_bytes.decode("utf-8", errors="ignore")
+    if ext == ".pdf":
+        try:
+            import PyPDF2  # type: ignore
+        except Exception:
+            raise HTTPException(status_code=400, detail="PDF support requires PyPDF2 installed")
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            texts = []
+            for page in reader.pages:
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            return "\n".join(texts).strip()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read PDF: {e}")
+    if ext == ".docx":
+        try:
+            import docx2txt  # type: ignore
+        except Exception:
+            raise HTTPException(status_code=400, detail="DOCX support requires docx2txt installed")
+        try:
+            return docx2txt.process(io.BytesIO(file_bytes)).strip()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read DOCX: {e}")
+    raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext or mime_type or 'unknown'}")
+
+def _chunk_text_legacy(text: str, chunk_size: int = 1000, overlap: int = 150) -> list[str]:
+    """Legacy char-based chunking - kept for backward compatibility"""
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(n, start + chunk_size)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end == n:
+            break
+        start = end - overlap
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def _select_latest_answer_mappings(mappings: list[dict], answers: list[dict]) -> list[dict]:
+    """
+    For each question, pick the mapping whose answer has the most recent timestamp.
+    Timestamps considered (in order): updated_at, last_updated, created_at.
+    """
+    if not mappings or not answers:
+        return mappings or []
+
+    answer_by_id = {a.get("id"): a for a in answers if a.get("id")}
+
+    def _ts(answer: dict) -> float:
+        ts_raw = answer.get("updated_at") or answer.get("last_updated") or answer.get("created_at")
+        if not ts_raw:
+            return 0.0
+        try:
+            return datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    best: dict[str, dict] = {}
+    for m in mappings:
+        qid = m.get("question_id")
+        ans_id = m.get("answer_id")
+        if not qid or not ans_id:
+            continue
+        ans = answer_by_id.get(ans_id)
+        if not ans:
+            continue
+        score = _ts(ans)
+        if qid not in best or score > best[qid]["_ts"]:
+            best[qid] = {**m, "_ts": score}
+
+    # Strip helper key
+    return [{k: v for k, v in vmap.items() if k != "_ts"} for vmap in best.values()]
 
 # ============================================================================
 # ORGANIZATION MANAGEMENT
@@ -66,6 +160,7 @@ def update_org(
 # ============================================================================
 
 @router.get("/org/qa")
+@safe_db_operation("list Q&A")
 def list_org_qa(
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
     rfp_id: str | None = Header(default=None, alias="X-RFP-ID")
@@ -75,13 +170,23 @@ def list_org_qa(
         client_id = get_client_id_from_key(x_client_key)
         
         def _build_questions_query():
-            query = get_supabase_client().table("client_questions").select("id, original_text, category, created_at, rfp_id").eq("client_id", client_id)
+            query = (
+                get_supabase_client()
+                .table("client_questions")
+                .select("id, original_text, category, created_at, updated_at, rfp_id")
+                .eq("client_id", client_id)
+            )
             if rfp_id:
                 query = query.eq("rfp_id", rfp_id)
             return query.order("created_at", desc=True)
 
         def _build_answers_query():
-            query = get_supabase_client().table("client_answers").select("id, answer_text, quality_score, last_updated, rfp_id").eq("client_id", client_id)
+            query = (
+                get_supabase_client()
+                .table("client_answers")
+                .select("id, answer_text, quality_score, last_updated, created_at, updated_at, rfp_id")
+                .eq("client_id", client_id)
+            )
             if rfp_id:
                 query = query.eq("rfp_id", rfp_id)
             return query.order("last_updated", desc=True)
@@ -94,7 +199,8 @@ def list_org_qa(
         if q_ids:
             mappings = fetch_question_answer_mappings(q_ids)
 
-        return {"questions": qs, "answers": ans, "mappings": mappings}
+        reliable_mappings = _select_latest_answer_mappings(mappings, ans)
+        return {"questions": qs, "answers": ans, "mappings": reliable_mappings}
     except HTTPException:
         raise
     except Exception as e:
@@ -187,6 +293,244 @@ async def extract_qa_from_upload(
 
     record_event("qa", "qa_extracted", actor_client_id=client_id, subject_type="qa_batch", metadata={"created": created, "file": file.filename})
     return {"created": created}
+
+
+@router.get("/org/documents")
+def get_documents(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    rfp_id: str | None = None,
+):
+    """
+    Get all document chunks for a client (with optional RFP filter)
+    
+    Returns chunks similar to Q&A pairs for display in Knowledge Base
+    """
+    from config.settings import get_supabase_client
+    
+    client_id = get_client_id_from_key(x_client_key)
+    supabase = get_supabase_client()
+    
+    # Build query
+    query = supabase.table("client_docs").select(
+        "id, filename, chunk_index, content_text, metadata, created_at, rfp_id"
+    ).eq("client_id", client_id).order("created_at", desc=True)
+    
+    if rfp_id:
+        query = query.eq("rfp_id", rfp_id)
+    
+    result = query.execute()
+    chunks = result.data or []
+    
+    # Format chunks similar to Q&A pairs for consistent display
+    formatted_chunks = []
+    for chunk in chunks:
+        formatted_chunks.append({
+            "id": chunk["id"],
+            "question": f"[Document Chunk {chunk['chunk_index'] + 1}] {chunk['filename']}",  # Use as "question"
+            "answer": chunk["content_text"],  # Content as "answer"
+            "category": "Document",
+            "rfp_id": chunk.get("rfp_id"),
+            "created_at": chunk.get("created_at"),
+            "metadata": chunk.get("metadata", {}),
+            "chunk_index": chunk["chunk_index"],
+            "filename": chunk["filename"],
+            "type": "document"  # Distinguish from Q&A pairs
+        })
+    
+    return {
+        "documents": formatted_chunks,
+        "count": len(formatted_chunks)
+    }
+
+
+@router.post("/org/text-extract")
+async def ingest_text_documents(
+    file: UploadFile = File(...),
+    original_rfp_date: str | None = Header(default=None, alias="X-Original-Date"),
+    tags: str | None = Header(default=None, alias="X-Tags"),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    rfp_id: str | None = Header(default=None, alias="X-RFP-ID"),
+):
+    """
+    Submit text document for background ingestion (as a job)
+    
+    Works like Q&A extraction - creates a background job that processes the document.
+    
+    Supported formats: TXT, MD, PDF, DOCX
+    
+    Args:
+        file: Text document to ingest
+        original_rfp_date: Optional original date of the RFP (ISO format YYYY-MM-DD)
+        tags: Optional comma-separated list of tags
+        x_client_key: Client API key
+        rfp_id: Optional RFP ID (auto-created if not provided)
+    
+    Returns:
+        Job submission details
+    """
+    from utils.helpers import create_rfp_from_filename, upsert_tags_for_rfp
+    from config.settings import get_supabase_client
+    from services.excel_service import estimate_minutes_from_chars
+    
+    # Authenticate
+    client_id = get_client_id_from_key(x_client_key)
+    filename = file.filename or "document"
+    
+    # Read file
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    
+    file_size = len(content)
+    
+    # Validate file type
+    import os
+    ext = os.path.splitext(filename)[1].lower()
+    supported_exts = {'.txt', '.md', '.markdown', '.pdf', '.docx'}
+    
+    if ext not in supported_exts:
+        raise HTTPException(
+            status_code=415, 
+            detail=f"Unsupported file type: {ext}. Supported: {', '.join(supported_exts)}"
+        )
+    
+    supabase = get_supabase_client()
+    
+    # Auto-create RFP if needed
+    if not rfp_id:
+        rfp_id = create_rfp_from_filename(client_id, filename, supabase)
+        print(f"Auto-created RFP {rfp_id} for text document")
+    
+    # Store original file and metadata in RFP
+    try:
+        rfp_update_data = {
+            "original_file_data": base64.b64encode(content).decode('utf-8'),  # Encode bytes as base64 string
+            "original_file_name": filename,
+            "original_file_size": file_size
+        }
+        
+        if original_rfp_date:
+            rfp_update_data["original_rfp_date"] = original_rfp_date
+        
+        supabase.table("client_rfps").update(rfp_update_data).eq("id", rfp_id).execute()
+        print(f"Stored original file in RFP {rfp_id}")
+        
+        # Store tags
+        if tags:
+            tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+            if tag_list:
+                upsert_tags_for_rfp(client_id, rfp_id, tag_list, supabase)
+                print(f"Associated {len(tag_list)} tags with RFP {rfp_id}")
+    except Exception as e:
+        print(f"Warning: Failed to store file/metadata: {e}")
+    
+    # Create background job
+    estimated_minutes = max(1, file_size // (1024 * 1024))  # Rough estimate: 1 min per MB
+    estimated_completion = datetime.now() + timedelta(minutes=estimated_minutes)
+    
+    job_data = {
+        "client_id": client_id,
+        "rfp_id": rfp_id,
+        "job_type": "ingest_text",
+        "status": "queued",
+
+        "file_name": filename,
+        "file_size": file_size,
+        "progress_percent": 0,
+        "current_step": "Job queued for text ingestion",
+        "estimated_completion": estimated_completion.isoformat(),
+        "created_at": datetime.now().isoformat(),
+        "job_data": {
+            "file_content": base64.b64encode(content).decode('utf-8'),
+            "file_name": filename,
+            "client_id": client_id,
+            "rfp_id": rfp_id
+        }
+    }
+    
+    job_result = supabase.table("client_jobs").insert(job_data).execute()
+    job_id = job_result.data[0]["id"]
+    
+    # Update RFP with job info
+    supabase.table("client_rfps").update({
+        "last_job_id": job_id,
+        "last_job_type": "ingest_text",
+        "last_job_status": "queued"
+    }).eq("id", rfp_id).execute()
+    
+    # Log activity
+    try:
+        record_event(
+            "qa",
+            "text_ingestion_submitted",
+            actor_client_id=client_id,
+            subject_id=job_id,
+            subject_type="job",
+            metadata={"job_type": "ingest_text", "rfp_id": rfp_id, "file_name": filename},
+        )
+    except Exception as e:
+        print(f"Warning: Failed to log activity: {e}")
+    
+    return {
+        "id": job_id,
+        "type": "ingest_text",
+        "status": "pending",
+        "fileName": filename,
+        "rfpName": rfp_id,
+        "fileSize": file_size,
+        "estimatedMinutes": estimated_minutes,
+        "message": "Text ingestion job submitted successfully"
+    }
+
+
+@router.post("/org/search")
+@safe_db_operation("search knowledge base")
+def search_knowledge_base_endpoint(
+    payload: dict = Body(...),
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    rfp_id: str | None = Header(default=None, alias="X-RFP-ID")
+):
+    """
+    Hybrid search across entire knowledge base (documents + Q&A pairs).
+    
+    Combines:
+    - Dense retrieval: Vector similarity (semantic understanding)
+    - Sparse retrieval: BM25 (keyword matching)
+    
+    Request body:
+    {
+        "query": "your search query",
+        "top_k": 10,  // optional, default 10
+        "include_docs": true,  // optional, default true
+        "include_qa": true  // optional, default true
+    }
+    
+    Returns matching documents and Q&A pairs ranked by relevance.
+    """
+    client_id = get_client_id_from_key(x_client_key)
+    query = payload.get("query", "").strip()
+    
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+    
+    top_k = payload.get("top_k", 10)
+    include_docs = payload.get("include_docs", True)
+    include_qa = payload.get("include_qa", True)
+    
+    try:
+        results = search_knowledge_base(
+            query=query,
+            client_id=client_id,
+            rfp_id=rfp_id,
+            top_k=top_k,
+            include_docs=include_docs,
+            include_qa=include_qa
+        )
+        return results
+    except Exception as e:
+        print(f"Knowledge base search error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 # ============================================================================

@@ -6,6 +6,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import httpcore
 import jwt
 from fastapi import HTTPException, Header
 
@@ -163,6 +164,10 @@ def get_client_id_from_key(client_key: str | None) -> str:
     raise HTTPException(status_code=500, detail="Client lookup failed")
 
 
+def get_client_id(x_client_key: str | None = Header(None, alias="X-Client-Key")) -> str:
+    """FastAPI dependency to get validated client ID from header."""
+    return get_client_id_from_key(x_client_key)
+
 def is_admin_client(client_id: str) -> bool:
     """
     Determine whether the given client ID has administrator privileges.
@@ -284,7 +289,7 @@ def verify_admin_credentials(email: str, password: str) -> str | None:
             supabase = get_supabase_client()
             resp = (
                 supabase.table("clients")
-                .select("id, password_hash, role, status, api_key_revoked")
+                .select("id, password_hash, role, status, api_key_revoked, contact_email")
                 .eq("contact_email", normalized_email)
                 .limit(1)
                 .execute()
@@ -295,18 +300,26 @@ def verify_admin_credentials(email: str, password: str) -> str | None:
 
             row = rows[0]
             status = (row.get("status") or "active").lower()
+            role = (row.get("role") or "").strip().lower()
+            
+            # Use logger if available or print
+            print(f"DEBUG: Admin login attempt for {normalized_email}. Status={status}, Role={role}")
+
             if status != "active" or row.get("api_key_revoked"):
                 # super admin is always allowed even if mis-set
                 if (row.get("contact_email") or "").strip().lower() != SUPER_ADMIN_EMAIL:
+                    print(f"DEBUG: Admin {normalized_email} rejected due to status/revocation")
                     return None
 
-            role = (row.get("role") or "").strip().lower()
             if role != ADMIN_ROLE_NAME:
+                print(f"DEBUG: Admin {normalized_email} rejected due to role mismatch (expected {ADMIN_ROLE_NAME})")
                 return None
 
             stored_hash = (row.get("password_hash") or "").strip()
             if stored_hash and stored_hash == password_hash:
                 return row["id"]
+            
+            print(f"DEBUG: Admin {normalized_email} rejected due to password mismatch")
             return None
         except Exception:
             if attempt < attempts - 1:
