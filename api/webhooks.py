@@ -103,4 +103,59 @@ async def stripe_webhook(
             supabase.table("clients").update({"stripe_customer_id": customer_id}).eq("id", client_id).execute()
             logger.info(f"Checkout completed for client {client_id}")
 
+    elif event_type == "invoice.payment_failed":
+        # Handle payment failure
+        customer_id = data_object["customer"]
+        subscription_id = data_object.get("subscription")
+        
+        if subscription_id:
+            # Get client_id from subscription metadata or customer lookup
+            subscription = get_subscription_details(subscription_id)
+            client_id = subscription.get("metadata", {}).get("client_id")
+            
+            if not client_id:
+                # Lookup client_id by customer_id
+                supabase = get_supabase_client()
+                res = supabase.table("clients").select("id").eq("stripe_customer_id", customer_id).single().execute()
+                if res.data:
+                    client_id = res.data["id"]
+            
+            if client_id:
+                # Update subscription status - it may have changed to past_due
+                subscription_data = {
+                    "status": subscription.get("status", "past_due"),
+                    "current_period_end": subscription.get("current_period_end"),
+                    "trial_end": subscription.get("trial_end"),
+                    "items": subscription.get("items")
+                }
+                update_client_subscription(client_id, subscription_data)
+                logger.info(f"Payment failed for client {client_id} - status updated to {subscription_data['status']}")
+
+    elif event_type == "invoice.payment_succeeded":
+        # Handle successful payment (renewal or retry)
+        customer_id = data_object["customer"]
+        subscription_id = data_object.get("subscription")
+        
+        if subscription_id:
+            subscription = get_subscription_details(subscription_id)
+            client_id = subscription.get("metadata", {}).get("client_id")
+            
+            if not client_id:
+                # Lookup client_id by customer_id
+                supabase = get_supabase_client()
+                res = supabase.table("clients").select("id").eq("stripe_customer_id", customer_id).single().execute()
+                if res.data:
+                    client_id = res.data["id"]
+            
+            if client_id:
+                # Update subscription status back to active
+                subscription_data = {
+                    "status": subscription.get("status", "active"),
+                    "current_period_end": subscription.get("current_period_end"),
+                    "trial_end": subscription.get("trial_end"),
+                    "items": subscription.get("items")
+                }
+                update_client_subscription(client_id, subscription_data)
+                logger.info(f"Payment succeeded for client {client_id} - subscription reactivated")
+
     return {"status": "success"}

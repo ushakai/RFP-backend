@@ -13,7 +13,10 @@ from utils.auth import get_client_id
 from services.stripe_service import (
     create_or_get_customer,
     create_checkout_session,
-    create_portal_session
+    create_portal_session,
+    cancel_subscription,
+    get_customer_subscription,
+    sync_subscription_by_session
 )
 from services.supabase_service import execute_with_retry
 from utils.logging_config import get_logger
@@ -60,6 +63,24 @@ def get_status(client_id: str = Depends(get_client_id)):
     except Exception as e:
         logger.error(f"Failed to fetch subscription status for client {client_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch subscription status. Please try again.")
+
+@router.post("/sync")
+def sync_subscription(
+    payload: Dict[str, str] = Body(...),
+    client_id: str = Depends(get_client_id)
+):
+    """Manually sync subscription from Stripe session."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+        
+    try:
+        result = sync_subscription_by_session(session_id, client_id)
+        return result
+    except Exception as e:
+        logger.error(f"Failed to sync subscription: {e}")
+        # Don't expose internal errors too broadly, but returning success: false is helpful
+        raise HTTPException(status_code=500, detail="Failed to sync subscription")
 
 @router.post("/create-checkout")
 def create_checkout(
@@ -158,4 +179,109 @@ def create_portal(client_id: str = Depends(get_client_id)):
         return {"portal_url": portal_url}
     except Exception as e:
         logger.error(f"Failed to create portal session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/cancel")
+def cancel_subscription_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    client_id: str = Depends(get_client_id)
+):
+    """Cancel the user's subscription."""
+    cancel_immediately = payload.get("cancel_immediately", False)
+    
+    try:
+        def _fetch_customer_id():
+            supabase = get_supabase_client()
+            return supabase.table("clients").select("stripe_customer_id, subscription_status").eq("id", client_id).single().execute()
+        
+        res = execute_with_retry(
+            _fetch_customer_id,
+            retries=3,
+            backoff_seconds=0.3,
+            max_total_time=5.0
+        )
+        
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        customer_id = res.data.get("stripe_customer_id")
+        current_status = res.data.get("subscription_status")
+        
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="No Stripe customer found for this account. Please subscribe first.")
+        
+        # Check if already canceled - but allow cancel_at_period_end subscriptions to be modified
+        if current_status == "canceled":
+            raise HTTPException(
+                status_code=400, 
+                detail="Subscription is already canceled. If you need to resubscribe, please visit the pricing page."
+            )
+        elif current_status in ["past_due", "unpaid"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subscription is {current_status}. Please update your payment method to reactivate."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch customer data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch customer data. Please try again.")
+    
+    try:
+        result = cancel_subscription(customer_id, cancel_immediately, client_id=client_id)
+        logger.info(f"Subscription canceled for client {client_id} (immediately={cancel_immediately})")
+        return result
+    except ValueError as e:
+        # ValueError from cancel_subscription contains user-friendly message
+        logger.error(f"Failed to cancel subscription for client {client_id}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error canceling subscription for client {client_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to cancel subscription: {str(e)}")
+
+@router.get("/payment-method")
+def get_payment_method(client_id: str = Depends(get_client_id)):
+    """Get the customer's default payment method."""
+    try:
+        def _fetch_customer_id():
+            supabase = get_supabase_client()
+            return supabase.table("clients").select("stripe_customer_id").eq("id", client_id).single().execute()
+        
+        res = execute_with_retry(
+            _fetch_customer_id,
+            retries=3,
+            backoff_seconds=0.3,
+            max_total_time=5.0
+        )
+        
+        customer_id = res.data.get("stripe_customer_id") if res.data else None
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="No Stripe customer found for this account. Please subscribe first.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch Stripe customer ID: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch customer data. Please try again.")
+    
+    try:
+        subscription = get_customer_subscription(customer_id)
+        if not subscription:
+            return {"has_payment_method": False, "payment_method": None}
+        
+        # Get default payment method from subscription
+        default_payment_method_id = subscription.get("default_payment_method")
+        if default_payment_method_id:
+            import stripe
+            pm = stripe.PaymentMethod.retrieve(default_payment_method_id)
+            return {
+                "has_payment_method": True,
+                "payment_method": {
+                    "type": pm.type,
+                    "card": pm.card.brand if pm.card else None,
+                    "last4": pm.card.last4 if pm.card else None,
+                }
+            }
+        return {"has_payment_method": False, "payment_method": None}
+    except Exception as e:
+        logger.error(f"Failed to get payment method: {e}")
         raise HTTPException(status_code=500, detail=str(e))
