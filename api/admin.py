@@ -11,8 +11,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 
-from api.tenders import notify_client as _notify_client
-import api.tenders as tenders_api
 from config.settings import ADMIN_JWT_EXPIRES_MINUTES, ENABLE_TENDER_INGESTION, UK_TIMEZONE
 from services.activity_service import (
     export_events_csv,
@@ -45,6 +43,88 @@ from config.settings import get_supabase_client
 
 router = APIRouter(prefix="/admin")
 logger = get_logger(__name__, "app")
+
+_admin_job_status = {
+    "ingestion": {
+        "running": False,
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    },
+    "digest": {
+        "running": False,
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    }
+}
+
+def _run_ingestion_background(actor_email: str):
+    global _admin_job_status
+    status = _admin_job_status["ingestion"]
+    try:
+        ingestion_module = importlib.import_module("tender_ingestion")
+        stored = matched = 0
+        new_ids = []
+        if ENABLE_TENDER_INGESTION:
+            stored, matched, new_ids = ingestion_module.ingest_all_tenders(force=True)
+            record_ingestion(datetime.now(timezone.utc))
+            
+            record_event(
+                "system",
+                "manual_ingestion",
+                actor_email=actor_email,
+                metadata={"stored": stored, "matched": matched, "new_ids": len(new_ids)},
+            )
+            
+            status["result"] = {
+                "stored": stored,
+                "matched": matched,
+                "new_tenders": len(new_ids),
+            }
+        else:
+            status["error"] = "ENABLE_TENDER_INGESTION is disabled"
+    except Exception as exc:
+        logger.error(f"Background ingestion failed: {exc}")
+        traceback.print_exc()
+        status["error"] = str(exc)
+    finally:
+        status["running"] = False
+        status["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+def _run_digest_background(actor_email: str):
+    global _admin_job_status
+    status = _admin_job_status["digest"]
+    try:
+        since_utc = datetime.now(timezone.utc) - timedelta(hours=24)
+        digest_summary = send_daily_digest_since(since_utc)
+        record_digest(datetime.now(UK_TIMEZONE).date())
+
+        record_event(
+            "system",
+            "manual_digest",
+            actor_email=actor_email,
+            metadata={
+                "emails_attempted": digest_summary["attempted"],
+                "emails_sent": digest_summary["sent"]
+            },
+        )
+
+        status["result"] = {
+            "emails_attempted": digest_summary["attempted"],
+            "emails_sent": digest_summary["sent"],
+            "no_matches": digest_summary.get("no_matches", 0),
+        }
+    except Exception as exc:
+        logger.error(f"Background digest failed: {exc}")
+        traceback.print_exc()
+        status["error"] = str(exc)
+    finally:
+        status["running"] = False
+        status["completed_at"] = datetime.now(timezone.utc).isoformat()
+
 
 
 class AdminLoginRequest(BaseModel):
@@ -139,6 +219,36 @@ def list_users(
     if role:
         query = query.eq("role", role)
 
+    resp = query.execute()
+    return {"items": resp.data or [], "total": resp.count or 0, "page": page, "page_size": page_size}
+
+
+@router.get("/subscriptions")
+def list_subscriptions(
+    tier: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    _: dict = Depends(require_admin),
+):
+    supabase = get_supabase_client()
+    offset = (page - 1) * page_size
+    
+    query = (
+        supabase.table("clients")
+        .select("id, name, contact_email, subscription_tier, subscription_status, subscription_period_end, trial_end, created_at", count="exact")
+        .order("created_at", desc=True)
+        .range(offset, offset + page_size - 1)
+    )
+    
+    if tier:
+        query = query.eq("subscription_tier", tier)
+    if status:
+        query = query.eq("subscription_status", status)
+    else:
+        # By default only show people who have or had a sub/trial
+        query = query.not_.is_("subscription_status", "null")
+        
     resp = query.execute()
     return {"items": resp.data or [], "total": resp.count or 0, "page": page, "page_size": page_size}
 
@@ -420,20 +530,14 @@ def analytics(hours: int = Query(default=168, ge=1, le=720), _: dict = Depends(r
 
 @router.post("/run-daily-cycle")
 def run_daily_cycle(admin: dict = Depends(require_admin)):
-    """
-    Manually trigger the daily ingestion and digest email process.
-    """
+    """Trigger both ingestion and digest sequentially (Sync)."""
     ingestion_module = importlib.import_module("tender_ingestion")
     stored = matched = 0
-    new_ids: list[str] = []
+    new_ids = []
     if ENABLE_TENDER_INGESTION:
         stored, matched, new_ids = ingestion_module.ingest_all_tenders(force=True)
         record_ingestion(datetime.now(timezone.utc))
-        for cid in list(tenders_api._client_streams.keys()):
-            _notify_client(cid, "matches-updated", {"reason": "ingestion"})
-    else:
-        logger.info("ENABLE_TENDER_INGESTION disabled; skipping manual ingestion run.")
-
+    
     since_utc = datetime.now(timezone.utc) - timedelta(hours=24)
     digest_summary = send_daily_digest_since(since_utc)
     record_digest(datetime.now(UK_TIMEZONE).date())
@@ -445,71 +549,55 @@ def run_daily_cycle(admin: dict = Depends(require_admin)):
         actor_email=admin.get("email"),
         metadata={"stored": stored, "matched": matched, "new_ids": len(new_ids)},
     )
-
     return {
         "stored": stored,
         "matched": matched,
         "new_tenders": len(new_ids),
         "emails_attempted": digest_summary["attempted"],
         "emails_sent": digest_summary["sent"],
-        "no_matches_emails": digest_summary.get("no_matches", 0),
     }
 
-
-@router.post("/run-daily-cycle")
-def run_daily_cycle(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """
-    Manually trigger the daily ingestion and digest email process.
-    Runs in background to avoid HTTP timeout issues.
-    """
-    global _digest_job_status
-    client_id = get_client_id_from_key(x_client_key)
-    if not is_admin_client(client_id):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    # Check if already running
-    if _digest_job_status["running"]:
-        return {
-            "status": "already_running",
-            "message": "Daily cycle is already in progress",
-            "started_at": _digest_job_status["started_at"],
-        }
-
-    # Start background job
-    _digest_job_status = {
+@router.post("/ingest-tenders")
+def trigger_ingestion(admin: dict = Depends(require_admin)):
+    global _admin_job_status
+    status = _admin_job_status["ingestion"]
+    if status["running"]:
+        return {"status": "already_running", "started_at": status["started_at"]}
+    
+    status.update({
         "running": True,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
         "result": None,
         "error": None,
-    }
+    })
     
-    thread = threading.Thread(target=_run_daily_cycle_background, daemon=True)
+    thread = threading.Thread(target=_run_ingestion_background, args=(admin.get("email"),), daemon=True)
     thread.start()
+    return {"status": "started", "started_at": status["started_at"]}
 
-    return {
-        "status": "started",
-        "message": "Daily cycle started in background. Check /admin/daily-cycle-status for progress.",
-        "started_at": _digest_job_status["started_at"],
-    }
+@router.post("/send-digests")
+def trigger_digests(admin: dict = Depends(require_admin)):
+    global _admin_job_status
+    status = _admin_job_status["digest"]
+    if status["running"]:
+        return {"status": "already_running", "started_at": status["started_at"]}
+    
+    status.update({
+        "running": True,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    })
+    
+    thread = threading.Thread(target=_run_digest_background, args=(admin.get("email"),), daemon=True)
+    thread.start()
+    return {"status": "started", "started_at": status["started_at"]}
 
-
-@router.get("/daily-cycle-status")
-def get_daily_cycle_status(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """
-    Check the status of the background daily cycle job.
-    """
-    client_id = get_client_id_from_key(x_client_key)
-    if not is_admin_client(client_id):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    return {
-        "running": _digest_job_status["running"],
-        "started_at": _digest_job_status["started_at"],
-        "completed_at": _digest_job_status["completed_at"],
-        "result": _digest_job_status["result"],
-        "error": _digest_job_status["error"],
-    }
+@router.get("/job-status")
+def get_admin_job_status(_: dict = Depends(require_admin)):
+    return _admin_job_status
 
 
 def _parse_since_param(value: str | None) -> datetime | None:

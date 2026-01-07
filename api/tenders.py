@@ -10,12 +10,12 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Header, HTTPException, Body
+from fastapi import APIRouter, Header, HTTPException, Body, Depends
 from sse_starlette.sse import EventSourceResponse
 from postgrest.exceptions import APIError
 import httpx
 import httpcore
-from utils.auth import get_client_id_from_key
+from utils.auth import get_client_id_from_key, require_subscription
 from config.settings import get_supabase_client, reinitialize_supabase, ENABLE_PAYMENT, FILTER_UK_ONLY
 from services.tender_service import rematch_for_client
 from services.gemini_service import summarize_tender_for_paid_view
@@ -38,45 +38,12 @@ from utils.cache_manager import (
 router = APIRouter()
 logger = get_logger(__name__, "app")
 
-# Client notification streams
-_client_streams: dict[str, list[asyncio.Queue]] = {}
 
-def notify_client(client_id: str, event_type: str, payload: dict | None = None):
-    """Notify connected SSE clients for a specific client_id."""
-    queues = _client_streams.get(client_id) or []
-    message = {"type": event_type, "data": payload or {}}
-    for q in queues:
-        try:
-            q.put_nowait(message)
-        except Exception:
-            pass
+# Client notification streams removed in favor of polling
+# _client_streams: dict[str, list[asyncio.Queue]] = {}
+# notify_client removed
 
-
-@router.get("/tenders/stream")
-async def tenders_stream(client_key: str):
-    """SSE stream for tender match updates. Pass client_key as query param."""
-    client_id = get_client_id_from_key(client_key)
-    q: asyncio.Queue = asyncio.Queue()
-    if client_id not in _client_streams:
-        _client_streams[client_id] = []
-    _client_streams[client_id].append(q)
-
-    async def gen():
-        try:
-            # Initial ping
-            yield {"event": "ping", "data": "ok"}
-            while True:
-                msg = await q.get()
-                yield {"event": msg.get("type", "message"), "data": json.dumps(msg.get("data", {}))}
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                _client_streams[client_id].remove(q)
-            except Exception:
-                pass
-
-    return EventSourceResponse(gen())
+# @router.get("/tenders/stream") - Removed
 
 
 def _is_schema_cache_error(exc: Exception) -> bool:
@@ -219,7 +186,7 @@ def _schedule_tender_refresh():
     pass
 
 
-@router.get("/tenders/keywords")
+@router.get("/tenders/keywords", dependencies=[Depends(require_subscription(["tenders", "both"]))])
 def get_tender_keywords(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get the keyword set for the client (single set)."""
     client_id = get_client_id_from_key(x_client_key)
@@ -687,7 +654,7 @@ def _derive_summary_preview(tender_row: dict) -> str:
     return intro.strip()
 
 
-@router.post("/tenders/keywords")
+@router.post("/tenders/keywords", dependencies=[Depends(require_subscription(["tenders", "both"]))])
 def upsert_tender_keyword(
     payload: dict = Body(...),
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
@@ -739,8 +706,6 @@ def upsert_tender_keyword(
                 logger.info(f"Starting synchronous rematch for client {client_id[:8]}...")
                 created = rematch_for_client(client_id)
                 logger.info(f"Rematch complete: {created} matches created")
-                # Notify connected clients about the update
-                notify_client(client_id, "matches-updated", {"reason": "keywords-upserted"})
             except Exception as e:
                 logger.error(f"Error in rematch for client {client_id}: {e}")
                 traceback.print_exc()
@@ -755,7 +720,7 @@ def upsert_tender_keyword(
         raise HTTPException(status_code=500, detail="Failed to save tender keywords")
 
 
-@router.put("/tenders/keywords/{keyword_id}")
+@router.put("/tenders/keywords/{keyword_id}", dependencies=[Depends(require_subscription(["tenders", "both"]))])
 def update_tender_keyword(
     keyword_id: str,
     payload: dict = Body(...),
@@ -816,7 +781,7 @@ def update_tender_keyword(
         raise HTTPException(status_code=500, detail="Failed to update tender keyword")
 
 
-@router.delete("/tenders/keywords/{keyword_id}")
+@router.delete("/tenders/keywords/{keyword_id}", dependencies=[Depends(require_subscription(["tenders", "both"]))])
 def delete_tender_keyword(
     keyword_id: str,
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
@@ -852,8 +817,11 @@ def delete_tender_keyword(
         raise HTTPException(status_code=500, detail="Failed to delete tender keyword")
 
 
-@router.get("/tenders")
-def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+@router.get("/tenders", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getAllTenders(
+    page: int = 1,
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
     """Get all active tenders (includes matched status for the client)."""
     client_id = get_client_id_from_key(x_client_key)
     now_utc = datetime.now(timezone.utc)
@@ -1012,8 +980,10 @@ def get_all_tenders(x_client_key: str | None = Header(default=None, alias="X-Cli
         return []
 
 
-@router.get("/tenders/purchased")
-def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+@router.get("/tenders/purchased", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getPurchasedTenders(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
     client_id = get_client_id_from_key(x_client_key)
 
     # Check cache first
@@ -1173,8 +1143,10 @@ def get_purchased_tenders(x_client_key: str | None = Header(default=None, alias=
         return []
 
 
-@router.get("/tenders/matches")
-def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
+@router.get("/tenders/matches", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getMatchedTenders(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
     """Get all matched tenders for the client (excludes tenders with passed deadlines)
     
     NOTE: Cache is disabled for matched tenders to ensure fresh results after keyword changes.
@@ -1297,8 +1269,8 @@ def get_matched_tenders(x_client_key: str | None = Header(default=None, alias="X
         return []
 
 
-@router.get("/tenders/{tender_id}")
-def get_tender_details(
+@router.get("/tenders/{tender_id}", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getTenderDetails(
     tender_id: str,
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
 ):
@@ -1449,8 +1421,8 @@ def get_tender_details(
         raise HTTPException(status_code=500, detail=f"Failed to get tender details: {str(e)}")
 
 
-@router.post("/tenders/{tender_id}/access")
-def request_tender_access(
+@router.post("/tenders/{tender_id}/access", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def requestTenderAccess(
     tender_id: str,
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
 ):

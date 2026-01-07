@@ -28,11 +28,9 @@ from config.settings import (
 )
 
 # Import API routers
-from api import health, rfps, qa, jobs, drive, tenders, admin, auth
+from api import health, rfps, qa, jobs, drive, tenders, admin, auth, subscriptions, webhooks
 
 # Import notification function for background tasks
-from api.tenders import notify_client as _notify_client
-import api.tenders as tenders_api
 
 from services.digest_service import (
     send_daily_digest_since,
@@ -136,6 +134,8 @@ app.include_router(jobs.router, tags=["Jobs"])
 app.include_router(drive.router, tags=["Google Drive"])
 app.include_router(tenders.router, tags=["Tenders"])
 app.include_router(admin.router, tags=["Admin"])
+app.include_router(subscriptions.router, tags=["Subscriptions"])
+app.include_router(webhooks.router, tags=["Webhooks"])
 
 
 # ============================================================================
@@ -182,8 +182,7 @@ def _scheduled_ingestion_worker():
                 f"Ingestion complete: stored={stored}, matched={matched}, new_tenders={len(new_ids)}"
             )
 
-            for cid in list(tenders_api._client_streams.keys()):
-                _notify_client(cid, "matches-updated", {"reason": "ingestion"})
+            # Notification removed as WebSocket support is disabled
         except Exception as exc:
             tender_logger.error(f"Ingestion cycle failed: {exc}")
             traceback.print_exc()

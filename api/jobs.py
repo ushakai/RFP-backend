@@ -5,8 +5,8 @@ import base64
 import time
 import traceback
 from datetime import datetime, timedelta
-from fastapi import APIRouter, UploadFile, Header, HTTPException, File, Form
-from utils.auth import get_client_id_from_key
+from fastapi import APIRouter, UploadFile, Header, HTTPException, File, Form, Depends
+from utils.auth import get_client_id_from_key, require_subscription
 from services.activity_service import record_event
 from utils.helpers import create_rfp_from_filename
 from config.settings import get_supabase_client, reinitialize_supabase
@@ -73,7 +73,7 @@ def submit_job_internal(file_content: bytes, file_name: str, file_size: int, job
     
     return job_id
 
-@router.post("/jobs/submit")
+@router.post("/jobs/submit", dependencies=[Depends(require_subscription(["processing", "both"]))])
 async def submit_job(
     file: UploadFile = File(...),
     job_type: str = Form(...),
@@ -248,7 +248,7 @@ async def submit_job(
     return result
 
 
-@router.get("/jobs")
+@router.get("/jobs", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("list jobs")
 def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """List all jobs for a client with built-in pagination and automatic retry
@@ -313,7 +313,7 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
     return {"jobs": [], "error": "Database connection failed after retries"}
 
 
-@router.get("/jobs/{job_id}")
+@router.get("/jobs/{job_id}", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get specific job details with retry logic"""
     client_id = get_client_id_from_key(x_client_key)
@@ -350,7 +350,7 @@ def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 
-@router.get("/jobs/{job_id}/status")
+@router.get("/jobs/{job_id}/status", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def get_job_status(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get job status for polling - lightweight endpoint"""
     client_id = get_client_id_from_key(x_client_key)
@@ -383,7 +383,7 @@ def get_job_status(job_id: str, x_client_key: str | None = Header(default=None, 
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 
-@router.delete("/jobs/{job_id}")
+@router.delete("/jobs/{job_id}", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Cancel a pending job"""
     client_id = get_client_id_from_key(x_client_key)
@@ -410,7 +410,7 @@ def cancel_job(job_id: str, x_client_key: str | None = Header(default=None, alia
         raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job_status}'. Only pending or processing jobs can be cancelled.")
 
 
-@router.post("/jobs/cleanup")
+@router.post("/jobs/cleanup", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def cleanup_old_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Clean up old completed/failed jobs to free up database space"""
     client_id = get_client_id_from_key(x_client_key)
@@ -431,7 +431,7 @@ def cleanup_old_jobs(x_client_key: str | None = Header(default=None, alias="X-Cl
         raise HTTPException(status_code=500, detail="Failed to cleanup jobs")
 
 
-@router.get("/jobs/stats")
+@router.get("/jobs/stats", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def get_job_stats(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get job statistics for the client"""
     client_id = get_client_id_from_key(x_client_key)

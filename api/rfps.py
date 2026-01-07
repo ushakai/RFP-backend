@@ -3,16 +3,16 @@ RFP management endpoints
 """
 import io
 import traceback
-from fastapi import APIRouter, UploadFile, Header, HTTPException, Body
+from fastapi import APIRouter, UploadFile, Header, HTTPException, Body, Depends
 from fastapi.responses import StreamingResponse
-from utils.auth import get_client_id_from_key
+from utils.auth import get_client_id_from_key, require_subscription
 from config.settings import get_supabase_client
 from services.excel_service import process_excel_file_obj
 from utils.db_utils import safe_db_operation
 
 router = APIRouter()
 
-@router.post("/process")
+@router.post("/process", dependencies=[Depends(require_subscription(["processing", "both"]))])
 async def process_excel(
     file: UploadFile, 
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
@@ -34,7 +34,7 @@ async def process_excel(
         headers={"Content-Disposition": f"attachment; filename=processed_{file.filename}"}
     )
 
-@router.get("/rfps")
+@router.get("/rfps", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("list RFPs")
 def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """List all RFPs for a client with automatic retry on connection errors"""
@@ -92,7 +92,7 @@ def list_rfps(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
             pass
         raise
 
-@router.post("/rfps")
+@router.post("/rfps", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("create RFP")
 def create_rfp(
     payload: dict = Body(...), 
@@ -116,7 +116,7 @@ def create_rfp(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to create RFP")
 
-@router.put("/rfps/{rfp_id}")
+@router.put("/rfps/{rfp_id}", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("update RFP")
 def update_rfp(
     rfp_id: str, 
@@ -139,7 +139,7 @@ def update_rfp(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to update RFP")
 
-@router.delete("/rfps/{rfp_id}")
+@router.delete("/rfps/{rfp_id}", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("delete RFP")
 def delete_rfp(
     rfp_id: str, 
@@ -156,7 +156,7 @@ def delete_rfp(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Failed to delete RFP")
 
-@router.post("/rfps/{rfp_id}/reprocess")
+@router.post("/rfps/{rfp_id}/reprocess", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("reprocess RFP")
 def reprocess_rfp(
     rfp_id: str,
