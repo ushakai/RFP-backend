@@ -11,8 +11,8 @@ import pandas as pd
 import numpy as np
 import base64
 from datetime import datetime, timedelta
-from fastapi import APIRouter, UploadFile, Header, HTTPException, Body, File
-from utils.auth import get_client_id_from_key
+from fastapi import APIRouter, UploadFile, Header, HTTPException, Body, File, Depends
+from utils.auth import get_client_id_from_key, require_subscription
 from config.settings import get_supabase_client, GEMINI_MODEL
 from services.gemini_service import get_embedding, extract_qa_pairs_from_sheet
 from services.supabase_service import (
@@ -123,7 +123,7 @@ def _select_latest_answer_mappings(mappings: list[dict], answers: list[dict]) ->
 # ORGANIZATION MANAGEMENT
 # ============================================================================
 
-@router.get("/org")
+@router.get("/org", dependencies=[Depends(require_subscription(["tenders", "processing", "both"]))])
 def get_org(x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
     """Get organization details"""
     client_id = get_client_id_from_key(x_client_key)
@@ -159,7 +159,7 @@ def update_org(
 # Q&A MANAGEMENT
 # ============================================================================
 
-@router.get("/org/qa")
+@router.get("/org/qa", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("list Q&A")
 def list_org_qa(
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
@@ -209,7 +209,7 @@ def list_org_qa(
         return {"questions": [], "answers": [], "mappings": []}
 
 
-@router.post("/org/qa")
+@router.post("/org/qa", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def ingest_org_qa(
     payload: dict = Body(...), 
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
@@ -238,7 +238,7 @@ def ingest_org_qa(
     return {"created": created}
 
 
-@router.post("/org/qa/extract")
+@router.post("/org/qa/extract", dependencies=[Depends(require_subscription(["processing", "both"]))])
 async def extract_qa_from_upload(
     file: UploadFile = File(...), 
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"), 
@@ -295,7 +295,7 @@ async def extract_qa_from_upload(
     return {"created": created}
 
 
-@router.get("/org/documents")
+@router.get("/org/documents", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def get_documents(
     x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
     rfp_id: str | None = None,
@@ -343,7 +343,7 @@ def get_documents(
     }
 
 
-@router.post("/org/text-extract")
+@router.post("/org/text-extract", dependencies=[Depends(require_subscription(["processing", "both"]))])
 async def ingest_text_documents(
     file: UploadFile = File(...),
     original_rfp_date: str | None = Header(default=None, alias="X-Original-Date"),
@@ -483,7 +483,7 @@ async def ingest_text_documents(
     }
 
 
-@router.post("/org/search")
+@router.post("/org/search", dependencies=[Depends(require_subscription(["processing", "both"]))])
 @safe_db_operation("search knowledge base")
 def search_knowledge_base_endpoint(
     payload: dict = Body(...),

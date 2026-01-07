@@ -98,6 +98,23 @@ GMAIL_CLIENT_SECRET = _clean_env(os.getenv("GMAIL_CLIENT_SECRET"))
 GMAIL_REFRESH_TOKEN = _clean_env(os.getenv("GMAIL_REFRESH_TOKEN"))
 GMAIL_SENDER_EMAIL = _clean_env(os.getenv("GMAIL_SENDER_EMAIL"))
 
+# Stripe configuration
+STRIPE_SECRET_KEY = _clean_env(os.getenv("STRIPE_SECRET_KEY"))
+STRIPE_WEBHOOK_SECRET = _clean_env(os.getenv("STRIPE_WEBHOOK_SECRET"))
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", f"{FRONTEND_ORIGIN}/subscription/success")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", f"{FRONTEND_ORIGIN}/pricing")
+
+# Stripe Price IDs
+STRIPE_PRICE_TENDERS_MONTHLY = _clean_env(os.getenv("STRIPE_PRICE_TENDERS_MONTHLY"))
+STRIPE_PRICE_TENDERS_YEARLY = _clean_env(os.getenv("STRIPE_PRICE_TENDERS_YEARLY"))
+STRIPE_PRICE_PROCESSING_MONTHLY = _clean_env(os.getenv("STRIPE_PRICE_PROCESSING_MONTHLY"))
+STRIPE_PRICE_PROCESSING_YEARLY = _clean_env(os.getenv("STRIPE_PRICE_PROCESSING_YEARLY"))
+STRIPE_PRICE_BOTH_MONTHLY = _clean_env(os.getenv("STRIPE_PRICE_BOTH_MONTHLY"))
+STRIPE_PRICE_BOTH_YEARLY = _clean_env(os.getenv("STRIPE_PRICE_BOTH_YEARLY"))
+
+# Trial Period Configuration
+STRIPE_TRIAL_PERIOD_MINUTES = int(os.getenv("STRIPE_TRIAL_PERIOD_MINUTES", "10080")) # Default 7 days
+
 # Validate Gemini configuration
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY for Gemini")

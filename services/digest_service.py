@@ -327,7 +327,7 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
 
     clients_resp = (
         supabase.table("clients")
-        .select("id, name, contact_email")
+        .select("id, name, contact_email, subscription_tier, subscription_status")
         .in_("id", list(eligible_clients))
         .execute()
     )
@@ -336,6 +336,18 @@ def collect_digest_payloads(since_utc: datetime | None = None) -> Dict[str, Any]
     for client in clients:
         client_id = client.get("id")
         email = (client.get("contact_email") or "").strip()
+        
+        # Check subscription status and tier
+        sub_status = (client.get("subscription_status") or "").lower()
+        sub_tier = (client.get("subscription_tier") or "").lower()
+        
+        # Only send to active/trialing users with 'tenders' or 'both' tier
+        if sub_status not in ("active", "trialing"):
+            continue
+            
+        if sub_tier not in ("tenders", "both"):
+            continue
+
         if not client_id or not email:
             continue
 

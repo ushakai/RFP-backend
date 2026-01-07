@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import httpcore
 import jwt
-from fastapi import HTTPException, Header
+from fastapi import HTTPException, Header, Depends
 
 from config.settings import (
     ADMIN_CLIENT_EMAILS,
@@ -28,6 +28,12 @@ def hash_password(password: str) -> str:
     """Return a deterministic SHA-256 hash for the supplied password."""
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
+
+# Simple in-memory cache to reduce DB hits and socket exhaustion
+# Format: {api_key: (client_id, expiry_timestamp)}
+CLIENT_CACHE = {}
+CACHE_TTL = 60  # 1 minute cache
+
 def get_client_id_from_key(client_key: str | None) -> str:
     """
     Validate client API key and return client ID
@@ -43,6 +49,15 @@ def get_client_id_from_key(client_key: str | None) -> str:
     """
     if not client_key:
         raise HTTPException(status_code=401, detail="Missing X-Client-Key")
+        
+    # Check cache first
+    now = time.time()
+    if client_key in CLIENT_CACHE:
+        client_id, expiry = CLIENT_CACHE[client_key]
+        if now < expiry:
+            return client_id
+        else:
+            del CLIENT_CACHE[client_key]
     
     # Use fewer retries in production to avoid timeouts
     attempts = 3 if os.getenv("RENDER") or os.getenv("VERCEL") else 5
@@ -99,6 +114,9 @@ def get_client_id_from_key(client_key: str | None) -> str:
                 ).eq("id", client_id).execute()
             except Exception:
                 pass
+
+            # Cache the result
+            CLIENT_CACHE[client_key] = (client_id, time.time() + CACHE_TTL)
 
             return client_id
         except HTTPException as http_exc:
@@ -369,11 +387,22 @@ def require_admin(
     """
     # Try JWT first
     if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-        claims = decode_admin_token(token)
-        if claims.get("role") != ADMIN_ROLE_NAME:
-            raise HTTPException(status_code=403, detail="Admin role required")
-        return claims
+        try:
+            token = authorization.split(" ", 1)[1].strip()
+            claims = decode_admin_token(token)
+            if claims.get("role") != ADMIN_ROLE_NAME:
+                raise HTTPException(status_code=403, detail="Admin role required")
+            return claims
+        except HTTPException as e:
+            # If it's a 403 (role mismatch), we should probably keep it
+            if e.status_code == 403:
+                raise
+            # For 401 (expired/invalid), fall through to API key if provided
+            if not (x_api_key or x_client_key):
+                raise
+        except Exception:
+            if not (x_api_key or x_client_key):
+                raise HTTPException(status_code=401, detail="Invalid admin token")
     
     # Try API key (accept both x-api-key and X-Client-Key for compatibility)
     api_key = x_api_key or x_client_key
@@ -394,3 +423,59 @@ def require_admin(
         return {"sub": client_id, "email": email, "role": ADMIN_ROLE_NAME}
     
     raise HTTPException(status_code=401, detail="Missing authentication")
+
+
+def require_subscription(required_tiers: list[str] = ["tenders", "processing", "both"]):
+    """
+    FastAPI dependency factory to require a valid subscription.
+    """
+    def _require_subscription(client_id: str = Depends(get_client_id)) -> dict:
+        try:
+            supabase = get_supabase_client()
+            resp = (
+                supabase.table("clients")
+                .select("subscription_status, subscription_tier, trial_end, subscription_period_end, role")
+                .eq("id", client_id)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            if not rows:
+                raise HTTPException(status_code=404, detail="Client not found")
+            
+            row = rows[0]
+            status = row.get("subscription_status", "inactive")
+            tier = row.get("subscription_tier", "free")
+            role = row.get("role", "client")
+            
+            # Admins have full access
+            if role == "admin":
+                return row
+                
+            # Check if status is active or trialing
+            is_active = status in ["active", "trialing"]
+            
+            if not is_active:
+                # Check if it was trialing but trial ended
+                raise HTTPException(
+                    status_code=402, 
+                    detail="Subscription required. Please upgrade your plan."
+                )
+                
+            # Check if tier matches
+            if tier not in required_tiers and tier != "both":
+                raise HTTPException(
+                    status_code=403, 
+                    detail=f"Subscription tier '{tier}' does not have access to this feature. Required tiers: {required_tiers}"
+                )
+                
+            return row
+        except HTTPException:
+            raise
+        except Exception as exc:
+            print(f"Error checking subscription for {client_id}: {exc}")
+            # In case of DB error, we might want to fail closed or open depending on policy
+            # For now, fail closed (secure)
+            raise HTTPException(status_code=500, detail="Failed to verify subscription status")
+            
+    return _require_subscription
