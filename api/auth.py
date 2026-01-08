@@ -358,7 +358,7 @@ def login(payload: LoginRequest, request: Request) -> AuthResponse:
         # 1. First check the client status in our table
         client_resp = (
             supabase.table("clients")
-            .select("id, api_key, name, status, api_key_revoked, role, password_hash")
+            .select("id, api_key, name, status, api_key_revoked, role, password_hash, subscription_tier, subscription_status")
             .eq("contact_email", email)
             .limit(1)
             .execute()
