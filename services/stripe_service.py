@@ -94,8 +94,13 @@ def update_client_subscription(client_id: str, subscription_data: Dict[str, Any]
     if trial_end:
         update_data["trial_end"] = datetime.fromtimestamp(trial_end).isoformat()
     
-    # Determine tier and interval from price ID if available
-    if "items" in subscription_data:
+    # Clear tier if subscription is canceled/unpaid/past_due
+    status = subscription_data.get("status")
+    if status in ["canceled", "unpaid", "past_due"]:
+        update_data["subscription_tier"] = None
+        logger.info(f"Clearing subscription_tier for status: {status}")
+    # Determine tier and interval from price ID if available (only if status is active)
+    elif "items" in subscription_data:
         items = subscription_data["items"]
         if isinstance(items, dict) and "data" in items and items["data"]:
             item = items["data"][0]
@@ -279,6 +284,11 @@ def cancel_subscription(customer_id: str, cancel_immediately: bool = False, clie
                 update_data = {
                     "subscription_status": status,
                 }
+                
+                # If canceling immediately, clear subscription_tier to remove access
+                if cancel_immediately and status == "canceled":
+                    update_data["subscription_tier"] = None
+                    logger.info(f"Clearing subscription_tier for immediate cancellation")
                 
                 # Get full subscription details to update period_end
                 full_sub = stripe.Subscription.retrieve(subscription_id)

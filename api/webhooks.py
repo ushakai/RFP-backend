@@ -83,9 +83,14 @@ async def stripe_webhook(
             
             update_client_subscription(client_id, update_data)
             
-            # If tier was identified, update it too
-            if tier:
-                supabase = get_supabase_client()
+            # Update tier: set if active, clear if canceled
+            supabase = get_supabase_client()
+            if subscription["status"] == "canceled":
+                # Clear tier when subscription is canceled
+                supabase.table("clients").update({"subscription_tier": None}).eq("id", client_id).execute()
+                logger.info(f"Cleared subscription_tier for canceled subscription (client {client_id})")
+            elif tier:
+                # Only set tier if subscription is active and tier was identified
                 supabase.table("clients").update({"subscription_tier": tier}).eq("id", client_id).execute()
                 
             logger.info(f"Updated subscription for client {client_id} (Status: {subscription['status']})")
