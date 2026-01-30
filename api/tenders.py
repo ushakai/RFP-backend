@@ -33,10 +33,39 @@ from utils.cache_manager import (
     invalidate_matched_cache,
     invalidate_keywords_cache,
     invalidate_purchased_cache,
+    set_matching_status,
+    get_matching_status,
 )
 
 router = APIRouter()
 logger = get_logger(__name__, "app")
+
+
+def _normalize_str_list(value: Any) -> List[str]:
+    """Normalize a value to a list of strings (handles various formats)."""
+    if value is None:
+        return []
+    result = []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            cleaned = cleaned[1:-1]
+        if not cleaned:
+            return []
+        parts = [part.strip().strip('"').strip("'") for part in cleaned.replace(";", ",").split(",")]
+        result = [part.lower() for part in parts if part]
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip().lower()
+            if text:
+                result.append(text)
+    else:
+        text = str(value).strip().lower()
+        if text:
+            result.append(text)
+    return result
 
 
 # Client notification streams removed in favor of polling
@@ -671,11 +700,13 @@ def upsert_tender_keyword(
         f"sectors/industries={keyword_data.get('sectors')}"
     )
 
-    # Require at least one keyword (location and industry are optional filters)
+    # Require at least one filter: keywords, locations, OR industries
     has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
+    has_locations = keyword_data.get("locations") and len(keyword_data["locations"]) > 0
+    has_sectors = keyword_data.get("sectors") and len(keyword_data["sectors"]) > 0
     
-    if not has_keywords:
-        raise HTTPException(status_code=400, detail="At least one keyword is required")
+    if not has_keywords and not has_locations and not has_sectors:
+        raise HTTPException(status_code=400, detail="At least one keyword, location, or industry is required")
     
     try:
         existing = _with_supabase_retry(
@@ -700,15 +731,20 @@ def upsert_tender_keyword(
             # Invalidate caches
             invalidate_client_caches(client_id)
             
-            # Run rematching SYNCHRONOUSLY so the frontend can show loading state
-            # This is faster than before because AI enhancement is disabled during rematch
-            try:
-                logger.info(f"Starting synchronous rematch for client {client_id[:8]}...")
-                created = rematch_for_client(client_id)
-                logger.info(f"Rematch complete: {created} matches created")
-            except Exception as e:
-                logger.error(f"Error in rematch for client {client_id}: {e}")
-                traceback.print_exc()
+            # Run rematching in a background thread to avoid HTTP timeout
+            def _run_rematch():
+                try:
+                    set_matching_status(client_id, "matching")
+                    logger.info(f"Starting background rematch for client {client_id[:8]}...")
+                    created = rematch_for_client(client_id)
+                    logger.info(f"Background rematch complete: {created} matches created")
+                except Exception as e:
+                    logger.error(f"Error in background rematch for client {client_id}: {e}")
+                    traceback.print_exc()
+                finally:
+                    set_matching_status(client_id, "idle")
+
+            threading.Thread(target=_run_rematch, daemon=True).start()
             
             return res.data[0]
         raise HTTPException(status_code=500, detail="Failed to store tender keywords")
@@ -734,10 +770,12 @@ def update_tender_keyword(
     keyword_data = _normalize_keyword_payload(client_id, payload)
     keyword_data["updated_at"] = datetime.now().isoformat()
 
-    # Require at least one keyword (location and industry are optional filters)
+    # Require at least one filter: keywords, locations, OR industries
     has_keywords = keyword_data.get("keywords") and len(keyword_data["keywords"]) > 0
-    if not has_keywords:
-        raise HTTPException(status_code=400, detail="At least one keyword is required")
+    has_locations = keyword_data.get("locations") and len(keyword_data["locations"]) > 0
+    has_sectors = keyword_data.get("sectors") and len(keyword_data["sectors"]) > 0
+    if not has_keywords and not has_locations and not has_sectors:
+        raise HTTPException(status_code=400, detail="At least one keyword, location, or industry is required")
 
     try:
         existing = _with_supabase_retry(
@@ -762,15 +800,20 @@ def update_tender_keyword(
         # Invalidate caches
         invalidate_client_caches(client_id)
         
-        # Run rematching SYNCHRONOUSLY so the frontend can show loading state
-        try:
-            logger.info(f"Starting synchronous rematch for client {client_id[:8]}... (PUT)")
-            created = rematch_for_client(client_id)
-            logger.info(f"Rematch complete (PUT): {created} matches created")
-            notify_client(client_id, "matches-updated", {"reason": "keywords-updated"})
-        except Exception as e:
-            logger.error(f"Error in rematch for client {client_id}: {e}")
-            traceback.print_exc()
+        # Run rematching in a background thread to avoid HTTP timeout
+        def _run_rematch():
+            try:
+                set_matching_status(client_id, "matching")
+                logger.info(f"Starting background rematch for client {client_id[:8]}... (PUT)")
+                created = rematch_for_client(client_id)
+                logger.info(f"Background rematch complete (PUT): {created} matches created")
+            except Exception as e:
+                logger.error(f"Error in background rematch for client {client_id}: {e}")
+                traceback.print_exc()
+            finally:
+                set_matching_status(client_id, "idle")
+
+        threading.Thread(target=_run_rematch, daemon=True).start()
         
         return res.data[0]
     except HTTPException:
@@ -1143,11 +1186,25 @@ def getPurchasedTenders(
         return []
 
 
+@router.get("/tenders/matching-status", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getMatchingStatus(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Check if tender matching is currently in progress for the client."""
+    client_id = get_client_id_from_key(x_client_key)
+    status = get_matching_status(client_id)
+    return {"status": status, "is_matching": status == "matching"}
+
+
 @router.get("/tenders/matches", dependencies=[Depends(require_subscription(["tenders", "both"]))])
 def getMatchedTenders(
+    industry: str | None = None,
     x_client_key: str | None = Header(default=None, alias="X-Client-Key")
 ):
     """Get all matched tenders for the client (excludes tenders with passed deadlines)
+    
+    Args:
+        industry: Optional CPV code (e.g., "45") to filter by industry
     
     NOTE: Cache is disabled for matched tenders to ensure fresh results after keyword changes.
     """
@@ -1189,6 +1246,66 @@ def getMatchedTenders(
         if not all_matches:
             return []  # Early return if no matches
         
+        # Collect tender IDs to fetch details separately (join can sometimes return null for 'tenders')
+        tender_ids = list(set(m.get("tender_id") for m in all_matches if m.get("tender_id")))
+        
+        # Clean up orphaned matches (tenders that were moved to expired_tenders)
+        # This happens when expired tenders are moved but matches still reference them
+        orphaned_match_ids = []
+        if tender_ids:
+            # Check which tender IDs don't exist in tenders table
+            def check_tenders_exist(ids=tender_ids):
+                supabase = get_supabase_client()
+                return supabase.table("tenders").select("id").in_("id", ids).execute()
+            
+            existing_res = _with_supabase_retry(check_tenders_exist)
+            existing_ids = {t["id"] for t in (existing_res.data or [])}
+            missing_ids = set(tender_ids) - existing_ids
+            
+            if missing_ids:
+                # Find matches that reference missing tenders (likely moved to expired_tenders)
+                for match in all_matches:
+                    if match.get("tender_id") in missing_ids:
+                        orphaned_match_ids.append(match.get("id"))
+                
+                if orphaned_match_ids:
+                    logger.info(f"Found {len(orphaned_match_ids)} orphaned matches (tenders moved to expired_tenders) - cleaning up")
+                    # Delete orphaned matches in background (don't block the response)
+                    def cleanup_orphaned():
+                        try:
+                            supabase = get_supabase_client()
+                            for match_id in orphaned_match_ids:
+                                try:
+                                    supabase.table("tender_matches").delete().eq("id", match_id).execute()
+                                except Exception:
+                                    pass  # Ignore individual failures
+                        except Exception as e:
+                            logger.warning(f"Error cleaning up orphaned matches: {e}")
+                    
+                    threading.Thread(target=cleanup_orphaned, daemon=True).start()
+                    
+                    # Filter out orphaned matches from results
+                    all_matches = [m for m in all_matches if m.get("id") not in orphaned_match_ids]
+                    tender_ids = list(set(m.get("tender_id") for m in all_matches if m.get("tender_id")))
+        
+        if not all_matches:
+            return []  # All matches were orphaned
+        
+        # Fetch tender details in batches
+        tender_map = {}
+        batch_size = 100
+        for i in range(0, len(tender_ids), batch_size):
+            batch = tender_ids[i:i + batch_size]
+            def fetch_tenders_batch(ids=batch):
+                supabase = get_supabase_client()
+                return supabase.table("tenders").select(
+                    "id, title, summary, description, source, deadline, published_date, value_amount, value_currency, location, category, metadata"
+                ).in_("id", ids).execute()
+            
+            t_res = _with_supabase_retry(fetch_tenders_batch)
+            for t in (t_res.data or []):
+                tender_map[t["id"]] = t
+
         def fetch_access():
             supabase = get_supabase_client()
             return supabase.table("tender_access").select("tender_id, payment_status").eq("client_id", client_id).eq("payment_status", "completed").execute()
@@ -1196,23 +1313,56 @@ def getMatchedTenders(
         access_res = _with_supabase_retry(fetch_access)
         access_map = {acc["tender_id"]: True for acc in (access_res.data or []) if acc.get("tender_id")}
         
-        matches = all_matches  # Use all fetched matches
-        
-        # Filter out tenders with passed deadlines (but keep them in DB)
+        # Process matches
         now_utc = datetime.now(timezone.utc)
         result = []
         seen_matches: set[str] = set()
-        for match in matches:
-            tender = match.get("tenders")
-            if not tender:
-                continue
+        for match in all_matches:
             tender_id = match.get("tender_id")
             if not tender_id or tender_id in seen_matches:
                 continue
+                
+            tender = tender_map.get(tender_id)
+            if not tender:
+                # Try fallback if join data was actually present but we missed it in tender_map
+                tender = match.get("tenders")
+                if not tender:
+                    # Tender might have been moved to expired_tenders - skip this match
+                    # We'll clean up orphaned matches below
+                    logger.debug(f"Skipping match {match.get('id')} - tender {tender_id} not found (may be expired)")
+                    continue
+            
             seen_matches.add(tender_id)
             
             if FILTER_UK_ONLY and _is_ted_source(tender.get("source")):
                 continue
+            
+            # Filter by industry if specified
+            if industry:
+                industry_lower = industry.lower().strip()
+                tender_categories = _normalize_str_list(tender.get("category"))
+                tender_sectors = _normalize_str_list(tender.get("sector"))
+                all_tender_industries = set(tender_categories + tender_sectors)
+                
+                industry_matches = False
+                # Check exact match
+                if industry_lower in all_tender_industries:
+                    industry_matches = True
+                # Check prefix match (e.g., "45" matches "45212345")
+                elif len(industry_lower) <= 3 and industry_lower.isdigit():
+                    for t_ind in all_tender_industries:
+                        if t_ind and t_ind.startswith(industry_lower):
+                            industry_matches = True
+                            break
+                # Check reverse prefix match (e.g., "45212345" matches "45")
+                elif len(industry_lower) > 3 and industry_lower.isdigit():
+                    for t_ind in all_tender_industries:
+                        if t_ind and len(t_ind) <= 3 and t_ind.isdigit() and industry_lower.startswith(t_ind):
+                            industry_matches = True
+                            break
+                
+                if not industry_matches:
+                    continue  # Skip this tender - doesn't match the requested industry
             
             metadata = tender.get("metadata") or {}
             if not isinstance(metadata, dict):
@@ -1253,12 +1403,11 @@ def getMatchedTenders(
                 "category_label": category_label,
                 "match_score": match.get("match_score", 0.0),
                 "matched_keywords": match.get("matched_keywords", []),
-                "has_access": access_map.get(match["tender_id"], False),
+                "has_access": access_map.get(tender_id, False),
                 "deadline_passed": deadline_passed,
             })
         
         logger.info(f"GET /tenders/matches - returning {len(result)} matched tenders")
-        set_cached_matched(client_id, result)
         return result
     except HTTPException:
         raise
@@ -1267,6 +1416,291 @@ def getMatchedTenders(
         traceback.print_exc()
         # Return empty list instead of crashing - graceful degradation for production
         return []
+
+
+@router.get("/tenders/industry-counts", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getIndustryCounts(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Get counts of matched tenders by industry/CPV code for the current client."""
+    client_id = get_client_id_from_key(x_client_key)
+    try:
+        # Count industries from matched tenders only (not all tenders)
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        
+        # Get all matched tender IDs for this client
+        def fetch_matched_tender_ids():
+            supabase = get_supabase_client()
+            return supabase.table("tender_matches").select("tender_id").eq("client_id", client_id).execute()
+        
+        matches_res = _with_supabase_retry(fetch_matched_tender_ids)
+        matched_tender_ids = [m["tender_id"] for m in (matches_res.data or []) if m.get("tender_id")]
+        
+        if not matched_tender_ids:
+            return {"counts": {}}
+        
+        # Fetch category and sector for matched tenders
+        industry_counts = {}
+        
+        # Fetch in batches to avoid query size limits
+        batch_size = 1000
+        for i in range(0, len(matched_tender_ids), batch_size):
+            batch = matched_tender_ids[i:i + batch_size]
+            
+            def fetch_tenders_batch(ids=batch):
+                supabase = get_supabase_client()
+                return supabase.table("tenders").select(
+                    "category, sector, deadline"
+                ).in_("id", ids).or_(f"deadline.is.null,deadline.gte.{now_iso}").execute()
+            
+            tenders_res = _with_supabase_retry(fetch_tenders_batch)
+            tenders = tenders_res.data or []
+            
+            def normalize_field(value):
+                if value is None:
+                    return []
+                result = []
+                if isinstance(value, str):
+                    cleaned = value.strip()
+                    if cleaned.startswith("{") and cleaned.endswith("}"):
+                        cleaned = cleaned[1:-1]
+                    if not cleaned:
+                        return []
+                    parts = [part.strip().strip('"').strip("'") for part in cleaned.replace(";", ",").split(",")]
+                    result = [part.lower() for part in parts if part]
+                elif isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        if item is None:
+                            continue
+                        text = str(item).strip().lower()
+                        if text:
+                            result.append(text)
+                else:
+                    text = str(value).strip().lower()
+                    if text:
+                        result.append(text)
+                return result
+            
+            for tender in tenders:
+                # Skip expired tenders
+                deadline_value = tender.get("deadline")
+                if deadline_value:
+                    try:
+                        deadline_dt = datetime.fromisoformat(str(deadline_value).replace("Z", "+00:00"))
+                        if deadline_dt < now_utc:
+                            continue
+                    except Exception:
+                        pass
+                
+                categories_list = normalize_field(tender.get("category"))
+                sectors_list = normalize_field(tender.get("sector"))
+                
+                all_codes = set()
+                for code in categories_list + sectors_list:
+                    if not code:
+                        continue
+                    digits = ''.join(c for c in code if c.isdigit())
+                    if len(digits) >= 2:
+                        all_codes.add(digits[:2])
+                    elif len(digits) == 1:
+                        all_codes.add(f"0{digits}")
+                
+                for cpv_code in all_codes:
+                    industry_counts[cpv_code] = industry_counts.get(cpv_code, 0) + 1
+        
+        # Fallback: If no matched tenders, try indexed data (but this counts all tenders, not just matched)
+        if not industry_counts:
+            now_utc = datetime.now(timezone.utc)
+            now_iso = now_utc.isoformat()
+            lookback = (now_utc - timedelta(days=30)).isoformat()
+            
+            def fetch_tenders():
+                supabase = get_supabase_client()
+                query = supabase.table("tenders").select(
+                    "category, sector"
+                ).gte("published_date", lookback).eq("is_duplicate", False)
+                query = query.or_(f"deadline.is.null,deadline.gte.{now_iso}")
+                if FILTER_UK_ONLY:
+                    query = query.not_.ilike("source", "%ted%")
+                return query.execute()
+            
+            tenders_res = _with_supabase_retry(fetch_tenders)
+            tenders = tenders_res.data or []
+            
+            def normalize_field(value):
+                if value is None:
+                    return []
+                result = []
+                if isinstance(value, str):
+                    cleaned = value.strip()
+                    if cleaned.startswith("{") and cleaned.endswith("}"):
+                        cleaned = cleaned[1:-1]
+                    if not cleaned:
+                        return []
+                    parts = [part.strip().strip('"').strip("'") for part in cleaned.replace(";", ",").split(",")]
+                    result = [part.lower() for part in parts if part]
+                elif isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        if item is None:
+                            continue
+                        text = str(item).strip().lower()
+                        if text:
+                            result.append(text)
+                else:
+                    text = str(value).strip().lower()
+                    if text:
+                        result.append(text)
+                return result
+            
+            for tender in tenders:
+                categories_list = normalize_field(tender.get("category"))
+                sectors_list = normalize_field(tender.get("sector"))
+                
+                all_codes = set()
+                for code in categories_list + sectors_list:
+                    if not code:
+                        continue
+                    digits = ''.join(c for c in code if c.isdigit())
+                    if len(digits) >= 2:
+                        all_codes.add(digits[:2])
+                    elif len(digits) == 1:
+                        all_codes.add(f"0{digits}")
+                
+                for cpv_code in all_codes:
+                    industry_counts[cpv_code] = industry_counts.get(cpv_code, 0) + 1
+        
+        return {"counts": industry_counts}
+    except Exception as e:
+        logger.error(f"Error getting industry counts: {e}")
+        traceback.print_exc()
+        return {"counts": {}}
+
+
+@router.get("/tenders/location-counts", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getLocationCounts(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key")
+):
+    """Get counts of tenders by location using indexed data."""
+    try:
+        from services.tender_search_service import get_search_suggestions
+        suggestions = get_search_suggestions("location", limit=50)
+        
+        # Convert to counts dict format
+        location_counts = {s["label"]: s["count"] for s in suggestions if s["count"] > 0}
+        
+        # If no indexed data available yet, fall back to old method
+        if not location_counts:
+            now_utc = datetime.now(timezone.utc)
+            now_iso = now_utc.isoformat()
+            lookback = (now_utc - timedelta(days=30)).isoformat()
+            
+            def fetch_tenders():
+                supabase = get_supabase_client()
+                query = supabase.table("tenders").select(
+                    "location, metadata"
+                ).gte("published_date", lookback).eq("is_duplicate", False)
+                query = query.or_(f"deadline.is.null,deadline.gte.{now_iso}")
+                if FILTER_UK_ONLY:
+                    query = query.not_.ilike("source", "%ted%")
+                return query.execute()
+            
+            tenders_res = _with_supabase_retry(fetch_tenders)
+            tenders = tenders_res.data or []
+            
+            uk_locations = [
+                "london", "manchester", "birmingham", "glasgow", "edinburgh",
+                "liverpool", "leeds", "sheffield", "bristol", "newcastle",
+                "cardiff", "belfast", "nottingham", "southampton", "leicester",
+                "aberdeen", "dundee", "brighton", "cambridge", "oxford",
+                "yorkshire", "lancashire", "kent", "essex", "surrey",
+                "midlands", "scotland", "wales", "northern ireland", "england"
+            ]
+            
+            for tender in tenders:
+                location = (tender.get("location") or "").lower()
+                metadata = tender.get("metadata") or {}
+                location_name = ""
+                if isinstance(metadata, dict):
+                    location_name = (metadata.get("location_name") or "").lower()
+                
+                combined_location = f"{location} {location_name}"
+                
+                for uk_loc in uk_locations:
+                    if uk_loc in combined_location:
+                        loc_title = uk_loc.title()
+                        location_counts[loc_title] = location_counts.get(loc_title, 0) + 1
+        
+        return {"counts": location_counts}
+    except Exception as e:
+        logger.error(f"Error getting location counts: {e}")
+        traceback.print_exc()
+        return {"counts": {}}
+
+
+@router.get("/tenders/keyword-suggestions", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getKeywordSuggestions(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    limit: int = 100
+):
+    """Get keyword suggestions with tender counts for dropdown."""
+    try:
+        from services.tender_search_service import get_search_suggestions
+        suggestions = get_search_suggestions("keyword", limit=limit)
+        return {"suggestions": suggestions}
+    except Exception as e:
+        logger.error(f"Error getting keyword suggestions: {e}")
+        traceback.print_exc()
+        return {"suggestions": []}
+
+
+@router.get("/tenders/location-suggestions", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getLocationSuggestions(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    limit: int = 50
+):
+    """Get location suggestions with tender counts for dropdown."""
+    try:
+        from services.tender_search_service import get_search_suggestions
+        suggestions = get_search_suggestions("location", limit=limit)
+        return {"suggestions": suggestions}
+    except Exception as e:
+        logger.error(f"Error getting location suggestions: {e}")
+        traceback.print_exc()
+        return {"suggestions": []}
+
+
+@router.get("/tenders/industry-suggestions", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def getIndustrySuggestions(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    limit: int = 50
+):
+    """Get industry/CPV suggestions with tender counts for dropdown."""
+    try:
+        from services.tender_search_service import get_search_suggestions
+        suggestions = get_search_suggestions("industry", limit=limit)
+        return {"suggestions": suggestions}
+    except Exception as e:
+        logger.error(f"Error getting industry suggestions: {e}")
+        traceback.print_exc()
+        return {"suggestions": []}
+
+
+@router.post("/tenders/reindex", dependencies=[Depends(require_subscription(["tenders", "both"]))])
+def reindexTenders(
+    x_client_key: str | None = Header(default=None, alias="X-Client-Key"),
+    batch_size: int = Body(default=100),
+    max_tenders: int = Body(default=5000)
+):
+    """Re-index all tenders with search data. Admin operation."""
+    try:
+        from services.tender_search_service import reindex_all_tenders
+        success, errors = reindex_all_tenders(batch_size=batch_size, max_tenders=max_tenders)
+        return {"success_count": success, "error_count": errors}
+    except Exception as e:
+        logger.error(f"Error reindexing tenders: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {str(e)}")
 
 
 @router.get("/tenders/{tender_id}", dependencies=[Depends(require_subscription(["tenders", "both"]))])
@@ -1528,4 +1962,3 @@ def rematch_client(x_client_key: str | None = Header(default=None, alias="X-Clie
     created = rematch_for_client(client_id)
     notify_client(client_id, "matches-updated", {"reason": "manual-rematch"})
     return {"ok": True, "created": created}
-

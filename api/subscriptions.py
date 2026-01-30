@@ -40,11 +40,7 @@ def get_status(client_id: str = Depends(get_client_id)):
         def _fetch_status():
             supabase = get_supabase_client()
             return supabase.table("clients").select(
-                "subscription_status", 
-                "subscription_tier", 
-                "subscription_interval", 
-                "subscription_period_end",
-                "trial_end"
+                "subscription_status, subscription_tier, subscription_interval, subscription_period_end, trial_end"
             ).eq("id", client_id).single().execute()
         
         res = execute_with_retry(
@@ -99,10 +95,7 @@ def create_checkout(
         def _fetch_client():
             supabase = get_supabase_client()
             return supabase.table("clients").select(
-                "contact_email", 
-                "name", 
-                "subscription_status",
-                "trial_end"
+                "contact_email, name, subscription_status, trial_end"
             ).eq("id", client_id).single().execute()
         
         client_res = execute_with_retry(

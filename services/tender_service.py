@@ -7,12 +7,36 @@ import traceback
 import time
 from decimal import Decimal
 from typing import Optional, Any, Dict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from postgrest.exceptions import APIError
 
 from config.settings import get_supabase_client, reinitialize_supabase, FILTER_UK_ONLY
+
+CPV_INDUSTRY_MAP = {
+    "03": "Agricultural and Farming Goods",
+    "09": "Petroleum and Fuel Products",
+    "14": "Mining, Basic Metals and Related Products",
+    "15": "Food, Beverages and Tobacco",
+    "18": "Clothing and Accessories",
+    "30": "Office and Computing Equipment",
+    "33": "Medical Equipment",
+    "34": "Transport Equipment and Auxiliary Products",
+    "35": "Security, Defence and Safety Services",
+    "45": "Construction Work",
+    "50": "Repair and Maintenance Services",
+    "60": "Transport Services",
+    "71": "Architecture and Engineering Services",
+    "72": "IT Services Software Systems",
+    "73": "Research and Consultancy Services",
+    "79": "Business Services",
+    "80": "Education and Training Services",
+    "85": "Health and Social Work Services",
+    "90": "Cleaning Environmental and Waste Services",
+    "92": "Recreational Cultural and Sporting Services",
+    "98": "Miscellaneous Services",
+}
 
 
 def is_uk_specific_source(source: str) -> bool:
@@ -301,6 +325,100 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
         keyword_set: Keywords, locations, industries to match
         enable_ai: If True, use AI to enhance keywords (slower but better recall)
     """
+    # FAST PATH: Use indexed data if available for quick matching
+    # This can dramatically speed up bulk matching operations
+    indexed_keywords = tender_data.get("indexed_keywords") or []
+    indexed_locations = tender_data.get("indexed_locations") or []
+    indexed_industries = tender_data.get("indexed_industries") or []
+    
+    # Get filter criteria (normalized)
+    filter_keywords = _normalize_str_list(keyword_set.get("keywords"))
+    filter_locations = _normalize_str_list(keyword_set.get("locations"))
+    filter_industries = _normalize_str_list(keyword_set.get("sectors"))
+    
+    # Quick indexed match check (if indexed data available)
+    # This is an optimization - we still do full matching below
+    has_indexed_data = bool(indexed_keywords or indexed_locations or indexed_industries)
+    
+    if has_indexed_data and not enable_ai:
+        # Fast path: check indexed data directly
+        has_keyword_filter = len(filter_keywords) > 0
+        has_location_filter = len(filter_locations) > 0
+        has_industry_filter = len(filter_industries) > 0
+        
+        if not has_keyword_filter and not has_location_filter and not has_industry_filter:
+            return False, 0.0, []
+        
+        # Check indexed matches
+        indexed_kw_set = set(indexed_keywords)
+        indexed_loc_set = set(indexed_locations)
+        indexed_ind_set = set(indexed_industries)
+        
+        keyword_match = False
+        matched_kws = []
+        if has_keyword_filter:
+            for kw in filter_keywords:
+                if kw in indexed_kw_set:
+                    keyword_match = True
+                    matched_kws.append(kw)
+            if not keyword_match:
+                # Also check if keyword appears as substring in any indexed keyword
+                for kw in filter_keywords:
+                    for idx_kw in indexed_kw_set:
+                        if kw in idx_kw or idx_kw in kw:
+                            keyword_match = True
+                            matched_kws.append(kw)
+                            break
+                    if keyword_match:
+                        break
+        
+        location_match = True if not has_location_filter else False
+        if has_location_filter:
+            for loc in filter_locations:
+                if loc in indexed_loc_set:
+                    location_match = True
+                    break
+                # Also check substring match for locations
+                for idx_loc in indexed_loc_set:
+                    if loc in idx_loc or idx_loc in loc:
+                        location_match = True
+                        break
+                if location_match:
+                    break
+        
+        industry_match = True if not has_industry_filter else False
+        if has_industry_filter:
+            for ind in filter_industries:
+                if ind in indexed_ind_set:
+                    industry_match = True
+                    break
+                # Check CPV prefix match (e.g., "72" matches "72222300")
+                if ind.isdigit() and len(ind) <= 3:
+                    for idx_ind in indexed_ind_set:
+                        if idx_ind.startswith(ind) or ind.startswith(idx_ind):
+                            industry_match = True
+                            break
+                if industry_match:
+                    break
+        
+        # All specified filters must match
+        keyword_ok = keyword_match if has_keyword_filter else True
+        location_ok = location_match if has_location_filter else True
+        industry_ok = industry_match if has_industry_filter else True
+        
+        is_match = keyword_ok and location_ok and industry_ok
+        
+        if is_match or (has_indexed_data and (keyword_match or location_match or industry_match)):
+            # Calculate score
+            match_score = 1.0
+            if has_keyword_filter and len(filter_keywords) > 0:
+                match_score = len(matched_kws) / len(filter_keywords)
+            return is_match, match_score, matched_kws
+        
+        # If indexed data exists but didn't match, still fall through to full matching
+        # in case indexing missed something
+    
+    # FULL MATCHING: Standard matching logic for comprehensive results
     title = str(tender_data.get("title") or "").lower()
     description = str(tender_data.get("description") or "").lower()  # Include full description for search
     summary = str(tender_data.get("summary") or "").lower()
@@ -322,24 +440,37 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
     # Extract comprehensive location information
     location_text = _extract_location_fields(tender_data)
 
+    # Include all string values from metadata in searchable text
+    metadata_values = []
+    if isinstance(metadata, dict):
+        def _collect_strings(d):
+            vals = []
+            if isinstance(d, dict):
+                for v in d.values(): vals.extend(_collect_strings(v))
+            elif isinstance(d, list):
+                for v in d: vals.extend(_collect_strings(v))
+            elif isinstance(d, (str, int, float)):
+                vals.append(str(d))
+            return vals
+        metadata_values = _collect_strings(metadata)
+
     # Combine curated/searchable text for keyword matching.
-    # We include the full raw description because "website" and other key terms might be buried there.
-    # We trust the user's specific keywords to filter out noise.
     searchable_text = " ".join(
         filter(
             None,
             [
                 title,
-                description,  # Added back description
+                description,
                 summary,
                 category_text,
                 sector_text,
                 meta_category_label,
                 exec_summary,
                 scope_summary,
+                " ".join(metadata_values)
             ],
         )
-    )
+    ).lower()
 
     # Get filter criteria
     keywords = _normalize_str_list(keyword_set.get("keywords"))
@@ -379,14 +510,15 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
             # We use a more lenient regex that allows matches even if surrounded by non-alphanumeric chars (except whitespace)
             # or if it's part of a larger word if word boundary fails.
             
-            # 1. Exact word match (most reliable)
-            pattern = r'\b' + re.escape(kw_lower) + r'\b'
-            if re.search(pattern, searchable_text, re.IGNORECASE):
+            # 1. Exact word match (most reliable) - Case insensitive
+            # We use \b to ensure we match whole words like "website" and not "anywhere" in "anywhere"
+            pattern = r'(?i)\b' + re.escape(kw_lower) + r'\b'
+            if re.search(pattern, searchable_text):
                 if kw_lower in original_keywords_lower:
                     matched_keywords.append(kw_lower)
-            # 2. Substring match (fallback, necessary for some terms)
-            # e.g. "cleaning" matching "cleaning" in "housecleaning" or plurals if simple enough
-            elif kw_lower in searchable_text:
+            # 2. Substring match (fallback for longer terms)
+            # Only allow substring match for terms >= 4 chars to avoid false positives with short keywords
+            elif len(kw_lower) >= 4 and kw_lower in searchable_text:
                 if kw_lower in original_keywords_lower:
                     matched_keywords.append(kw_lower)
         # Remove duplicates while preserving order
@@ -403,48 +535,28 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
         matched_location = None
         match_source = None  # Track where we found the match
         
-        # First, check primary location fields
-        if location_text and location_text.strip():
-            for loc in keyword_locations:
-                if not loc:
-                    continue
-                # Use word boundary matching for location to avoid partial matches
-                # e.g., "manchester" should match "Manchester" but not "manchesterfield"
-                pattern = r'\b' + re.escape(loc) + r'\b'
-                if re.search(pattern, location_text, re.IGNORECASE):
-                    location_match = True
-                    matched_location = loc
-                    match_source = "location_fields"
-                    break
-                # Also try substring match as fallback for compound locations
-                # e.g., "Greater Manchester" contains "Manchester"
-                elif loc in location_text:
-                    location_match = True
-                    matched_location = loc
-                    match_source = "location_fields (substring)"
-                    break
-        
-        # If no match in location fields, also check title and description as fallback
-        # This helps catch tenders where location is mentioned in the title/description
-        # but not in the structured location fields
-        if not location_match:
-            # Combine title and description for fallback search
-            title_desc_text = (
-                (title or "") + " " + 
-                (description or "") + " " + 
-                (summary or "")
-            ).lower()
+        # We search for the location in the structured location info + title/description
+        # But we MUST use word boundaries for locations to avoid "UK" matching "Buckinghamshire"
+        for loc in keyword_locations:
+            if not loc:
+                continue
+            loc_lower = loc.lower()
+            pattern = r'(?i)\b' + re.escape(loc_lower) + r'\b'
             
-            for loc in keyword_locations:
-                if not loc:
-                    continue
-                # Use word boundary matching to avoid false positives
-                pattern = r'\b' + re.escape(loc) + r'\b'
-                if re.search(pattern, title_desc_text, re.IGNORECASE):
-                    location_match = True
-                    matched_location = loc
-                    match_source = "title/description"
-                    break
+            # Check location fields first
+            if location_text and re.search(pattern, location_text):
+                location_match = True
+                matched_location = loc
+                match_source = "location_fields"
+                break
+                
+            # Fallback to title/description search (also with word boundaries)
+            search_fields = (title or "") + " " + (description or "") + " " + (summary or "")
+            if re.search(pattern, search_fields):
+                location_match = True
+                matched_location = loc
+                match_source = "title/description"
+                break
         
         # Debug logging
         if debug_matching:
@@ -470,43 +582,113 @@ def match_tender_against_keywords(tender_data: dict, keyword_set: dict, enable_a
         # Check both sector and category fields
         all_tender_industries = set(tender_sectors + tender_categories)
         
-        # If tender has no industry data, it CANNOT match (strict mode)
-        if not all_tender_industries:
-            industry_match = False  # Reject tenders with no industry when user specified industries
-            # Debug logging
-            if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
-                tender_title = tender_data.get("title", "Unknown")[:50]
-                print(f"[Industry Match] REJECTED (no industry): {tender_title}")
-        else:
-            # Check if any of the user's specified industries match
-            if set(keyword_sectors).intersection(all_tender_industries):
+        # Normalize user sectors for comparison (ensure lowercase)
+        normalized_user_sectors = [s.lower().strip() if s else "" for s in keyword_sectors if s]
+        
+        # Check if any of the user's specified industries match
+        # Handle CPV codes: user might specify "72", tender might have "72222300"
+        for user_sector in normalized_user_sectors:
+            if not user_sector:
+                continue
+            
+            # 1. EXACT MATCH: Check if user sector exactly matches any tender industry
+            if user_sector in all_tender_industries:
                 industry_match = True
-                # Debug logging
-                if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
-                    tender_title = tender_data.get("title", "Unknown")[:50]
-                    matched = set(keyword_sectors).intersection(all_tender_industries)
-                    print(f"[Industry Match] MATCHED: {tender_title} | Required: {keyword_sectors} | Found: {matched}")
-            else:
-                # Debug logging
-                if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
-                    tender_title = tender_data.get("title", "Unknown")[:50]
-                    print(f"[Industry Match] REJECTED: {tender_title} | Required: {keyword_sectors} | Tender has: {all_tender_industries}")
+                break
+            
+            # 2. PREFIX MATCH: Handle CPV codes where user specifies "72" and tender has "72222300"
+            # Only do prefix match if user_sector is a short CPV code (2-3 digits)
+            if len(user_sector) <= 3 and user_sector.isdigit():
+                for t_ind in all_tender_industries:
+                    if t_ind and t_ind.startswith(user_sector):
+                        industry_match = True
+                        break
+                if industry_match:
+                    break
+            
+            # 3. REVERSE PREFIX MATCH: Handle cases where tender has "72" and user specifies "72222300"
+            if len(user_sector) > 3 and user_sector.isdigit():
+                for t_ind in all_tender_industries:
+                    if t_ind and len(t_ind) <= 3 and t_ind.isdigit() and user_sector.startswith(t_ind):
+                        industry_match = True
+                        break
+                if industry_match:
+                    break
+            
+            # 4. TEXT SEARCH FALLBACK: Search for industry label in title/description
+            # This helps when tender doesn't have proper CPV codes but mentions the industry
+            # IMPORTANT: Only use this as a last resort and be very precise to avoid false matches
+            industry_label = CPV_INDUSTRY_MAP.get(user_sector)
+            if industry_label:
+                label_lower = industry_label.lower()
+                # First, try exact phrase match (most reliable)
+                if label_lower in title or label_lower in category_text or label_lower in meta_category_label:
+                    industry_match = True
+                    break
+                
+                # For multi-word labels, require the PRIMARY keyword (first significant word, not common words)
+                # Common words to skip: "and", "or", "the", "of", "for", "services", "work", "goods", "products"
+                common_words = {"and", "or", "the", "of", "for", "services", "work", "goods", "products", "equipment"}
+                label_terms = [t for t in label_lower.split() if t not in common_words and len(t) >= 4]
+                
+                # Only match if we have a primary keyword AND it appears in context
+                if label_terms:
+                    primary_keyword = label_terms[0]  # First significant word
+                    # Require the primary keyword to appear, but be more strict
+                    # Check if it appears as a whole word (not just substring)
+                    import re
+                    primary_pattern = r'\b' + re.escape(primary_keyword) + r'\b'
+                    if re.search(primary_pattern, searchable_text, re.IGNORECASE):
+                        # Additional check: if label has multiple significant terms, at least 2 should match
+                        if len(label_terms) == 1 or sum(1 for term in label_terms if re.search(r'\b' + re.escape(term) + r'\b', searchable_text, re.IGNORECASE)) >= 2:
+                            industry_match = True
+                            break
 
-    # All three conditions must be true (AND)
-    is_match = keyword_match and location_match and industry_match
+        # Debug logging
+        if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
+            tender_title = tender_data.get("title", "Unknown")[:50]
+            status = "MATCHED" if industry_match else "REJECTED"
+            print(f"[Industry Match] {status}: {tender_title} | Required: {normalized_user_sectors} | Tender has: {all_tender_industries}")
+
+    # Matching logic: All SPECIFIED filters must match (AND between specified filters)
+    # If keywords are specified, at least one must match. Same for locations and industries.
+    # If a filter is NOT specified, it's considered matching (no restriction).
+    
+    # Check if each filter type is specified
+    has_keyword_filter = len(keywords) > 0
+    has_location_filter = len(keyword_locations) > 0
+    has_industry_filter = len(keyword_sectors) > 0
+    
+    # At least one filter must be specified
+    if not has_keyword_filter and not has_location_filter and not has_industry_filter:
+        return False, 0.0, []
+    
+    # For each SPECIFIED filter, check if it matches
+    # Unspecified filters default to True (no restriction)
+    keyword_match_ok = keyword_match if has_keyword_filter else True
+    location_match_ok = location_match if has_location_filter else True
+    industry_match_ok = industry_match if has_industry_filter else True
+    
+    # All specified filters must match (AND)
+    is_match = keyword_match_ok and location_match_ok and industry_match_ok
 
     # Debug logging - final decision
     if os.getenv("DEBUG_LOCATION_MATCHING") == "1":
         tender_title = tender_data.get("title", "Unknown")[:60]
         status = "✓ MATCH" if is_match else "✗ NO MATCH"
         print(f"\n[FINAL DECISION] {status}: {tender_title}")
-        print(f"  └─ Keyword Match: {'✓' if keyword_match else '✗'} (matched: {matched_keywords})")
-        print(f"  └─ Location Match: {'✓' if location_match else '✗'} (required: {keyword_locations})")
-        print(f"  └─ Industry Match: {'✓' if industry_match else '✗'} (required: {keyword_sectors})")
+        print(f"  └─ Keyword Filter: {'(not set)' if not has_keyword_filter else ('✓' if keyword_match else '✗')} (matched: {matched_keywords})")
+        print(f"  └─ Location Filter: {'(not set)' if not has_location_filter else ('✓' if location_match else '✗')} (required: {keyword_locations})")
+        print(f"  └─ Industry Filter: {'(not set)' if not has_industry_filter else ('✓' if industry_match else '✗')} (required: {keyword_sectors})")
         print()
 
-    # Calculate match score based on keyword matches
-    match_score = len(matched_keywords) / len(keywords) if keywords else 0.0
+    # Calculate match score - if no keywords, use location/industry match as full score
+    if has_keyword_filter and len(keywords) > 0:
+        match_score = len(matched_keywords) / len(keywords)
+    elif is_match:
+        match_score = 1.0  # Full score for location/industry-only matches
+    else:
+        match_score = 0.0
 
     # Apply value filters if specified
     if is_match:
@@ -542,25 +724,37 @@ def _rematch_for_client_once(client_id: str) -> int:
 
     supabase.table("tender_matches").delete().eq("client_id", client_id).execute()
 
-    # Fetch active tenders with pagination (Supabase limits to 1000 rows per request)
-    # Also exclude duplicates and fetch metadata for location_name
-    # IMPORTANT: Include full_data to get detailed location info (buyer address, delivery locations)
-    now_utc = datetime.now(timezone.utc).isoformat()
+    # Fetch active tenders with pagination
+    # Search recent tenders (last 90 days) for performance - balance between speed and coverage
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+    lookback_90_days = (now_utc - timedelta(days=90)).isoformat()
     
     to_insert = []
     created = 0
-    page_size = 1000
+    page_size = 1000  # Larger page size for fewer round trips
     offset = 0
-    max_tenders = 50000  # Safety limit to prevent infinite loops
+    max_tenders = 30000  # Reasonable limit for fast matching (30 seconds target)
+    total_processed = 0
+    max_matches = 5000  # Early termination if we find enough matches
     
-    while offset < max_tenders:
-        # Note: We intentionally do NOT fetch full_data here to avoid performance issues
-        # (full_data can be very large JSON). Location matching uses:
-        # - location field, location_name from metadata, title/description fallback
+    print(f"[Rematch] Starting optimized rematch for client {client_id[:8]}...")
+    start_time = time.time()
+    
+    # Check if tenders have indexed data for fast matching
+    use_indexed_matching = os.getenv("USE_INDEXED_MATCHING", "1") == "1"
+    
+    while offset < max_tenders and len(to_insert) < max_matches:
+        # Select indexed columns if available for faster matching
+        select_cols = "id, title, description, summary, category, sector, location, value_amount, metadata, is_duplicate, source"
+        if use_indexed_matching:
+            select_cols += ", indexed_keywords, indexed_locations, indexed_industries"
+        
         tenders_res = (
             supabase.table("tenders")
-            .select("id, title, description, summary, category, sector, location, value_amount, metadata, is_duplicate, source")
-            .or_(f"deadline.is.null,deadline.gte.{now_utc}")
+            .select(select_cols)
+            .gte("published_date", lookback_90_days)
+            .or_(f"deadline.is.null,deadline.gte.{now_iso}")
             .eq("is_duplicate", False)
             .order("published_date", desc=True)
             .range(offset, offset + page_size - 1)
@@ -572,6 +766,8 @@ def _rematch_for_client_once(client_id: str) -> int:
             break  # No more tenders to process
             
         for tender in tenders:
+            total_processed += 1
+            
             # Skip duplicates
             if tender.get("is_duplicate"):
                 continue
@@ -587,9 +783,7 @@ def _rematch_for_client_once(client_id: str) -> int:
             if isinstance(metadata, dict):
                 location_name = metadata.get("location_name")
             
-            # Include metadata in tender_data for keyword matching against structured fields
-            # Note: full_data is NOT fetched for performance (can be very large)
-            # Location matching uses: location field, metadata.location_name, title/description fallback
+            # Include metadata and indexed data in tender_data for keyword matching
             tender_data = {
                 "title": tender.get("title"),
                 "description": tender.get("description"),
@@ -599,7 +793,11 @@ def _rematch_for_client_once(client_id: str) -> int:
                 "location": tender.get("location"),
                 "location_name": location_name,
                 "value_amount": tender.get("value_amount"),
-                "metadata": metadata,  # Include metadata for structured field matching
+                "metadata": metadata,
+                # Include indexed data for faster matching
+                "indexed_keywords": tender.get("indexed_keywords"),
+                "indexed_locations": tender.get("indexed_locations"),
+                "indexed_industries": tender.get("indexed_industries"),
             }
             for kw in keyword_sets:
                 # Disable AI enhancement during bulk rematch for speed (enable_ai=False)
@@ -615,9 +813,22 @@ def _rematch_for_client_once(client_id: str) -> int:
         
         offset += page_size
         
+        # Log progress every ~5000 tenders
+        if total_processed % 5000 < page_size:
+            elapsed = time.time() - start_time
+            print(f"[Rematch] Processed {total_processed} tenders in {elapsed:.1f}s, found {len(to_insert)} matches so far...")
+        
+        # Early termination if we have enough matches
+        if len(to_insert) >= max_matches:
+            print(f"[Rematch] Found {len(to_insert)} matches - early termination for speed")
+            break
+        
         # If we got fewer results than page_size, we've reached the end
         if len(tenders) < page_size:
             break
+    
+    elapsed = time.time() - start_time
+    print(f"[Rematch] Completed: processed {total_processed} tenders in {elapsed:.1f}s, found {len(to_insert)} matches")
     
     if not to_insert:
         return 0

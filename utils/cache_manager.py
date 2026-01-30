@@ -12,6 +12,7 @@ _TENDERS_CACHE: Dict[str, Dict[str, Any]] = {}
 _MATCHED_CACHE: Dict[str, Dict[str, Any]] = {}
 _PURCHASED_CACHE: Dict[str, Dict[str, Any]] = {}
 _KEYWORDS_CACHE: Dict[str, Dict[str, Any]] = {}
+_MATCHING_STATUS: Dict[str, str] = {}  # client_id -> "idle" | "matching"
 
 # Cache TTL
 CACHE_TTL_SECONDS = 1800  # 30 minutes
@@ -200,4 +201,14 @@ def get_cache_stats() -> Dict[str, int]:
         "keywords_cached_clients": len(_KEYWORDS_CACHE),
         "pending_invalidations": len(_invalidation_queue),
     }
+
+
+def get_matching_status(client_id: str) -> str:
+    """Get the matching status for a client"""
+    return _MATCHING_STATUS.get(client_id, "idle")
+
+
+def set_matching_status(client_id: str, status: str) -> None:
+    """Set the matching status for a client"""
+    _MATCHING_STATUS[client_id] = status
 

@@ -135,30 +135,67 @@ supabase_admin: Client | None = None
 # Service role key (for administrative operations like deleting users from auth.users)
 SUPABASE_SERVICE_ROLE_KEY = _clean_env(os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 
-def get_supabase_client() -> Client:
+# Direct PostgreSQL connection configuration
+# Use dedicated IPv4 for Supabase direct connection
+# Format: postgresql://postgres:[PASSWORD]@[DEDICATED_IPV4]:5432/postgres?sslmode=require
+DATABASE_URL = _clean_env(os.getenv("DATABASE_URL"))
+
+# Individual database connection parameters (alternative to DATABASE_URL)
+DB_HOST = _clean_env(os.getenv("DB_HOST"))  # Your dedicated IPv4 address
+DB_PORT = _clean_env(os.getenv("DB_PORT", "5432"))
+DB_USER = _clean_env(os.getenv("DB_USER", "postgres"))
+DB_PASSWORD = _clean_env(os.getenv("DB_PASSWORD"))
+DB_NAME = _clean_env(os.getenv("DB_NAME", "postgres"))
+
+# Flag to use dedicated IP connection (enables SSL automatically)
+USE_DEDICATED_IP = os.getenv("USE_DEDICATED_IP", "1").lower() not in {"0", "false", "off", "no"}
+
+# =============================================================================
+# Database Connection Functions
+# =============================================================================
+
+# Import the direct database module
+from config.db import db, get_db, init_db
+
+
+def get_supabase_client():
     """
-    Get or reinitialize Supabase client.
-    Returns a reliable connection with automatic retry on failure.
+    Get the database client for database operations.
+    
+    This now returns a direct PostgreSQL connection (via the db module)
+    which provides a Supabase-like interface but with persistent connections.
+    
+    Usage remains the same:
+        supabase = get_supabase_client()
+        result = supabase.table("clients").select("*").eq("id", client_id).execute()
     """
     global supabase
-    try:
-        if supabase is None:
-            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        return supabase
-    except Exception as e:
-        print(f"Error getting Supabase client: {e}")
-        # Try to create a fresh client
+    
+    # Initialize the database if DATABASE_URL is configured
+    if DATABASE_URL:
         try:
-            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            db._ensure_initialized()
+        except Exception as e:
+            print(f"Warning: Failed to initialize direct database: {e}")
+            # Fall back to Supabase client if direct connection fails
+            if supabase is None:
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             return supabase
-        except Exception as e2:
-            print(f"Failed to create Supabase client: {e2}")
-            raise Exception("Cannot connect to database. Please try again later.") from e2
+        return db
+    
+    # Fall back to Supabase client if DATABASE_URL is not configured
+    if supabase is None:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return supabase
+
 
 def get_supabase_admin_client() -> Client:
     """
     Get a Supabase client with service role privileges.
-    Used for administrative tasks like deleting users from auth.users.
+    Used for administrative tasks like Auth operations (creating users, etc.)
+    
+    NOTE: This still uses the Supabase HTTP client as Auth operations
+    require the Supabase Auth API.
     """
     global supabase_admin
     if not SUPABASE_SERVICE_ROLE_KEY:
@@ -170,7 +207,6 @@ def get_supabase_admin_client() -> Client:
         return supabase_admin
     except Exception as e:
         print(f"Error getting Supabase admin client: {e}")
-        # Try to create a fresh client
         try:
             supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
             return supabase_admin
@@ -178,12 +214,24 @@ def get_supabase_admin_client() -> Client:
             print(f"Failed to create Supabase admin client: {e2}")
             raise Exception("Cannot connect to database with administrative privileges.") from e2
 
+
 def reinitialize_supabase():
     """
-    Force reinitialize Supabase client - creates fresh connection.
+    Reinitialize database connections.
     Call this when experiencing connection issues.
     """
     global supabase, supabase_admin
+    
+    # Reinitialize direct database connection
+    if DATABASE_URL:
+        try:
+            db.close()
+            db.initialize(database_url=DATABASE_URL)
+            print("✓ Reinitialized direct database connection successfully")
+        except Exception as e:
+            print(f"Warning: Failed to reinitialize direct database: {e}")
+    
+    # Also reinitialize Supabase clients (needed for Auth operations)
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         if SUPABASE_SERVICE_ROLE_KEY:
@@ -193,4 +241,22 @@ def reinitialize_supabase():
     except Exception as e:
         print(f"✗ Failed to reinitialize Supabase client: {e}")
         raise Exception("Cannot reconnect to database. Please try again later.") from e
+
+
+def is_direct_db_configured() -> bool:
+    """Check if direct database connection is properly configured."""
+    return bool(DATABASE_URL)
+
+
+def test_direct_db_connection() -> bool:
+    """Test the direct PostgreSQL connection."""
+    if not is_direct_db_configured():
+        print("Direct database connection not configured")
+        return False
+    return db.test_connection()
+
+
+def close_connection_pool():
+    """Close all database connections. Call this on application shutdown."""
+    db.close()
 

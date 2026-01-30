@@ -1817,6 +1817,7 @@ def _sanitize_for_supabase(value):
 def store_tender(tender_data: Dict[str, Any]) -> str | None:
     """
     Store a tender in the database with retry logic for connection errors.
+    Automatically extracts and indexes keywords, locations, and industries.
     Returns the tender ID if stored, None otherwise.
     """
     import httpx
@@ -1825,6 +1826,14 @@ def store_tender(tender_data: Dict[str, Any]) -> str | None:
     cleaned_payload = _sanitize_for_supabase(tender_data) or {}
     source = cleaned_payload.get("source")
     external_id = cleaned_payload.get("external_id")
+    
+    # Extract and add indexed search data
+    try:
+        from services.tender_search_service import extract_tender_search_data
+        search_data = extract_tender_search_data(cleaned_payload)
+        cleaned_payload.update(search_data)
+    except Exception as e:
+        print(f"Warning: Could not extract search data: {e}")
 
     max_attempts = 3
     for attempt in range(max_attempts):
@@ -1844,7 +1853,7 @@ def store_tender(tender_data: Dict[str, Any]) -> str | None:
                 if existing.data:
                     return existing.data[0]["id"]
 
-            # Insert new tender
+            # Insert new tender with indexed search data
             res = client.table("tenders").insert(cleaned_payload).execute()
             
             if res.data:
