@@ -16,13 +16,32 @@ if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 def create_or_get_customer(client_id: str, email: str, name: str) -> str:
-    """Create or get an existing Stripe customer ID for a client."""
+    """Create or get an existing Stripe customer ID for a client.
+    
+    Validates that the customer exists in Stripe before returning it.
+    If the customer doesn't exist (e.g., when switching from test to live mode),
+    it will clear the invalid ID and create a new customer.
+    """
     supabase = get_supabase_client()
     
     # Check if client already has a stripe_customer_id
     res = supabase.table("clients").select("stripe_customer_id").eq("id", client_id).single().execute()
-    if res.data and res.data.get("stripe_customer_id"):
-        return res.data["stripe_customer_id"]
+    existing_customer_id = res.data.get("stripe_customer_id") if res.data else None
+    
+    if existing_customer_id:
+        # Validate that the customer exists in Stripe (handles test->live mode switch)
+        try:
+            stripe.Customer.retrieve(existing_customer_id)
+            return existing_customer_id
+        except stripe.error.InvalidRequestError:
+            # Customer doesn't exist (likely from test mode, now using live mode)
+            logger.warning(f"Customer {existing_customer_id} not found in Stripe, creating new customer for client {client_id}")
+            # Clear the invalid customer ID
+            supabase.table("clients").update({"stripe_customer_id": None}).eq("id", client_id).execute()
+        except Exception as e:
+            # Other Stripe errors - log and create new customer
+            logger.error(f"Error validating Stripe customer {existing_customer_id}: {e}")
+            supabase.table("clients").update({"stripe_customer_id": None}).eq("id", client_id).execute()
     
     # Create new customer in Stripe
     customer = stripe.Customer.create(
