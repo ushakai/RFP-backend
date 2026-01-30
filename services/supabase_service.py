@@ -1,12 +1,9 @@
 """
-Supabase Service - Database operations
+Database Service - Database operations using direct PostgreSQL connection
 """
 import traceback
 import time
 from typing import Any, Callable, List
-
-import httpcore
-import httpx
 
 from config.settings import get_supabase_client, reinitialize_supabase
 from services.gemini_service import get_embedding
@@ -14,25 +11,20 @@ from services.gemini_service import get_embedding
 
 def execute_with_retry(
     operation_factory: Callable[[], Any],
-    retries: int = 3,  # Reduced from 5 to 3 to prevent long hangs
-    backoff_seconds: float = 0.3,  # Reduced from 0.5 to 0.3
+    retries: int = 3,
+    backoff_seconds: float = 0.3,
     on_retry: Callable[[], None] | None = None,
-    max_total_time: float = 10.0,  # Maximum total time for all retries (seconds)
+    max_total_time: float = 10.0,
 ):
-    """Execute a Supabase/PostgREST operation with retries on socket/network errors.
+    """Execute a database operation with retries on connection errors.
     
-    Args:
-        operation_factory: Function that returns the operation to execute
-        retries: Maximum number of retry attempts
-        backoff_seconds: Initial backoff delay in seconds
-        on_retry: Optional callback to execute on each retry
-        max_total_time: Maximum total time to spend on all retries (prevents infinite hangs)
+    With direct PostgreSQL connections, this is much more reliable than
+    the HTTP-based Supabase client.
     """
     last_error: Exception | None = None
     start_time = time.time()
     
     for attempt in range(1, retries + 1):
-        # Check if we've exceeded maximum time
         elapsed = time.time() - start_time
         if elapsed > max_total_time:
             print(f"ERROR: Exceeded maximum retry time ({max_total_time}s), giving up")
@@ -41,42 +33,36 @@ def execute_with_retry(
             raise TimeoutError(f"Operation timed out after {elapsed:.2f} seconds")
         
         try:
-            return operation_factory()
-        except (
-            httpx.ReadError,
-            httpx.RemoteProtocolError,
-            httpx.ProtocolError,
-            httpx.NetworkError,
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpcore.ReadError,
-            httpcore.RemoteProtocolError,
-            httpcore.ProtocolError,
-            httpcore.NetworkError,
-            ConnectionError,
-            ConnectionResetError,
-            BrokenPipeError,
-            OSError,  # Catch WinError 10035, 10060, etc.
-            RuntimeError,  # "Cannot send a request, as the client has been closed"
-            KeyError,  # HTTP/2 stream ID errors
-        ) as err:
+            result = operation_factory()
+            # Check if result has an error attribute (QueryResult format)
+            if hasattr(result, 'error') and result.error:
+                raise Exception(result.error)
+            return result
+        except Exception as err:
             last_error = err
-            error_msg = str(err).lower()
+            error_str = str(err).lower()
+            error_type = type(err).__name__.lower()
             
-            # Check if it's a known Windows socket error if it's an OSError
-            is_socket_error = "winerror 10035" in error_msg or "non-blocking socket" in error_msg or "10060" in error_msg
-            is_protocol_error = isinstance(err, KeyError) or "protocol" in error_msg or "stream" in error_msg
+            # Check if it's a connection error that we should retry
+            is_connection_error = any([
+                "operationalerror" in error_type,
+                "interfaceerror" in error_type,
+                "connection" in error_str,
+                "timeout" in error_str,
+                "pool" in error_str,
+                "closed" in error_str,
+            ])
             
-            # Only log first and last attempt to reduce noise
-            if attempt == 1 or attempt == retries or is_socket_error or is_protocol_error:
-                suffix = " (Windows socket error)" if is_socket_error else (" (HTTP/2 protocol error)" if is_protocol_error else "")
-                print(f"Supabase connection error (attempt {attempt}/{retries}): {error_msg[:100]}{suffix}")
+            if not is_connection_error:
+                # Non-connection errors bubble up immediately
+                raise
             
-            # Reinitialize client to get fresh connection
+            print(f"Database connection error (attempt {attempt}/{retries}): {str(err)[:100]}")
+            
             try:
                 reinitialize_supabase()
             except Exception:
-                pass  # Ignore reinit errors, will retry anyway
+                pass
             
             if on_retry:
                 try:
@@ -85,18 +71,9 @@ def execute_with_retry(
                     pass
             
             if attempt < retries:
-                # Exponential backoff, but cap at 2 seconds and respect max_total_time
-                sleep_time = backoff_seconds * (2 ** (attempt - 1))
-                sleep_time = min(sleep_time, 2.0)  # Cap at 2 seconds (reduced from 5)
-                
-                # Don't sleep if it would exceed max_total_time
+                sleep_time = min(backoff_seconds * (2 ** (attempt - 1)), 2.0)
                 if elapsed + sleep_time < max_total_time:
                     time.sleep(sleep_time)
-                else:
-                    print(f"WARNING: Skipping sleep to avoid exceeding max_total_time")
-        except Exception as err:
-            # Non-network errors bubble up immediately
-            raise err
     
     if last_error:
         raise last_error

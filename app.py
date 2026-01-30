@@ -215,6 +215,42 @@ def _scheduled_digest_worker():
         )
 
 
+def _scheduled_expired_tenders_worker():
+    """Background worker to move expired tenders to expired_tenders table"""
+    expired_logger = get_logger("expired_tenders", "tender")
+    expired_logger.info("Scheduled expired tenders cleanup worker initialized.")
+    
+    # Run every 6 hours (21600 seconds)
+    CLEANUP_INTERVAL = 6 * 60 * 60
+    
+    while True:
+        try:
+            time.sleep(CLEANUP_INTERVAL)
+            expired_logger.info("Running expired tenders cleanup...")
+            
+            from services.expired_tenders_service import move_expired_tenders, count_expired_tenders
+            
+            # Count before moving
+            count_before = count_expired_tenders()
+            expired_logger.info(f"Found {count_before} expired tenders to move")
+            
+            if count_before > 0:
+                result = move_expired_tenders(use_direct_db=True)
+                if result.get("error"):
+                    expired_logger.error(f"Error moving expired tenders: {result['error']}")
+                else:
+                    moved = result.get("moved_count", 0)
+                    expired_logger.info(f"Successfully moved {moved} expired tenders to expired_tenders table")
+            else:
+                expired_logger.debug("No expired tenders to move")
+                
+        except Exception as e:
+            expired_logger.error(f"Error in expired tenders cleanup worker: {e}")
+            import traceback
+            expired_logger.debug(traceback.format_exc())
+            # Continue running even if there's an error
+
+
 @app.on_event("startup")
 def start_background_tasks():
     """
@@ -227,6 +263,24 @@ def start_background_tasks():
     logger.info(f"Docs: http://localhost:8000/docs")
     logger.info("=" * 80)
     
+    # Initialize direct database connection if configured
+    try:
+        from config.settings import DATABASE_URL, DB_HOST, DB_PASSWORD, init_db
+        if DATABASE_URL or (DB_HOST and DB_PASSWORD):
+            logger.info("Initializing direct PostgreSQL connection...")
+            init_db(database_url=DATABASE_URL)
+            # Test connection
+            from config.db import db
+            if db.test_connection():
+                logger.info("✓ Direct database connection established (using connection pooling)")
+            else:
+                logger.warning("⚠ Direct database connection test failed, falling back to REST API")
+        else:
+            logger.info("Using Supabase REST API (DATABASE_URL not configured)")
+    except Exception as e:
+        logger.warning(f"Failed to initialize direct database connection: {e}")
+        logger.info("Falling back to Supabase REST API")
+    
     if DISABLE_TENDER_INGESTION_LOOP:
         logger.info("Scheduled tender tasks DISABLED by environment variable")
         return
@@ -238,7 +292,20 @@ def start_background_tasks():
     threading.Thread(target=_scheduled_ingestion_worker, daemon=True).start()
     logger.info("Starting scheduled tender digest worker...")
     threading.Thread(target=_scheduled_digest_worker, daemon=True).start()
+    logger.info("Starting scheduled expired tenders cleanup worker...")
+    threading.Thread(target=_scheduled_expired_tenders_worker, daemon=True).start()
     logger.info("Scheduled background workers started successfully")
+
+
+@app.on_event("shutdown")
+def shutdown_tasks():
+    """Clean up database connections on shutdown"""
+    try:
+        from config.db import db
+        db.close()
+        logger.info("✓ Database connections closed")
+    except Exception as e:
+        logger.warning(f"Error closing database connections: {e}")
 
 
 # Main entry point for Render deployment

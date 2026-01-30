@@ -315,39 +315,65 @@ def list_jobs(x_client_key: str | None = Header(default=None, alias="X-Client-Ke
 
 @router.get("/jobs/{job_id}", dependencies=[Depends(require_subscription(["processing", "both"]))])
 def get_job(job_id: str, x_client_key: str | None = Header(default=None, alias="X-Client-Key")):
-    """Get specific job details with retry logic"""
+    """Get specific job details with server-side retry logic"""
     client_id = get_client_id_from_key(x_client_key)
     
-    def _fetch_job():
-        supabase = get_supabase_client()
-        return supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
+    max_retries = 3
+    last_error = None
     
-    try:
-        res = execute_with_retry(_fetch_job)
-        job_data = res.data
-        
-        if job_data:
-            created_at = datetime.fromisoformat(job_data["created_at"].replace('Z', '+00:00'))
-            elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
+    for attempt in range(max_retries):
+        try:
+            supabase = get_supabase_client()
+            res = supabase.table("client_jobs").select("*").eq("id", job_id).eq("client_id", client_id).single().execute()
             
-            job_data["elapsed_minutes"] = round(elapsed_minutes, 1)
+            if hasattr(res, 'error') and res.error:
+                raise Exception(res.error)
             
-            if job_data["status"] == "pending":
-                job_data["estimated_remaining_minutes"] = job_data.get("estimated_minutes", 10)
-            elif job_data["status"] == "processing":
-                estimated_total = job_data.get("estimated_minutes", 10)
-                remaining = max(0, estimated_total - elapsed_minutes)
-                job_data["estimated_remaining_minutes"] = round(remaining, 1)
+            job_data = res.data
+            
+            if job_data:
+                # Add calculated fields for the UI
+                try:
+                    created_at_str = job_data.get("created_at")
+                    if created_at_str:
+                        created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                        elapsed_minutes = (datetime.now(created_at.tzinfo) - created_at).total_seconds() / 60
+                        job_data["elapsed_minutes"] = round(elapsed_minutes, 1)
+                        
+                        if job_data["status"] == "pending":
+                            job_data["estimated_remaining_minutes"] = job_data.get("estimated_minutes", 10)
+                        elif job_data["status"] == "processing":
+                            estimated_total = job_data.get("estimated_minutes", 10)
+                            remaining = max(0, estimated_total - elapsed_minutes)
+                            job_data["estimated_remaining_minutes"] = round(remaining, 1)
+                        else:
+                            job_data["estimated_remaining_minutes"] = 0
+                except Exception as calc_err:
+                    print(f"Warning: Calculation error for job {job_id}: {calc_err}")
+                
+                # Remove large fields for the status check to save bandwidth
+                if "job_data" in job_data:
+                    del job_data["job_data"]
+            
+            return job_data
+            
+        except Exception as e:
+            last_error = e
+            print(f"ERROR: Fetching job {job_id} (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                try:
+                    from config.settings import reinitialize_supabase
+                    reinitialize_supabase()
+                except:
+                    pass
             else:
-                job_data["estimated_remaining_minutes"] = 0
-            
-            if "job_data" in job_data:
-                del job_data["job_data"]
-        
-        return job_data
-    except Exception as e:
-        print(f"ERROR: Error fetching job {job_id} after retries: {e}")
-        raise HTTPException(status_code=500, detail="Database connection failed")
+                print(f"CRITICAL: Failed to fetch job {job_id} after {max_retries} attempts")
+                traceback.print_exc()
+                
+    # If we reached here, it failed after all retries
+    error_msg = str(last_error) if last_error else "Unknown database error"
+    raise HTTPException(status_code=500, detail=f"Database connection failed: {error_msg}")
 
 
 @router.get("/jobs/{job_id}/status", dependencies=[Depends(require_subscription(["processing", "both"]))])

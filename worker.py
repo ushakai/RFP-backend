@@ -2,6 +2,8 @@
 """
 Background Job Worker for RFP Processing
 This script runs as a separate process to handle long-running jobs (15-20+ minutes)
+
+Uses direct PostgreSQL connection for reliable, persistent database connections.
 """
 
 import os
@@ -19,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 # Import from modular structure
-from config.settings import get_supabase_client
+from config.settings import get_supabase_client, reinitialize_supabase, is_direct_db_configured
 from services.job_service import process_rfp_background, extract_qa_background, ingest_text_background, update_job_progress
 from utils.logging_config import get_logger
 
@@ -27,34 +29,47 @@ from utils.logging_config import get_logger
 logger = get_logger(__name__, "worker")
 
 
-def get_supabase_with_retry(max_retries=3):
-    """Get Supabase client with retry for network issues"""
+def get_db_with_retry(max_retries=3):
+    """Get database client with retry for connection issues"""
     for attempt in range(max_retries):
         try:
             client = get_supabase_client()
             # Test connection with a simple query
-            client.table("client_jobs").select("id").limit(1).execute()
-            logger.debug(f"Supabase connection successful (attempt {attempt + 1}/{max_retries})")
+            result = client.table("client_jobs").select("id").limit(1).execute()
+            if hasattr(result, 'error') and result.error:
+                raise Exception(result.error)
+            logger.debug(f"Database connection successful (attempt {attempt + 1}/{max_retries})")
             return client
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
-                logger.warning(f"Supabase connection failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.warning(f"Database connection failed (attempt {attempt + 1}/{max_retries}): {e}")
                 logger.warning(f"Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
+                try:
+                    reinitialize_supabase()
+                except:
+                    pass
             else:
-                logger.error(f"Supabase connection failed after {max_retries} attempts: {e}")
-                logger.error("Please check: 1) Internet connection, 2) SUPABASE_URL in .env, 3) DNS resolution")
-                raise Exception(f"Failed to connect to Supabase after {max_retries} attempts") from e
+                logger.error(f"Database connection failed after {max_retries} attempts: {e}")
+                logger.error("Please check: 1) DATABASE_URL in .env, 2) Network connectivity")
+                raise Exception(f"Failed to connect to database after {max_retries} attempts") from e
     return None
+
+
+# Alias for backwards compatibility
+get_supabase_with_retry = get_db_with_retry
 
 
 def get_pending_jobs():
     """Get all jobs waiting for processing (pending or queued)"""
     try:
-        supabase = get_supabase_with_retry()
+        db = get_db_with_retry()
         # Fetch both pending and queued jobs
-        res = supabase.table("client_jobs").select("*").in_("status", ["pending", "queued"]).order("created_at", desc=False).execute()
+        res = db.table("client_jobs").select("*").in_("status", ["pending", "queued"]).order("created_at", desc=False).execute()
+        if hasattr(res, 'error') and res.error:
+            logger.error(f"Database error getting pending jobs: {res.error}")
+            return []
         return res.data or []
     except Exception as e:
         logger.error(f"Failed to get pending jobs: {e}")
@@ -65,16 +80,16 @@ def get_pending_jobs():
 def reset_stuck_jobs():
     """Reset jobs that have been stuck in processing for too long (30+ minutes)"""
     try:
-        supabase = get_supabase_with_retry()
+        db = get_db_with_retry()
         cutoff_time = (datetime.now() - timedelta(minutes=30)).isoformat()
         
-        res = supabase.table("client_jobs").select("*").eq("status", "processing").lt("last_updated", cutoff_time).execute()
+        res = db.table("client_jobs").select("*").eq("status", "processing").lt("last_updated", cutoff_time).execute()
         stuck_jobs = res.data or []
         
         if stuck_jobs:
             logger.warning(f"Found {len(stuck_jobs)} stuck jobs, resetting to pending...")
             for job in stuck_jobs:
-                supabase.table("client_jobs").update({
+                db.table("client_jobs").update({
                     "status": "pending",
                     "current_step": "Job was stuck and has been reset for retry",
                     "progress_percent": 0,
@@ -127,8 +142,8 @@ def process_job(job: dict):
         # Store worker PID to prevent ghost workers from marking job as failed
         original_status = job.get("status", "pending")
         worker_pid = str(os.getpid())
-        supabase = get_supabase_with_retry()
-        update_res = supabase.table("client_jobs").update({
+        db = get_db_with_retry()
+        update_res = db.table("client_jobs").update({
             "status": "processing",
             "last_updated": datetime.now().isoformat(),
             "started_at": datetime.now().isoformat(),
@@ -183,8 +198,8 @@ def process_job(job: dict):
                 # Check if the job was actually completed (status might be updated even if exception raised)
                 # This prevents marking successful jobs as failed due to status update errors
                 try:
-                    supabase = get_supabase_with_retry()
-                    job_check = supabase.table("client_jobs").select("status, progress_percent, result_data").eq("id", job_id).limit(1).execute()
+                    db = get_db_with_retry()
+                    job_check = db.table("client_jobs").select("status, progress_percent, result_data").eq("id", job_id).limit(1).execute()
                     if job_check.data:
                         job_status = job_check.data[0].get("status")
                         job_progress = job_check.data[0].get("progress_percent", 0)
@@ -222,11 +237,11 @@ def process_job(job: dict):
             logger.error(f"Failed to update job progress: {update_error}")
             # Try direct update as fallback
             try:
-                supabase = get_supabase_with_retry()
-                job_res = supabase.table("client_jobs").select("rfp_id").eq("id", job_id).limit(1).execute()
+                db = get_db_with_retry()
+                job_res = db.table("client_jobs").select("rfp_id").eq("id", job_id).limit(1).execute()
                 if job_res.data and job_res.data[0].get("rfp_id"):
                     rfp_id = job_res.data[0]["rfp_id"]
-                    supabase.table("client_rfps").update({
+                    db.table("client_rfps").update({
                         "last_job_status": "failed"
                     }).eq("id", rfp_id).execute()
             except Exception as fallback_error:
@@ -235,7 +250,12 @@ def process_job(job: dict):
 
 def worker_loop():
     """Main worker loop"""
-    logger.info("Worker started - polling for jobs every 5 seconds")
+    # Log connection type
+    if is_direct_db_configured():
+        logger.info("Worker started with DIRECT PostgreSQL connection (reliable, persistent)")
+    else:
+        logger.info("Worker started with Supabase HTTP client (fallback mode)")
+    logger.info("Polling for jobs every 5 seconds")
     
     consecutive_errors = 0
     max_consecutive_errors = 10
